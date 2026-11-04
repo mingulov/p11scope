@@ -11,7 +11,7 @@
 //! child, and drives the production scan → pin → reconcile → plan chain
 //! over that child's stable memory.
 
-use super::{CaptureWorkBudget, ScanLimits, ScanRequest, scan_pid};
+use super::{CaptureWorkBudget, ScanLimits, ScanRequest, Skipped, scan_pid};
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{
     PinnedObjects, ReconciledModule, pin_scanned_objects, reconcile_scanned_modules,
@@ -51,6 +51,12 @@ enum Variant {
     /// so the bootstrap slot forwards out of the module by ordinary
     /// dynamic-linker interposition.
     Interposed32,
+    /// The hostile twin of [`Variant::Interposed32`]: the table is stamped
+    /// 3.2 with the same deterministic tail, but its bootstrap slot points
+    /// at the preload's *decoy* export instead of the preload's
+    /// `C_GetFunctionList` — a forwarded bootstrap to a wrong offset.
+    /// The forward must be refused and every ordinal must stay `unknown`.
+    Misdirected32,
 }
 
 fn legacy_names() -> Vec<&'static str> {
@@ -89,11 +95,21 @@ fn source(variant: Variant) -> String {
             Variant::IfuncResolvers => format!("(void *)resolve_{ordinal}"),
             Variant::Swapped if name == "C_Sign" => "(void *)C_Verify".into(),
             Variant::Swapped if name == "C_Verify" => "(void *)C_Sign".into(),
+            Variant::Misdirected32 if name == "C_GetFunctionList" => {
+                "(void *)p11scope_decoy".into()
+            }
             _ => format!("(void *){name}"),
         }
     };
     let entries: Vec<String> = (0..LEGACY_ORDINALS).map(entry).collect();
-    if matches!(variant, Variant::Interposed32) {
+    if matches!(variant, Variant::Misdirected32) {
+        // The reference must link: the provider defines the decoy too, but
+        // the globally preloaded decoy wins the relocation by load order,
+        // so the bootstrap slot forwards out of the module to a wrong
+        // offset. Distinct body, so the two decoys can never fold.
+        c.push_str("unsigned long p11scope_decoy(void) { return 0xDEC07; }\n");
+    }
+    if matches!(variant, Variant::Interposed32 | Variant::Misdirected32) {
         // The 3.2 stamp walks the 68-slot known prefix; the embedded tail
         // of small non-pointer words refutes wider layouts at ordinal 68
         // deterministically (low addresses never resolve to executable
@@ -173,16 +189,12 @@ int main(int argc, char **argv) {
     driver
 }
 
-/// A second provider exporting only the `C_GetFunctionList` bootstrap, so a
-/// provider loaded after it (globally visible) interposes that one slot.
-fn build_preload(dir: &Path) -> PathBuf {
-    let c = dir.join("preload.c");
-    let path = dir.join("preload.so");
-    std::fs::write(
-        &c,
-        "unsigned long C_GetFunctionList(void) { return 0xC11CE5; }\n",
-    )
-    .unwrap();
+/// A second provider exporting exactly `sources`, so a provider loaded
+/// after it (globally visible) interposes the names it references.
+fn build_preload_source(dir: &Path, stem: &str, sources: &str) -> PathBuf {
+    let c = dir.join(format!("{stem}.c"));
+    let path = dir.join(format!("{stem}.so"));
+    std::fs::write(&c, sources).unwrap();
     let output = std::process::Command::new("gcc")
         .args(["-shared", "-fPIC", "-O0", "-o"])
         .arg(&path)
@@ -195,6 +207,28 @@ fn build_preload(dir: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     path
+}
+
+/// A second provider exporting only the `C_GetFunctionList` bootstrap, so a
+/// provider loaded after it (globally visible) interposes that one slot.
+fn build_preload(dir: &Path) -> PathBuf {
+    build_preload_source(
+        dir,
+        "preload",
+        "unsigned long C_GetFunctionList(void) { return 0xC11CE5; }\n",
+    )
+}
+
+/// The misdirected twin's preload: the genuine bootstrap plus a decoy
+/// export at a different offset, so the bootstrap slot can forward to a
+/// wrong offset while the rest of the table agrees.
+fn build_decoy_preload(dir: &Path) -> PathBuf {
+    build_preload_source(
+        dir,
+        "decoy-preload",
+        "unsigned long C_GetFunctionList(void) { return 0xC11CE5; }\n\
+         unsigned long p11scope_decoy(void) { return 0xDEC09; }\n",
+    )
 }
 
 fn build_interposed_loader(dir: &Path) -> PathBuf {
@@ -281,10 +315,25 @@ impl Loaded {
     /// so the provider's bootstrap relocation binds to the preload's
     /// `C_GetFunctionList`. Returns the loaded subject and the preload path.
     fn build_interposed() -> (Self, PathBuf) {
+        Self::build_interposed_like(Variant::Interposed32, build_preload)
+    }
+
+    /// The misdirected twin: the decoy preload lands first and globally
+    /// visible, so the provider's bootstrap slot binds to the preload's
+    /// decoy export — a forwarded bootstrap to a wrong offset — while the
+    /// other 67 slots bind to the provider's own definitions.
+    fn build_misdirected() -> (Self, PathBuf) {
+        Self::build_interposed_like(Variant::Misdirected32, build_decoy_preload)
+    }
+
+    fn build_interposed_like(
+        variant: Variant,
+        build_preload: fn(&Path) -> PathBuf,
+    ) -> (Self, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let c = dir.path().join("provider.c");
         let path = dir.path().join("provider.so");
-        std::fs::write(&c, source(Variant::Interposed32)).unwrap();
+        std::fs::write(&c, source(variant)).unwrap();
         let output = std::process::Command::new("gcc")
             .args(["-shared", "-fPIC", "-O0", "-o"])
             .arg(&path)
@@ -347,6 +396,39 @@ impl Loaded {
         let (reconciled, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
         assert!(lost.is_empty(), "{lost:?}");
         (reconciled, pinned)
+    }
+
+    /// The production chain without the no-loss assertion, for twins whose
+    /// shape must refuse an entry: returns the refused records too.
+    fn reconciled_with_loss(&self) -> (Vec<ReconciledModule>, PinnedObjects, Vec<Skipped>) {
+        let pid = self.subject.pid();
+        let hooks = HookRegistry::builtin();
+        let hints = [self.path.clone()];
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        });
+        let outcome = scan_pid(
+            &ScanRequest {
+                pid,
+                hints: &hints,
+                hooks: &hooks,
+            },
+            &mut budget,
+        )
+        .expect("scan the owned stopped subject");
+        let modules = outcome.modules().to_vec();
+        assert_eq!(modules.len(), 1, "skipped: {:?}", outcome.skipped());
+        assert_eq!(
+            modules[0].tables.len(),
+            1,
+            "exactly the planted table decodes"
+        );
+        let (mut pinned, skipped) =
+            pin_scanned_objects(pid, &modules, &mut budget).expect("pin the fixture");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let (reconciled, _, lost) = reconcile_scanned_modules(&modules, &mut pinned);
+        (reconciled, pinned, lost)
     }
 
     /// The production chain over the retained stopped child's memory.
@@ -610,6 +692,73 @@ fn interposed_bootstrap_names_the_table_and_publishes_full_walk() {
     assert_eq!(surface.walk, "full", "{surface:?}");
     assert_eq!(surface.acquisition, "ok", "{surface:?}");
     assert_eq!(surface.functions, LEGACY_ORDINALS, "{surface:?}");
+    assert_count_only(&plan);
+}
+
+/// RED (fix round): a bootstrap slot forwarded to a *wrong* offset —
+/// the preload's decoy export, not its `C_GetFunctionList` — must not
+/// name the table, even though the other 67 entries agree in-object.
+/// The forward is refused at bind time (unpinned with a reason) and every
+/// ordinal stays `unknown` (linkage `heuristic`, no full walk): the
+/// bootstrap exemption trusts only a forward the pinned target's own
+/// `.dynsym` resolves by name.
+#[test]
+fn forwarded_bootstrap_to_a_wrong_offset_stays_unnamed() {
+    let (loaded, preload) = Loaded::build_misdirected();
+    let preload_file = std::fs::File::open(&preload).unwrap();
+    let mut preload_offsets = p11scope_manifest::elf::exports_matching(
+        &preload_file,
+        &["C_GetFunctionList", "p11scope_decoy"],
+    )
+    .unwrap();
+    preload_offsets.sort();
+    assert_eq!(
+        preload_offsets.len(),
+        2,
+        "the preload exports the bootstrap and the decoy"
+    );
+    let bootstrap = preload_offsets
+        .iter()
+        .find(|(name, _)| name == "C_GetFunctionList")
+        .map(|(_, offset)| *offset)
+        .expect("the preload exports the bootstrap");
+    let decoy = preload_offsets
+        .iter()
+        .find(|(name, _)| name == "p11scope_decoy")
+        .map(|(_, offset)| *offset)
+        .expect("the preload exports the decoy");
+    assert_ne!(
+        bootstrap, decoy,
+        "the decoy must sit at a different offset than the bootstrap"
+    );
+    let (reconciled, _pinned, lost) = loaded.reconciled_with_loss();
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(
+        lost.len(),
+        1,
+        "exactly the misdirected bootstrap is refused: {lost:?}"
+    );
+    assert_eq!(lost[0].subject, "C_GetFunctionList");
+    assert!(
+        lost[0].reason.contains("C_GetFunctionList") && lost[0].reason.contains("not attached"),
+        "the refusal names the check and the outcome: {}",
+        lost[0].reason
+    );
+    let plan = build_from_reconciled_modules(&reconciled);
+    let tables = &plan.modules[0].tables;
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].version, (3, 2), "{tables:?}");
+    assert_eq!(tables[0].linkage, "heuristic", "{tables:?}");
+    assert_eq!(plan.slots.len(), LEGACY_ORDINALS - 1);
+    for slot in &plan.slots {
+        assert_eq!(slot.names, ["unknown"], "{slot:?}");
+    }
+    let surface = plan
+        .surfaces
+        .iter()
+        .find(|surface| surface.source.contains("table 3.2"))
+        .expect("the 3.2 table surface is published");
+    assert_eq!(surface.walk, "known_prefix", "{surface:?}");
     assert_count_only(&plan);
 }
 

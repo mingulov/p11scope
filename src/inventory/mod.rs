@@ -12761,8 +12761,10 @@ mod tests {
                     use p11scope_manifest::identity::{
                         inspect_file, mapping_file_key, open_object,
                     };
-                    let path = std::env::current_exe().unwrap();
-                    let file = open_object(&path).unwrap();
+                    // A small owned fixture, not the test binary: instrumented
+                    // builds exceed the object limit and refuse every pin.
+                    let path = crate::discovery::identity::test_fixture::small_owned_object();
+                    let file = open_object(path).unwrap();
                     let inspected = inspect_file(&file).unwrap();
                     let mapping = mapping_file_key(&file).unwrap();
                     let key = p11scope_manifest::maps::ObjectKey {
@@ -12773,7 +12775,7 @@ mod tests {
                         inode: mapping.inode,
                     };
                     crate::discovery::identity::test_fixture::real_scan_pin(
-                        &path,
+                        path,
                         Some(key),
                         mapping.mount_id,
                         inspected.identity.sha256.as_deref().unwrap(),

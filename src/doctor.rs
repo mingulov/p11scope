@@ -3814,8 +3814,20 @@ mod tests {
     /// still names them, so nothing is hidden.
     #[test]
     fn extra_strict_passes_a_capable_host_whatever_this_build_cannot_prove() {
+        use crate::fixture_guard::DieWithParent as _;
+
+        // Probe a small owned child, not this test binary: the live checks
+        // snapshot the target executable, and instrumented builds exceed
+        // the object limit. The host loader is the same either way.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
         let mut checks = capable_host_environment_rows();
-        checks.extend(live_discovery_checks(Some(std::process::id()), true));
+        checks.extend(live_discovery_checks(Some(child.id()), true));
+        child.kill().unwrap();
+        child.wait().unwrap();
         let names = |checks: &[Check]| {
             extra_strict_violations(checks)
                 .iter()

@@ -193,6 +193,16 @@ fn timing_key(index: usize) -> PinnedTimingKey {
     static KEYS: std::sync::OnceLock<Vec<PinnedTimingKey>> = std::sync::OnceLock::new();
     KEYS.get_or_init(|| {
         let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
+        let mut keys = Vec::new();
+        // First key: the small owned fixture. The test binary itself would
+        // be the natural first executable object, but instrumented builds
+        // exceed the object limit and refuse every pin.
+        let module = crate::discovery::identity::test_fixture::small_owned_module(&view);
+        let pins = pin_test_module(&view, &module);
+        let object = pins
+            .id_for_scanned(&module, module.key, &module.path)
+            .unwrap();
+        keys.push(pins.owned_timing_key(object).unwrap());
         // The kernel renders /proc/self/maps in chunks and drops its lock in
         // between, so a snapshot taken while other test threads map and
         // unmap can overlap itself. Take a consistent one.
@@ -203,7 +213,6 @@ fn timing_key(index: usize) -> PinnedTimingKey {
             })
             .expect("a consistent self maps snapshot");
         let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-        let mut keys = Vec::new();
         for mapping in maps
             .iter()
             .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
@@ -215,6 +224,13 @@ fn timing_key(index: usize) -> PinnedTimingKey {
             else {
                 continue;
             };
+            // Objects past the scanner's object limit cannot pin (notably
+            // this test binary once instrumented); they contribute no key.
+            if std::fs::metadata(&path)
+                .is_ok_and(|facts| facts.len() > p11scope_manifest::identity::MAX_OBJECT_BYTES)
+            {
+                continue;
+            }
             let module = mapped_object(&view, mapping, &path);
             let pins = pin_test_module(&view, &module);
             let object = pins
@@ -1586,7 +1602,7 @@ fn a_provider_the_scan_never_reached_stays_uncorroborated() {
 
 #[test]
 fn capture_facts_keep_each_accepted_manifest_ordinal_once() {
-    let (_, pins) = pinned_self();
+    let (_, pins) = pinned_owned_fixture();
     let summary = pins.pinned().next().unwrap();
     let path = summary.path.to_string();
     let sha256 = summary.sha256.to_string();
@@ -2778,7 +2794,7 @@ fn named_capture_startup_twins_beside_an_unpublished_closure() {
 
 #[test]
 fn capture_facts_keep_a_manifest_only_capacity_refusal() {
-    let (_, pins) = pinned_self();
+    let (_, pins) = pinned_owned_fixture();
     let summary = pins.pinned().next().unwrap();
     let path = summary.path.to_string();
     let mut manifest = manifest_naming(&path, Some(summary.sha256.to_string()));
@@ -3854,7 +3870,7 @@ fn causal_completion_tracks_the_last_new_required_attachment() {
 
 #[test]
 fn accepted_causal_observation_is_independent_from_candidate_work() {
-    let (raw_modules, mut pinned) = pinned_self();
+    let (raw_modules, mut pinned) = pinned_owned_fixture();
     let modules = reconcile_for_test(&raw_modules, &mut pinned);
     let mut engine = Engine::empty();
     engine.plan = plan::build_from_reconciled_modules(&modules);
@@ -8532,7 +8548,11 @@ fn two_gib_dynamic_executable_arms_without_hashing_the_executable() {
 /// binds, which is why the broken binding hid it.
 #[test]
 fn a_cleanly_retired_loader_context_publishes_no_skip() {
-    let (mut engine, owner) = Engine::retiring_loader_context(std::process::id());
+    // Retire a context over a small owned child, not this test binary: the
+    // retirement batch scans the subject's mappings and pins its modules,
+    // and instrumented builds exceed the object limit.
+    let subject = OwnedMapper::ready();
+    let (mut engine, owner) = Engine::retiring_loader_context(subject.pid());
     // This test's subject is loader-retirement skip semantics, not tick
     // scheduling: unbound the wall-clock deep-scan quantum (the same
     // isolation the frame budget already gets in test builds) so a loaded
@@ -21771,7 +21791,7 @@ fn expired_deadline_names_live_export_snapshot_refusal() {
 
 #[test]
 fn absent_pinned_export_marks_seed_incomplete_without_allocating_a_slot() {
-    let (mut modules, pins) = pinned_self();
+    let (mut modules, pins) = pinned_owned_fixture();
     let mut module = modules.pop().unwrap();
     module.exports = vec!["C_GetFunctionList".into()];
     let mut engine = Engine::empty();
@@ -28115,7 +28135,7 @@ fn loader_pin_reuse_keeps_generation_checks_at_apply() {
 #[test]
 fn exact_loader_pin_is_view_owned_but_not_a_provider_module() {
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
-    let (raw_modules, mut provider_pins) = pinned_self();
+    let (raw_modules, mut provider_pins) = pinned_owned_fixture();
     let provider_modules = reconcile_for_test(&raw_modules, &mut provider_pins);
     let mut engine = Engine::empty();
     engine.plan = plan::build_from_reconciled_modules(&provider_modules);
@@ -28251,7 +28271,13 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
 fn loader_collision_candidate_keeps_provider_retirement_without_loader_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("provider-and-loader.so");
-    std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();
+    // A small owned fixture, not the test binary: instrumented builds
+    // exceed the object limit and refuse every pin.
+    std::fs::copy(
+        crate::discovery::identity::test_fixture::small_owned_object(),
+        &path,
+    )
+    .unwrap();
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -28703,7 +28729,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
     assert_eq!(retired_views, 1, "the stale candidate view is retired now");
     assert!(!committed, "stale ownership is never committed");
 
-    let (raw_modules, mut pins) = pinned_self();
+    let (raw_modules, mut pins) = pinned_owned_fixture();
     let stale = raw_modules[0].view;
     let (modules, skipped) = bind_scanned_modules(&raw_modules, &mut pins);
     assert!(skipped.is_empty());
@@ -29257,27 +29283,74 @@ fn incomplete_rescan_preserves_highest_load_count() {
 }
 
 /// Actual file-backed tables keep the fresh read and every carried word honest.
+/// Addresses of two planted export tables (69 words each) inside a small
+/// owned provider, dlopen'd once for the process. Historically statics in
+/// this test binary — but lowering a record pins the table's own object,
+/// and instrumented builds exceed the object limit, so the tables live in
+/// a small mapped object instead. Slot 1 of each table points at the
+/// fixture's own target; every other slot is a NULL hole.
 fn self_export_table_address(index: usize) -> u64 {
-    use std::sync::{
-        Once,
-        atomic::{AtomicU64, Ordering},
-    };
-    static INITIALIZED: Once = Once::new();
-    // Nonzero initialization keeps the complete arrays in file-backed .data.
-    static TABLES: [[AtomicU64; 69]; 2] = [const { [const { AtomicU64::new(1) }; 69] }; 2];
-    extern "C" fn target() -> u64 {
-        0
+    use std::sync::OnceLock;
+    struct Planted {
+        base: u64,
     }
-    INITIALIZED.call_once(|| {
-        for table in &TABLES {
-            for word in table {
-                word.store(0, Ordering::Relaxed);
-            }
-            table[0].store(0x2802, Ordering::Relaxed);
-            table[1].store(target as *const () as usize as u64, Ordering::Relaxed);
+    // SAFETY: initialized once, never mutated, never unmapped: the handle
+    // stays open and the directory stays kept for the process lifetime,
+    // like the statics this replaces.
+    unsafe impl Send for Planted {}
+    unsafe impl Sync for Planted {}
+    static PLANTED: OnceLock<Planted> = OnceLock::new();
+    let planted = PLANTED.get_or_init(|| {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("self-export-plant.c");
+        let path = dir.path().join("self-export-plant.so");
+        std::fs::write(
+            &source,
+            "unsigned long p11scope_self_export_tables[2][69] = {{1}, {1}};\n\
+             unsigned long p11scope_self_export_target(void) { return 0; }\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-shared", "-fPIC", "-o"])
+                .arg(&path)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success(),
+            "the planted export fixture must compile"
+        );
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: an owned file just written by this test; RTLD_LOCAL keeps
+        // its symbols out of every other test in this process.
+        let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(!handle.is_null(), "the planted export fixture must load");
+        let symbol = |name: &str| {
+            let name = std::ffi::CString::new(name).unwrap();
+            // SAFETY: the arrays and target above; the handle stays open for
+            // the process lifetime, and initialization runs once.
+            (unsafe { libc::dlsym(handle, name.as_ptr()) }) as *mut u64
+        };
+        let tables = symbol("p11scope_self_export_tables");
+        let target = symbol("p11scope_self_export_target");
+        assert!(
+            !tables.is_null() && !target.is_null(),
+            "the planted records must resolve"
+        );
+        let words = unsafe { std::slice::from_raw_parts_mut(tables, 2 * 69) };
+        words.fill(0);
+        for table in words.as_chunks_mut::<69>().0 {
+            table[0] = 0x2802;
+            table[1] = target as u64;
+        }
+        let _ = dir.keep();
+        Planted {
+            base: tables as u64,
         }
     });
-    TABLES[index].as_ptr() as u64
+    planted.base + index as u64 * 69 * 8
 }
 
 fn self_export_fixture(id: ProcessViewId) -> (ProcessView, Vec<MapEntry>, DiscoveryRecord) {
@@ -29532,11 +29605,11 @@ fn engine_lowers_export_table_owner_and_prefix() {
 
 #[test]
 fn post_session_rebuild_preserves_canonical_ids() {
-    let (modules, canonical) = pinned_self();
+    let (modules, canonical) = pinned_owned_fixture();
     let original = canonical
         .id_for_scanned(&modules[0], modules[0].key, &modules[0].path)
         .unwrap();
-    let (_, incoming) = pinned_self();
+    let (_, incoming) = pinned_owned_fixture();
     let mut engine = Engine::empty();
     engine.pinned = canonical;
     let mut candidate_pins = engine.pinned.clone();
@@ -29576,8 +29649,10 @@ fn manifest_pins_are_not_rehashed_by_event() {
     use std::io::{Read as _, Seek as _, SeekFrom};
     use std::os::fd::AsRawFd as _;
 
-    let exe = std::env::current_exe().unwrap();
-    let pins = pin_as_manifest_object(exe.to_str().unwrap());
+    // A small owned fixture, not the test binary: instrumented builds
+    // exceed the object limit and refuse every pin.
+    let object = crate::discovery::identity::test_fixture::small_owned_object();
+    let pins = pin_as_manifest_object(object.to_str().unwrap());
     let id = pins.pinned().next().unwrap().id;
     let file = pins
         .file_for(id)
@@ -32165,6 +32240,45 @@ fn build_fixture_so(path: &Path, marker: &str) {
     std::fs::copy(&built, path).unwrap();
 }
 
+/// Like [`build_fixture_so`], but the fixture also defines the bootstrap:
+/// a scan entry forwarding `C_GetFunctionList` into this object verifies
+/// against its own exports (F2 fail-closed contract), so the stale-object
+/// fixtures that carry such a forward must genuinely define it.
+fn build_fixture_so_with_bootstrap(path: &Path, marker: &str) {
+    let source = path.with_extension("c");
+    std::fs::write(
+            &source,
+            format!(
+                "const char p11scope_fixture_marker[] = \"{marker}\";\nint p11scope_fixture_entry(void) {{ return 0; }}\nvoid *C_GetFunctionList(void) {{ return 0; }}\n"
+            ),
+        )
+        .unwrap();
+    // Compile aside, then copy over the target: truncates in place and keeps
+    // the inode stable, which the stale tests' key matching requires.
+    let built = path.with_extension("build.so");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&built)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::copy(&built, path).unwrap();
+}
+
+/// The file offset at which `path` defines `C_GetFunctionList`, read with
+/// the same export walk bind verifies a forwarded bootstrap against.
+fn fixture_bootstrap_offset(path: &Path) -> u64 {
+    let file = std::fs::File::open(path).unwrap();
+    p11scope_manifest::elf::exports_matching(&file, &["C_GetFunctionList"])
+        .unwrap()
+        .into_iter()
+        .find_map(|(name, offset)| (name == "C_GetFunctionList").then_some(offset))
+        .expect("the fixture must define the bootstrap")
+}
+
 fn object_facts(path: &Path) -> (ObjectKey, p11scope_manifest::identity::ObjectIdentity, u64) {
     let file = p11scope_manifest::identity::open_object(path).unwrap();
     let mapping = p11scope_manifest::identity::mapping_file_key(&file).unwrap();
@@ -32523,9 +32637,15 @@ fn discovery_mixed_manifest_drops_only_the_stale_dependency_claims() {
     let provider = dir.path().join("provider.so");
     let replaced = dir.path().join("replaced.so");
     let fresh = dir.path().join("fresh.so");
-    for path in [&provider, &replaced, &fresh] {
+    for path in [&provider, &fresh] {
         build_fixture_so(path, FIXTURE_ORIGINAL);
     }
+    // The stale object carries the scan's cross-object bootstrap forward,
+    // so it must genuinely define C_GetFunctionList (F2 fail-closed
+    // contract); the manifest and the scan claim its true definition
+    // offset rather than the executable-range start.
+    build_fixture_so_with_bootstrap(&replaced, FIXTURE_ORIGINAL);
+    let bootstrap_offset = fixture_bootstrap_offset(&replaced);
     let paths = vec![provider.clone(), replaced.clone(), fresh.clone()];
     let mut targets = vec![0; 67];
     targets[0] = 1;
@@ -32533,6 +32653,14 @@ fn discovery_mixed_manifest_drops_only_the_stale_dependency_claims() {
     targets[2] = 2;
     targets[3] = 1;
     let mut manifest = valid_manifest_for(&paths, &targets);
+    assert_eq!(
+        manifest.surfaces[0].functions[3].name, "C_GetFunctionList",
+        "the catalog order pins which stale claim is the bootstrap"
+    );
+    match &mut manifest.surfaces[0].functions[3].resolution {
+        Resolution::Resolved { file_offset, .. } => *file_offset = bootstrap_offset,
+        resolution => panic!("the stale bootstrap claim must resolve: {resolution:?}"),
+    }
     let stale_offset = object_facts(&replaced).2;
     let fresh_offset = object_facts(&fresh).2;
     manifest.alias_groups = vec![
@@ -32571,6 +32699,11 @@ fn discovery_mixed_manifest_drops_only_the_stale_dependency_claims() {
     scan_targets[1] = 0;
     scan_targets[2] = 0;
     let mut scan = scanned_manifest_replacement(&paths, &scan_targets);
+    assert_eq!(
+        scan.tables[0].entries[3].name, "C_GetFunctionList",
+        "the catalog order pins which scan entry is the bootstrap"
+    );
+    scan.tables[0].entries[3].file_offset = bootstrap_offset;
     scan.tables[0].entries[4].file_offset += 1;
     let scan_pins = pin_scan(&scan);
     let input = manifest_input_from_pinning("mixed-valid.json", manifest);
@@ -33292,7 +33425,7 @@ fn stale_conflict_owner_is_removed_from_final_counter_and_corroboration() {
 
 #[test]
 fn repeated_manifest_only_outcomes_preserve_order_and_multiplicity() {
-    let (_, pins) = pinned_self();
+    let (_, pins) = pinned_owned_fixture();
     let summary = pins.pinned().next().unwrap();
     let path = summary.path.to_string();
     let sha256 = summary.sha256.to_string();
@@ -33683,11 +33816,14 @@ fn legacy_manifest_schemas_are_rejected_with_rediscovery_instruction() {
     }
 }
 
-/// Our own executable, represented by empty scan facts and pinned the way a
-/// capture pins a provider: one real `PinnedObjects` key, with no privileges.
-fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
-    let exe = std::env::current_exe().unwrap();
-    let key = object_facts(&exe).0;
+/// A small owned fixture, represented by empty scan facts and pinned the way
+/// a capture pins a provider: one real `PinnedObjects` key, with no
+/// privileges. Historically the test binary itself; instrumented builds
+/// exceed the object limit, so the shared small fixture stands in. The
+/// default budget applies: the fixture is far below every cap.
+fn pinned_owned_fixture() -> (Vec<ScannedModule>, PinnedObjects) {
+    let object = crate::discovery::identity::test_fixture::small_owned_object();
+    let key = object_facts(object).0;
     let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
     let modules = vec![ScannedModule {
         module_hint: None,
@@ -33697,7 +33833,7 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
-        path: exe.display().to_string(),
+        path: object.display().to_string(),
         decoder_abi: Some(if usize::BITS == 64 {
             ElfAbi::Lp64
         } else {
@@ -33707,25 +33843,13 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
         tables: vec![],
         interfaces: vec![],
     }];
-    // Unbounded on purpose: `pin_scanned_object` caps on the whole file size, and
-    // this test binary is already past 60% of the 256 MiB default. The byte caps are
-    // not what these tests are about, and a silent skip would fail them with
-    // "the hinted executable is pinned", which names the symptom, not the cause.
-    let limits = ScanLimits {
-        per_object_bytes: u64::MAX,
-        total_bytes: u64::MAX,
-    };
-    let mut budget = CaptureWorkBudget::new(limits);
+    let mut budget = CaptureWorkBudget::default();
     let (pinned, skipped) = pin_scanned_view_objects(&view, &modules, &mut budget).unwrap();
     assert!(
         skipped.is_empty(),
-        "the executable has no pinning loss: {skipped:?}"
+        "the fixture has no pinning loss: {skipped:?}"
     );
-    assert_eq!(
-        pinned.pinned().count(),
-        1,
-        "the hinted executable is pinned"
-    );
+    assert_eq!(pinned.pinned().count(), 1, "the hinted fixture is pinned");
     (modules, pinned)
 }
 
@@ -33880,7 +34004,7 @@ fn entry(name: &'static str, object: ObjectKey, file_offset: u64) -> ScannedEntr
 /// probed at scan-derived offsets.
 #[test]
 fn a_table_entry_whose_object_was_not_pinned_never_becomes_a_slot() {
-    let (mut modules, mut pinned) = pinned_self();
+    let (mut modules, mut pinned) = pinned_owned_fixture();
     let pinned_key = pinned.pinned().next().unwrap().key;
     let unpinned_key = ObjectKey {
         device: p11scope_manifest::maps::Device {
@@ -33953,7 +34077,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
                      ROUND4_ERROR_CHAIN_SENTINEL"
             .into(),
     };
-    let (mut modules, mut pinned) = pinned_self();
+    let (mut modules, mut pinned) = pinned_owned_fixture();
     modules[0]
         .tables
         .push(crate::discovery::scan::ScannedTable {
@@ -34304,7 +34428,7 @@ fn p2_retained_scan_error_keeps_counters_and_survives_attachment() {
 
 #[test]
 fn an_object_the_scan_could_not_read_is_published_not_only_printed() {
-    let (modules, _) = pinned_self();
+    let (modules, _) = pinned_owned_fixture();
     // Refuse before the first mount-table read while leaving the per-object
     // allowance generous: this specifically exercises capture-wide admission.
     let tiny = ScanLimits {
@@ -34412,7 +34536,7 @@ fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
 }
 
 fn plan_with_pins(slots: usize, refused: usize) -> (plan::AttachPlan, PinnedObjects) {
-    let (_, pins) = pinned_self();
+    let (_, pins) = pinned_owned_fixture();
     let pin = pins.pinned().next().unwrap();
     let mut plan = plan_with(slots, refused);
     for slot in &mut plan.slots {
@@ -34556,7 +34680,7 @@ fn late_collision_invalidates_fallback_evidence_without_discovery_evidence_panic
 /// to the wrong file. The mirror of the unpinned-entry hazard above.
 #[test]
 fn a_stale_recorded_identity_never_resolves_to_another_objects_pin() {
-    let (_, mut pins) = pinned_self();
+    let (_, mut pins) = pinned_owned_fixture();
     let collision = pins.pinned().next().unwrap().key;
 
     // A second, unrelated file.
@@ -34594,7 +34718,7 @@ fn a_stale_recorded_identity_never_resolves_to_another_objects_pin() {
 /// resolves to an unrelated file that shares it or fails to resolve at all.
 #[test]
 fn a_manifest_naming_its_object_and_its_provenance_differently_is_still_retargeted() {
-    let (_, mut pins) = pinned_self();
+    let (_, mut pins) = pinned_owned_fixture();
     let collision = pins.pinned().next().unwrap().key;
 
     let dir = tempfile::tempdir().unwrap();
@@ -34644,7 +34768,7 @@ fn a_manifest_naming_its_object_and_its_provenance_differently_is_still_retarget
 /// manifest is talking about, and whether the bytes agree.
 #[test]
 fn scan_view_matches_by_hash_then_path_and_needs_a_pin() {
-    let (modules, pinned) = pinned_self();
+    let (modules, pinned) = pinned_owned_fixture();
     let summary = pinned.pinned().next().unwrap();
     let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
 
@@ -34948,7 +35072,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
 /// same bytes, which the target may not map at all).
 #[test]
 fn retargeting_only_adopts_the_matched_scanned_object() {
-    let (modules, pinned) = pinned_self();
+    let (modules, pinned) = pinned_owned_fixture();
     let summary = pinned.pinned().next().unwrap();
     let (path, sha) = (summary.path.to_string(), summary.sha256.to_string());
     let mut m = manifest_naming(&path, Some(sha.clone()));
@@ -37499,6 +37623,7 @@ struct E07Provider {
     _dir: tempfile::TempDir,
     path: PathBuf,
     handle: *mut std::ffi::c_void,
+    interposer_handle: *mut std::ffi::c_void,
     table: *mut u64,
 }
 
@@ -37521,11 +37646,38 @@ impl E07Provider {
             .status()
             .unwrap();
         assert!(status.success(), "the fixture provider must compile");
+        // A second fixture holding the bootstrap definition: every planted
+        // slot collapses onto genuine interposition there, so the
+        // cross-object C_GetFunctionList verifies against the target's own
+        // exports (F2 fail-closed contract) while the scanned module itself
+        // stays free of seeds and anchors.
+        let interposer_c = dir.path().join("interposer.c");
+        let interposer = dir.path().join("interposer.so");
+        std::fs::write(
+            &interposer_c,
+            "void *C_GetFunctionList(void) { return 0; }\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&interposer)
+            .arg(&interposer_c)
+            .status()
+            .unwrap();
+        assert!(status.success(), "the fixture interposer must compile");
         let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: an owned file just written by this test; RTLD_LOCAL keeps
         // its symbols out of every other test in this process.
         let handle = unsafe { libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         assert!(!handle.is_null(), "the fixture provider must load");
+        let ipath = std::ffi::CString::new(interposer.as_os_str().as_bytes()).unwrap();
+        // SAFETY: as above; a second owned file in the same directory.
+        let interposer_handle =
+            unsafe { libc::dlopen(ipath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        assert!(
+            !interposer_handle.is_null(),
+            "the fixture interposer must load"
+        );
         let symbol = |name: &str| {
             let name = std::ffi::CString::new(name).unwrap();
             // SAFETY: the symbols are the arrays above; the handle stays
@@ -37539,10 +37691,18 @@ impl E07Provider {
             !table.is_null() && !iface.is_null() && !name.is_null(),
             "the planted records must resolve"
         );
+        let bootstrap_name = std::ffi::CString::new("C_GetFunctionList").unwrap();
+        // SAFETY: the interposer defines exactly this symbol; its handle
+        // stays open until Drop.
+        let bootstrap = unsafe { libc::dlsym(interposer_handle, bootstrap_name.as_ptr()) } as u64;
+        assert_ne!(bootstrap, 0, "the interposed bootstrap must resolve");
         let words = unsafe { std::slice::from_raw_parts_mut(table, E07_TABLE_WORDS) };
         words[0] = 0x2802; // CK_VERSION { major 2, minor 40 }.
+        // One collapsed address keeps the single covered target the
+        // retirement pins require; it verifies because the interposer
+        // genuinely defines the bootstrap there.
         for word in &mut words[1..] {
-            *word = e07_anchor as *const () as usize as u64;
+            *word = bootstrap;
         }
         // The interface triple linking the table: publication evidence, so
         // the plan authorizes the table's endpoints.
@@ -37554,6 +37714,7 @@ impl E07Provider {
             _dir: dir,
             path,
             handle,
+            interposer_handle,
             table,
         }
     }
@@ -37567,6 +37728,7 @@ impl E07Provider {
 impl Drop for E07Provider {
     fn drop(&mut self) {
         unsafe { libc::dlclose(self.handle) };
+        unsafe { libc::dlclose(self.interposer_handle) };
     }
 }
 
@@ -37590,26 +37752,15 @@ fn e07_engine() -> Engine {
 fn e07_loader_context(engine: &mut Engine, view: ProcessViewId) -> LoaderContextId {
     use p11scope_manifest::elf::SymbolFact;
 
-    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
-    let map_index = MapIndex::new(&maps).expect("the self maps snapshot is valid");
-    let executable = std::env::current_exe().unwrap();
-    let (loader_mapping, loader_path) = maps
-        .iter()
-        .filter(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
-        .find_map(|mapping| match map_index.resolve(mapping.start) {
-            Resolved::File {
-                path: MappedPath::Usable(path),
-                ..
-            } if path == executable => Some((mapping, path)),
-            _ => None,
-        })
-        .expect("the test process maps its own executable");
     let view_ref = engine
         .views
         .iter()
         .find(|retained| retained.id() == view)
         .expect("the engine retains the view");
-    let loader_module = mapped_object(view_ref, loader_mapping, &loader_path);
+    // The loader object is the small owned fixture, not this test binary:
+    // instrumented builds exceed the object limit and refuse every pin.
+    // Preflight only needs the loader id to resolve in the engine's pins.
+    let loader_module = crate::discovery::identity::test_fixture::small_owned_module(view_ref);
     let loader_pins = pin_test_module(view_ref, &loader_module);
     let absorb_skips = engine.pinned.absorb(loader_pins);
     assert!(absorb_skips.is_empty(), "{absorb_skips:?}");

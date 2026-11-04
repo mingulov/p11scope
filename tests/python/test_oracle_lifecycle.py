@@ -56,6 +56,23 @@ def scaled_whole_seconds(seconds):
     return str(math.ceil(seconds * TIME_SCALE))
 
 
+def _restore_hup_int_quit():
+    """Restore default SIGHUP/SIGINT/SIGQUIT in the driver subtree (preexec_fn).
+
+    A launcher that ignores SIGHUP passes the ignored disposition through
+    fork+exec, and a non-interactive bourne shell cannot trap an ignored
+    signal back: the driver's `trap 'exit 129' HUP` would stay dead and the
+    self-HUP cases would fall through to the wrong exit status. The drivers
+    trap HUP and INT, so the subtree needs the default disposition; QUIT is
+    restored for backgrounded-launcher parity, as in
+    test_key_operations_linked_control.py. Foreground CI steps already have
+    it; this only repairs ignoring launchers.
+    """
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+
+
 def process_starttime(pid):
     fields = Path(f"/proc/{pid}/stat").read_bytes().rsplit(b") ", 1)[1].split()
     return int(fields[19])
@@ -204,6 +221,7 @@ class OracleLifecycleTests(unittest.TestCase):
             capture_output=True,
             timeout=slack(timeout),
             env=self.fixture_env(env),
+            preexec_fn=_restore_hup_int_quit,
         )
 
     def start_hung_fixture(self, identity, env=None):
@@ -214,6 +232,7 @@ class OracleLifecycleTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=self.fixture_env(env),
+            preexec_fn=_restore_hup_int_quit,
         )
 
     def cleanup_hung_fixture(self, process, identity):

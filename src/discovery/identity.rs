@@ -8101,6 +8101,78 @@ pub(crate) mod test_fixture {
         pins
     }
 
+    /// A small owned ELF for tests that need a real pinnable object. The
+    /// test binary itself doubles as one while thin, but once instrumented
+    /// (coverage) it exceeds the scanner's object limit and every pin of it
+    /// is refused — so pinnable-object fixtures use this instead. Built once
+    /// per process and shared: pins from different calls merge exactly like
+    /// pins of one file. The file is gcc-built, never instrumented, and
+    /// asserted far below the limit, so it stays pinnable under any test
+    /// profile.
+    pub(crate) fn small_owned_object() -> &'static Path {
+        static OBJECT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        OBJECT
+            .get_or_init(|| {
+                let dir = tempfile::tempdir().unwrap();
+                let source = dir.path().join("small-owned-object.c");
+                let path = dir.path().join("small-owned-object.so");
+                std::fs::write(
+                    &source,
+                    "const char p11scope_small_owned_marker[] = \"SMALL-OWNED-0001\";\n\
+                 int p11scope_small_owned_entry(void) { return 0; }\n",
+                )
+                .unwrap();
+                assert!(
+                    std::process::Command::new("gcc")
+                        .args(["-shared", "-fPIC", "-o"])
+                        .arg(&path)
+                        .arg(&source)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "the small owned fixture must compile"
+                );
+                let len = std::fs::metadata(&path).unwrap().len();
+                assert!(
+                    len < p11scope_manifest::identity::MAX_OBJECT_BYTES,
+                    "the small owned fixture must stay pinnable: {len} bytes"
+                );
+                dir.keep().join("small-owned-object.so")
+            })
+            .as_path()
+    }
+
+    /// A scan module over [`small_owned_object`]: the shape
+    /// `mapped_object` builds for a real mapping (empty scan facts, no
+    /// mapped identity), keyed by the fixture's own maps key so pinning it
+    /// exercises the real open/identity path.
+    pub(crate) fn small_owned_module(view: &ProcessView) -> ScannedModule {
+        let path = small_owned_object();
+        let file = open_object(path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let key = ObjectKey {
+            device: Device {
+                major: mapping.device_major,
+                minor: mapping.device_minor,
+            },
+            inode: mapping.inode,
+        };
+        ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            path: path.display().to_string(),
+            decoder_abi: None,
+            exports: Vec::new(),
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        }
+    }
+
     /// Objects opened through a container's overlay mount — the shape this is about.
     pub(crate) fn pins(entries: &[(ObjectKey, &str, i64)]) -> PinnedObjects {
         pin_set(entries, true)
@@ -8493,6 +8565,37 @@ mod tests {
         Version, WalkOutcome,
     };
     use std::cell::RefCell;
+
+    #[test]
+    fn small_owned_object_stays_pinnable_under_the_object_limit() {
+        let path = test_fixture::small_owned_object();
+        let len = std::fs::metadata(path).unwrap().len();
+        assert!(
+            len < p11scope_manifest::identity::MAX_OBJECT_BYTES,
+            "the fixture must stay pinnable under any profile: {len} bytes"
+        );
+        // Same path twice: the process shares one file, so pins merge.
+        assert_eq!(path, test_fixture::small_owned_object());
+        let file = p11scope_manifest::identity::open_object(path).unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        assert!(
+            !inspected.executable_ranges.is_empty(),
+            "the fixture is a real ELF with executable ranges"
+        );
+        // A module over it pins through the real open/identity path under
+        // the default budget.
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let module = test_fixture::small_owned_module(&view);
+        let mut budget = CaptureWorkBudget::default();
+        let (pins, skipped) =
+            pin_scanned_view_objects(&view, std::slice::from_ref(&module), &mut budget).unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert!(
+            pins.id_for_scanned(&module, module.key, &module.path)
+                .is_some(),
+            "the fixture pin resolves"
+        );
+    }
 
     #[test]
     fn forwarded_bootstrap_verifies_only_the_named_definition_at_its_offset() {

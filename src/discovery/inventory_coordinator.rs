@@ -10846,6 +10846,7 @@ pub(crate) mod tests {
                 Scope::Pid(std::process::id()),
                 HookRegistry::builtin(),
                 Vec::new(),
+                vec![],
                 OsProcessSource,
                 RegistryLimits::default_limits(),
                 crate::capacity::inventory_endpoint_budget(Some(budget_endpoints)).unwrap(),

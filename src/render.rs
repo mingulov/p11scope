@@ -7123,6 +7123,7 @@ pub(crate) mod tests {
         let object = PinnedObjectId(0);
         let entry_count = table.entries.len();
         let scanned = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             view: ProcessViewId(0),
             mount_namespace: MountNamespaceId {
@@ -7607,6 +7608,7 @@ pub(crate) mod tests {
             })
             .collect();
         let scanned = ScannedModule {
+            module_hint: None,
             mapped_identity: None,
             view: ProcessViewId(0),
             mount_namespace: MountNamespaceId {

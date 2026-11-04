@@ -3865,6 +3865,7 @@ pub fn build_from_sources_for_policy_scoped_with_prearm(
         false,
         admission_policy,
         admission_scope,
+        false,
     )
 }
 
@@ -12642,6 +12643,7 @@ mod tests {
             file_offset: Some(64 * 0x1000),
             live_return: true,
             manifest_supported: false,
+            extension_impossible: false,
         });
         closure.entry_objects.push(vec![closure.object; 68]);
         let first = scoped_plan(&[filler, closure], AdmissionScope::Named);

@@ -138,7 +138,14 @@ LOSS_GAP_SUBJECTS = frozenset({
     "rejected demoted count",
     "semantic admission refused",
     "semantic calls unrouted",
+    "semantic calls unrouted from other callers",
 })
+# Unrouted sheds whose records prove a caller other than every bound
+# Joint caller (JK-17). In --joint mode they are the other caller's
+# loss: reported in the verdict, never a gap in the bound caller's
+# completeness. Outside --joint, and when attributed to the selected
+# caller, they stay loss gaps.
+OTHER_CALLER_UNROUTED = "semantic calls unrouted from other callers"
 # Gap reasons that name a lost feed (the plan-named text above).
 LOSS_GAP_REASONS = frozenset({
     "joint machine unavailable",
@@ -770,6 +777,22 @@ def check_conservation(view, selected, doc, joint=False):
             "teardown": teardown, "slot_refused": slot}
 
 
+def _other_caller_unrouted(gap, selected):
+    """Calls in a --joint other-caller unrouted gap, or None if the gap
+    is not one (wrong subject or attributed to the selected caller)."""
+    if gap.get("subject") != OTHER_CALLER_UNROUTED:
+        return None
+    if gap.get("caller") == selected["edge"]["caller"]:
+        return None
+    pid = gap.get("pid")
+    if pid is not None and pid == selected["pid"]:
+        return None
+    match = re.match(r"([0-9]+) calls shed without a route ", gap["reason"])
+    _require(match is not None,
+             f"other-caller unrouted gap without a call count: {gap['reason']!r}")
+    return int(match.group(1))
+
+
 def _gap_loss_reason(subject, reason):
     if subject in LOSS_GAP_SUBJECTS or reason in LOSS_GAP_REASONS:
         return "loss gap: published capture loss or retirement"
@@ -831,6 +854,7 @@ def check_loss(selected, doc, events, joint=False):
     gaps = doc.get("gaps")
     _require(type(gaps) is list, "inventory gaps must be a list")
     foreign_gaps = 0
+    other_caller_unrouted = 0
     for gap in gaps:
         _require(type(gap) is dict, "gap entry must be an object")
         subject = gap.get("subject")
@@ -842,6 +866,10 @@ def check_loss(selected, doc, events, joint=False):
         if joint:
             pid = gap.get("pid")
             _require(pid is None or _u64(pid), "gap pid out of range")
+            other = _other_caller_unrouted(gap, selected)
+            if other is not None:
+                other_caller_unrouted += other * gap["repeats"]
+                continue
             scoped = (gap.get("caller") in (None, selected["edge"]["caller"])
                       and (pid is None or pid == selected["pid"]))
             if not scoped:
@@ -867,6 +895,9 @@ def check_loss(selected, doc, events, joint=False):
         if joint:
             pid = payload.get("pid")
             _require(pid is None or _u64(pid), "gap_recorded pid out of range")
+            # Counted once from the snapshot gaps above.
+            if _other_caller_unrouted(payload, selected) is not None:
+                continue
             scoped = (payload.get("caller") in (None, selected["edge"]["caller"])
                       and (pid is None or pid == selected["pid"]))
             if not scoped:
@@ -931,6 +962,7 @@ def check_loss(selected, doc, events, joint=False):
         verdict["continuity_cuts"] = continuity_cuts
         verdict["stream_rotations"] = stream["rotations"]
         verdict["foreign_gaps"] = foreign_gaps
+        verdict["other_caller_unrouted"] = other_caller_unrouted
         verdict["foreign_callers"] = selected["foreign"]["callers"]
         verdict["foreign_edges"] = selected["foreign"]["edges"]
     return verdict

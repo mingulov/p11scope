@@ -697,6 +697,9 @@ def joint_hot_last_t1(ledger_paths):
     return last
 
 
+OTHER_UNROUTED = "semantic calls unrouted from other callers"
+
+
 class HealthyTwin(unittest.TestCase):
     def test_healthy_10k_passes_with_recorded_windows_and_latency(self):
         s1 = require_s1(self)
@@ -1199,6 +1202,19 @@ class LossGate(unittest.TestCase):
                 write_jsonl(events_path, events)
             return s1.compare([str(ledger_path)], [str(events_path)],
                               str(inventory_path), 10)
+
+    def test_other_caller_unrouted_gap_fails_outside_joint(self):
+        # Without a bound Joint caller nothing separates the loss.
+        def mutate(inventory):
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": OTHER_UNROUTED,
+                 "reason": "3 calls shed without a route (unobserved=3) "
+                           "from callers other than the 0 bound callers",
+                 "budget": None, "repeats": 1})
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory=mutate)
+        self.assertIn("loss gap", str(ctx.exception))
 
     def test_unrouted_returns_1_fails(self):
         def mutate(inventory):
@@ -2868,6 +2884,39 @@ class JointConservationGate(unittest.TestCase):
                      "subject": "semantic calls unrouted",
                      "reason": "13 calls shed without a route "
                                "(unobserved=13) with 0 bindings",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_other_caller_unrouted_gap_is_reported_never_gated(self):
+        # A shed whose records prove a caller other than the bound one
+        # is the other caller's loss: reported beside the verdict, not
+        # a gap in the bound caller's completeness.
+        with tempfile.TemporaryDirectory(prefix="joint-oshed-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": OTHER_UNROUTED,
+                     "reason": "18 calls shed without a route "
+                               "(unobserved=18) from callers other than "
+                               "the 1 bound callers",
+                     "budget": None, "repeats": 1})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["other_caller_unrouted"], 18)
+
+    def test_other_caller_unrouted_gap_on_the_bound_caller_fails(self):
+        # Never trust the subject alone: attributed to the bound caller
+        # itself it stays a loss gap.
+        with tempfile.TemporaryDirectory(prefix="joint-oshedb-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": OTHER_UNROUTED,
+                     "reason": "2 calls shed without a route "
+                               "(unobserved=2) from callers other than "
+                               "the 1 bound callers",
                      "budget": None, "repeats": 1})
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "loss gap"):

@@ -495,15 +495,15 @@ fn privileged_prearm_reaches_armed_pid() -> Result<()> {
     let target = workload.spawn(
         "target",
         &[
-            "mech", "--cell", "T", "--module", SOFTHSM, "--iters", "2", "--gate", &gate_arg,
+            "mech", "--cell", "T", "--module", softhsm(), "--iters", "2", "--gate", &gate_arg,
             "--hold",
         ],
     )?;
-    let mut coordinator = pid_coordinator(target.pid(), Path::new(SOFTHSM))?;
+    let mut coordinator = pid_coordinator(target.pid(), Path::new(softhsm()))?;
     // Pin the live provider as pre-arm before the lane starts: proved
     // offsets lower into the attach set and ride the activating extend.
     let pinning = crate::discovery::identity::pin_prearm_objects_in_views_with_budget(
-        &[PathBuf::from(SOFTHSM)],
+        &[PathBuf::from(softhsm())],
         &[],
         None,
         0,
@@ -5243,6 +5243,8 @@ fn privileged_key_operations_linked_fault_fails_coverage_without_latching() -> R
         retiring: None,
         joint_finish: JointFinishDriver::NotBegun,
         stop_requested: false,
+        prearm_stop_probe: None,
+        prearm_probe_stop: None,
         joint_first_error: None,
         suspended: false,
         joint_commit_pending: false,

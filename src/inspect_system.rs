@@ -3757,6 +3757,19 @@ impl IdentityRunShared {
         shared
     }
 
+    /// First witness candidate offset for this pass over the whole
+    /// sweep. The pass advances it by the queries it actually spends.
+    fn witness_start(&self) -> u64 {
+        self.sweep_witness_rotation
+    }
+
+    /// Advance the witness rotation by this pass's spent queries (0
+    /// when no witness ran, so the next pass restarts from the same
+    /// offset instead of skipping a candidate it never proved).
+    fn advance_witness_rotation(&mut self, spent: u32) {
+        self.sweep_witness_rotation = self.sweep_witness_rotation.wrapping_add(u64::from(spent));
+    }
+
     #[cfg(test)]
     pub(crate) fn with_threshold(
         selection: crate::cli::IdentityBackendSelection,
@@ -4306,17 +4319,16 @@ fn attribute_pass_with_kernel(
     pools: ProofPools<'_>,
     threshold: Option<usize>,
 ) -> Option<Attributed> {
-    // The witness budget covers a different candidate prefix each
+    // The witness budget covers a different candidate window each
     // kernel pass, so callers past the per-pass budget still prove
-    // within a few passes instead of starving every pass.
+    // within a few passes instead of starving every pass. The pass
+    // advances the window by the queries it actually spends.
     let witness_start = {
-        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        let start = shared.sweep_witness_rotation;
-        shared.sweep_witness_rotation = start.wrapping_add(1);
-        start
+        let shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        shared.witness_start()
     };
     let Some(takeout) = takeout else {
-        return attribute_sweep_with(
+        let out = attribute_sweep_with(
             collection,
             bound,
             &bound.aggregate,
@@ -4334,6 +4346,12 @@ fn attribute_pass_with_kernel(
                 )
             },
         );
+        // No witness runs on the plain path: the rotation stays.
+        {
+            let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+            shared.advance_witness_rotation(0);
+        }
+        return out;
     };
     let mut session = takeout.session;
     let generation = takeout.generation;
@@ -4368,7 +4386,7 @@ fn attribute_pass_with_kernel(
             if let Some(threshold) = threshold {
                 probe = probe.with_auto_threshold(threshold);
             }
-            let (attributed, observed) = attribute_sweep_with_kernel(
+            let (attributed, observed, witness_spent) = attribute_sweep_with_kernel(
                 collection,
                 bound,
                 segment_policy,
@@ -4380,13 +4398,13 @@ fn attribute_pass_with_kernel(
             );
             drop(probe);
             drop(installed);
-            Some((attributed, observed))
+            Some((attributed, observed, witness_spent))
         } else {
             None
         }
     };
-    match proved {
-        Some((attributed, observed)) => {
+    let (out, spent) = match proved {
+        Some((attributed, observed, witness_spent)) => {
             // A fully proved pass adds zero to the totals.
             let ledger_first = session.fallback_totals().first_reason;
             {
@@ -4401,7 +4419,7 @@ fn attribute_pass_with_kernel(
                 // its sticky status and counters persist across the capture.
                 shared.session = Some(session);
             }
-            match attributed {
+            let out = match attributed {
                 Some(attributed) => Some(attributed),
                 None => {
                     // Kernel expectations failed to install: same-pin
@@ -4429,7 +4447,8 @@ fn attribute_pass_with_kernel(
                         },
                     )
                 }
-            }
+            };
+            (out, witness_spent)
         }
         None => {
             // The install failed but the session stays valid: return it
@@ -4439,7 +4458,8 @@ fn attribute_pass_with_kernel(
                 note_anchor_setup_fallback(&mut shared, capture_excluded);
                 shared.session = Some(session);
             }
-            attribute_sweep_with(
+            let mut capture_excluded_spent = 0u32;
+            let out = attribute_sweep_with(
                 collection,
                 bound,
                 &bound.aggregate,
@@ -4451,11 +4471,9 @@ fn attribute_pass_with_kernel(
                         // refused hook manufactures no kernel proofs;
                         // non-overlay ranges read from userspace exactly
                         // as below).
-                        let mut hook =
-                            crate::discovery::kernel_identity::AnchorRefusedHook::new(index);
                         let mut witness =
                             crate::discovery::overlay_witness::KernelSweepWitness::new();
-                        crate::discovery::confirm_shards::attribute_unselected_with_segment_proof_with_witness(
+                        let out = crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
                             sweep,
                             unavailable,
                             selected,
@@ -4465,11 +4483,12 @@ fn attribute_pass_with_kernel(
                             reservations,
                             shards,
                             &|| OsConfirmIo::with_pools(pools),
-                            &mut hook,
                             &bound.aggregate,
                             &mut witness,
                             witness_start,
-                        )
+                        );
+                        capture_excluded_spent = witness.used();
+                        out
                     } else {
                         crate::discovery::confirm_shards::attribute_unselected_with_policy(
                             sweep,
@@ -4484,15 +4503,23 @@ fn attribute_pass_with_kernel(
                         )
                     }
                 },
-            )
+            );
+            (out, capture_excluded_spent)
         }
+    };
+    {
+        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        shared.advance_witness_rotation(spent);
     }
+    out
 }
 
 /// Kernel sweep attribution: the [`attribute_sweep_with`] prefix
 /// (index, selection, refused filtering) plus kernel slot
 /// expectations and the segment-proof hook. Setup failures return
-/// `None` so the caller runs the same-pin userspace fallback.
+/// `None` so the caller runs the same-pin userspace fallback. The
+/// third return is the witness queries this sweep spent, so the
+/// caller can advance the pass-wide rotation past them.
 #[allow(clippy::too_many_arguments)]
 fn attribute_sweep_with_kernel<Io, F>(
     collection: &mut Collection,
@@ -4506,6 +4533,7 @@ fn attribute_sweep_with_kernel<Io, F>(
 ) -> (
     Option<Attributed>,
     Option<crate::discovery::kernel_identity::KernelFallbackReason>,
+    u32,
 )
 where
     Io: crate::discovery::confirm_shards::ShardableIo,
@@ -4513,7 +4541,7 @@ where
     F: Fn() -> Io + Sync,
 {
     if !collection.cap_hit {
-        return (None, None);
+        return (None, None, 0);
     }
     let (mut index, selected, refused) = sweep_proof_prefix(collection, bound, &bound.aggregate);
     progress!(
@@ -4521,7 +4549,7 @@ where
         collection.sweep.len().saturating_sub(selected.len())
     );
     if probe.install_expectations(&mut index).is_err() {
-        return (None, None);
+        return (None, None, 0);
     }
     let mut observing = FallbackObservingProof {
         inner: probe.segment_proof(),
@@ -4549,6 +4577,7 @@ where
         );
     let changed = retain_unchanged(&mut attribution, &bound.aggregate);
     let observed = observing.observed();
+    let spent = witness.used();
     (
         Some(Attributed {
             attribution,
@@ -4556,6 +4585,7 @@ where
             changed,
         }),
         observed,
+        spent,
     )
 }
 
@@ -5293,6 +5323,69 @@ mod tests {
                 assert_eq!(checks.btf_calls.load(Ordering::SeqCst), btf);
             }
         }
+    }
+
+    /// The witness rotation advances by the queries a pass actually
+    /// spends (a full 8-query budget moves the window by 8, not 1; a
+    /// pass with no witness leaves it), wrapping at `u64::MAX`.
+    #[test]
+    fn witness_rotation_advances_by_queries_spent() {
+        let (shared, _) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::session_fails(IdentityUnavailable::LoadFailed),
+        );
+        let mut guard = shared.lock().unwrap();
+        assert_eq!(guard.witness_start(), 0);
+        guard.advance_witness_rotation(8);
+        assert_eq!(guard.witness_start(), 8);
+        guard.advance_witness_rotation(0);
+        assert_eq!(guard.witness_start(), 8);
+        guard.sweep_witness_rotation = u64::MAX;
+        guard.advance_witness_rotation(1);
+        assert_eq!(guard.witness_start(), 0);
+    }
+
+    /// A pass with no witness run (sticky setup failure: no takeout,
+    /// plain userspace path) leaves the rotation alone, so the next
+    /// kernel pass restarts from the same offset instead of skipping
+    /// a candidate it never proved.
+    #[test]
+    fn witness_rotation_stays_when_no_witness_runs() {
+        let (shared, _) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::session_fails(IdentityUnavailable::LoadFailed),
+        );
+        {
+            let mut guard = shared.lock().unwrap();
+            guard.sweep_witness_rotation = 5;
+        }
+        assert!(take_session_for_pass(&shared).is_none());
+        assert!(take_session_for_pass(&shared).is_none());
+        let mut collection = empty_collection();
+        let bound = super::bind_collection(&mut collection);
+        let policy = crate::discovery::sweep_attribution::SegmentPolicy::from_headroom(16, 1, 1);
+        let reservations = crate::discovery::sweep_attribution::ReservationOwner::new(policy);
+        let custody = crate::discovery::kernel_identity::ExaminedCustody::new(
+            reservations.clone(),
+            std::collections::BTreeMap::new(),
+        );
+        let out = super::attribute_pass_with_kernel(
+            &shared,
+            None,
+            &mut collection,
+            &bound,
+            custody,
+            policy,
+            &reservations,
+            1,
+            crate::discovery::sweep_attribution::ProofPools {
+                batch: None,
+                immediate: None,
+            },
+            None,
+        );
+        assert!(out.is_none());
+        assert_eq!(shared.lock().unwrap().sweep_witness_rotation, 5);
     }
 
     /// D3d: first-use session setup under scarce FDs refuses before

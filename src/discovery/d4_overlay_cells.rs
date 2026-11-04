@@ -3531,9 +3531,9 @@ fn privileged_k2_sweep_overlay_no_fallback() {
 /// through its private session: the fresh-upper row joins, the stale-lower
 /// row keeps the named `overlay_kernel_unavailable` loss, and the
 /// no-witness RED run keeps the loss on the fresh row (the edge needs the
-/// witness). With only the excluded anchor admitted, the install fails and
-/// the userspace path keeps the loss with no witness query (the gap when
-/// every anchor is watched).
+/// witness). With only the excluded anchor admitted, the install fails
+/// and the same witness route proves the shape: the fresh row joins,
+/// the stale row keeps the loss, and the no-witness run keeps the loss.
 #[test]
 #[ignore = "root: loop overlay mounts drive the sweep-side witness cell"]
 fn privileged_k1_sweep_witness_fresh_joins_stale_refuses() {
@@ -3850,7 +3850,9 @@ fn k1_sweep_witness_fresh_row(
         k2_assert_loss(&red, pid, "fresh RED")?;
     }
     // Only the excluded anchor: the install fails (every anchor watched)
-    // and the userspace path keeps the loss with no witness query.
+    // and the same production witness route proves the shape: the fresh
+    // row joins with one query, while the same shape without the witness
+    // keeps the loss.
     {
         use crate::discovery::kernel_identity::{
             AnchorPass, ExaminedCustody, KernelAnchorExclusions,
@@ -3870,6 +3872,7 @@ fn k1_sweep_witness_fresh_row(
                 .map_err(|error| format!("k1 only-excluded census: {error}"))?,
             0,
         );
+        let sweep_owner = owner.clone();
         let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
         custody
             .reconcile(
@@ -3891,20 +3894,61 @@ fn k1_sweep_witness_fresh_row(
                 "k1 only-excluded premise broken: install succeeded with no anchors".into(),
             );
         }
-        let userspace = d4_overlay_attribute_pid(pid, target.maps(), &index);
+        let policy = SegmentPolicy::from_headroom(16, 1, 1);
+        let sweep = vec![(pid, target.maps())];
+        // GREEN: the production witness route joins the fresh row.
+        let mut budget = CaptureWorkBudget::default();
+        let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
+        let out =
+            crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
+                &sweep,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &index,
+                &mut budget,
+                policy,
+                &sweep_owner,
+                1,
+                &|| OsConfirmIo::with_pool(None),
+                &pins,
+                &mut witness,
+                0,
+            );
+        let used = witness.used();
         if n4 {
-            k2_assert_edge(&userspace, pid, key, "fresh only-excluded (N4)")?;
-        } else if stable == Some(false) {
-            k2_assert_mismatch(&userspace, "fresh only-excluded (unstable)")?;
-        } else {
-            if held.identity != t_truth.map_files_identity() {
+            k2_assert_edge(&out, pid, key, "fresh only-excluded (N4)")?;
+            if used != 0 {
                 return Err(format!(
-                    "k1 fresh premise broken: expected agreeing userspace identity: {:?} vs {:?}",
-                    held.identity,
-                    t_truth.map_files_identity()
+                    "k1 fresh only-excluded N4 ran {used} witness queries, want 0"
                 ));
             }
-            k2_assert_loss(&userspace, pid, "fresh only-excluded")?;
+        } else {
+            k2_assert_edge(&out, pid, key, "fresh only-excluded")?;
+            if used != 1 {
+                return Err(format!(
+                    "k1 fresh only-excluded ran {used} witness queries, want 1"
+                ));
+            }
+        }
+        // RED: the same refused shape without the witness keeps the loss.
+        let mut red_budget = CaptureWorkBudget::default();
+        let mut hook = crate::discovery::kernel_identity::AnchorRefusedHook::new(&index);
+        let red = crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut red_budget,
+            policy,
+            &sweep_owner,
+            1,
+            &|| OsConfirmIo::with_pool(None),
+            &mut hook,
+        );
+        if n4 {
+            k2_assert_edge(&red, pid, key, "fresh only-excluded RED (N4)")?;
+        } else {
+            k2_assert_loss(&red, pid, "fresh only-excluded RED")?;
         }
     }
     eprintln!(
@@ -4063,6 +4107,88 @@ fn k1_sweep_witness_stale_row(
                 return Err(format!(
                     "k1 stale lane-A ran {used} witness queries, want 0"
                 ));
+            }
+        }
+    }
+    // Only the excluded anchor: the install fails (every anchor watched)
+    // and the same production witness route proves the shape: the stale
+    // row keeps the named loss on lane B with one query, while lane A
+    // never admits the stale key.
+    {
+        use crate::discovery::kernel_identity::{
+            AnchorPass, ExaminedCustody, KernelAnchorExclusions,
+        };
+        let (index, _) = KnownKeyIndex::build(
+            [(key, Some(object))],
+            &BTreeMap::from([(key, object)]),
+            [],
+            &pins,
+        );
+        let watched_target = pins
+            .retain_inventory_target(object)
+            .map_err(|error| format!("k1 only-excluded retain watched: {error}"))?;
+        let exclusions = KernelAnchorExclusions::from_targets([&watched_target]);
+        let owner = ReservationOwner::for_examined(
+            SegmentPolicy::try_snapshot(0, 0)
+                .map_err(|error| format!("k1 only-excluded census: {error}"))?,
+            0,
+        );
+        let sweep_owner = owner.clone();
+        let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+        custody
+            .reconcile(
+                SegmentPolicy::try_snapshot(1, 1)
+                    .map_err(|error| format!("k1 only-excluded confirm census: {error}"))?,
+            )
+            .map_err(|error| format!("k1 only-excluded reconcile: {error}"))?;
+        let pass = AnchorPass::prepare_excluding(&pins, [(key, object)], custody, &exclusions);
+        if !pass.only_capture_excluded() {
+            return Err(format!(
+                "k1 only-excluded premise broken: {:?}",
+                pass.fallback
+            ));
+        }
+        *generation += 1;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        if session.install_anchors(pass, *generation, deadline).is_ok() {
+            return Err(
+                "k1 only-excluded premise broken: install succeeded with no anchors".into(),
+            );
+        }
+        let policy = SegmentPolicy::from_headroom(16, 1, 1);
+        let sweep = vec![(pid, stale.maps())];
+        let mut budget = CaptureWorkBudget::default();
+        let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
+        let out =
+            crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
+                &sweep,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &index,
+                &mut budget,
+                policy,
+                &sweep_owner,
+                1,
+                &|| OsConfirmIo::with_pool(None),
+                &pins,
+                &mut witness,
+                0,
+            );
+        let used = witness.used();
+        match lane {
+            OverlayLane::B => {
+                k2_assert_loss(&out, pid, "stale only-excluded")?;
+                if used != 1 {
+                    return Err(format!("k1 stale only-excluded ran {used} queries, want 1"));
+                }
+            }
+            OverlayLane::A => {
+                k2_assert_no_candidate(&out, "stale only-excluded")?;
+                if used != 0 {
+                    return Err(format!(
+                        "k1 stale only-excluded lane-A ran {used} witness queries, want 0"
+                    ));
+                }
             }
         }
     }

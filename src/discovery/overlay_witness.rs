@@ -73,7 +73,9 @@ impl KernelSweepWitness {
         Self { used: 0 }
     }
 
-    #[cfg(test)]
+    /// Queries spent so far: the pass advances its witness rotation
+    /// by this count, so the next pass continues past the candidates
+    /// this pass already proved.
     pub(crate) fn used(&self) -> u32 {
         self.used
     }

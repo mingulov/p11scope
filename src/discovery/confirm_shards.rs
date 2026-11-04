@@ -96,9 +96,10 @@ pub(crate) trait SegmentProof {
     ) -> crate::discovery::kernel_identity::ProofDecision<'r>;
 }
 
-/// Rotation offset for one witness pass: the per-pass budget covers a
-/// different candidate prefix each pass, so callers past the budget
-/// prove within a few passes instead of starving every pass.
+/// Rotation offset for one witness pass over the whole sweep: the
+/// per-pass budget covers a different candidate window each pass, so
+/// callers past the budget prove within a few passes instead of
+/// starving every pass.
 fn rotated_start(candidates: usize, witness_start: u64) -> usize {
     if candidates == 0 {
         0
@@ -1269,6 +1270,51 @@ where
     )
 }
 
+/// Failed-install sweep for a pass whose anchors never installed
+/// because every anchor is capture-watched: no sweep kernel run
+/// exists, so the refused hook marks exactly the overlay ranges (no
+/// manufactured kernel proofs) and the private witness proves them;
+/// non-overlay ranges read from userspace exactly like the plain
+/// path. Production and the privileged sweep cell share this
+/// function, so the tested route cannot drift from the shipped one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attribute_unselected_capture_excluded_with_witness<Io, F>(
+    sweep: &[(u32, Vec<MapEntry>)],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+    budget: &mut CaptureWorkBudget,
+    policy: SegmentPolicy,
+    owner: &ReservationOwner,
+    threads: usize,
+    make_io: &F,
+    pins: &PinnedObjects,
+    witness: &mut dyn SweepWitness,
+    witness_start: u64,
+) -> SweepAttribution
+where
+    Io: ShardableIo,
+    Io::Pin: Send,
+    F: Fn() -> Io + Sync,
+{
+    let mut hook = crate::discovery::kernel_identity::AnchorRefusedHook::new(index);
+    attribute_unselected_with_segment_proof_with_witness(
+        sweep,
+        unavailable,
+        selected,
+        index,
+        budget,
+        policy,
+        owner,
+        threads,
+        make_io,
+        &mut hook,
+        pins,
+        witness,
+        witness_start,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attribute_unselected_with_policy<Io, F>(
     sweep: &[(u32, Vec<MapEntry>)],
@@ -1322,6 +1368,24 @@ where
     Io::Pin: Send,
     F: Fn() -> Io + Sync,
 {
+    // The witness budget covers one window across the whole pass, not
+    // one prefix per segment: rotate the sweep once, so a later
+    // segment's callers prove as soon as the window reaches them
+    // instead of starving behind an earlier segment's wrap-around.
+    // Skipped without a witness (no rotation) and at offset zero.
+    let offset = if witness.is_some() {
+        rotated_start(sweep.len(), witness_start)
+    } else {
+        0
+    };
+    let rotated = if offset == 0 {
+        None
+    } else {
+        let mut order = sweep.to_vec();
+        order.rotate_left(offset);
+        Some(order)
+    };
+    let sweep: &[(u32, Vec<MapEntry>)] = rotated.as_deref().unwrap_or(sweep);
     let prove = index.map_files_keys();
     let mut out = SweepAttribution::default();
     let batch = owner.batch();
@@ -1472,9 +1536,10 @@ where
             && let Some((pins, runner)) = witness.as_mut()
         {
             let pins = *pins;
-            // The budget covers a rotated candidate prefix each pass,
-            // so the same callers never starve every pass.
-            let mut order: Vec<usize> = prepared
+            // Stable segment order: the sweep input already carries
+            // the pass-wide rotation, so this prefix continues where
+            // the previous segment left off.
+            let order: Vec<usize> = prepared
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| {
@@ -1486,8 +1551,6 @@ where
                 })
                 .map(|(slot, _)| slot)
                 .collect();
-            let offset = rotated_start(order.len(), witness_start);
-            order.rotate_left(offset);
             for slot in order {
                 let (at, prepared) = &mut prepared[slot];
                 let (pid, sweep_entries) = &sweep[*at];

@@ -1272,26 +1272,32 @@ The old bounds are measurements, not a product startup SLA.
   overlay provider (attach-set exclusion, for example a provider
   inside a container) proves through a private witness session with no
   exclusions, one query per watched (pid, key) under a per-pass budget
-  of 8 queries, starting one candidate later each pass; a same-file
-  verdict joins, anything else (another file, failure, budget
-  exhaustion) keeps the named loss, never a userspace join. The
-  witness also covers refused overlay ranges from unproven requests in
-  an ordinary kernel batch: callers the run never visited, demoted
-  duplicates, and zombie batches. A pass whose anchors never installed
-  because every anchor is watched takes the same witness route with no
-  sweep kernel run. The remaining sweep paths keep the named loss with
-  no witness query: cgroup-scoped collection (the userspace-only
-  path), a segment after the pass's third kernel run or another run
-  failure (sticky, deadline, stream, headroom), an oversized single
-  caller (which reads its ranges and then refuses), file-descriptor
-  pressure (every pid takes the immediate path, which reads and then
-  refuses, including its idle promotions), a failed kernel expectation
-  or anchor install that is not capture-excluded, and the explicit
-  userspace identity backend (which never reaches the witness). The
-  pure-userspace sweep reads the ranges and then refuses the join; the
-  kernel ladder refuses without reading them, except the oversized,
-  cgroup, immediate and failed-install paths which read and then
-  refuse (still never an edge).
+  of 8 queries; each pass starts past the queries the previous pass
+  spent, so with more than 8 refused callers every pass proves a
+  different 8 and each caller alternates between joined and the named
+  loss. A same-file verdict joins, anything else (another file,
+  failure, budget exhaustion) keeps the named loss, never a userspace
+  join. While a caller waits for its turn, its edge reads uncertain
+  and its in-flight operations end as unknown. The witness also
+  covers refused overlay ranges from unproven requests in an ordinary
+  kernel batch: callers the run never visited, demoted duplicates,
+  and zombie batches. A pass whose anchors never installed because
+  every anchor is watched takes the same witness route with no sweep
+  kernel run. The remaining sweep paths keep the named loss with no
+  witness query: cgroup-scoped collection (the userspace-only path),
+  a segment after the pass's third kernel run or another run failure
+  (sticky, deadline, stream, headroom), an oversized single caller
+  (which reads its ranges and then refuses), file-descriptor pressure
+  (every pid takes the immediate path, which reads and then refuses,
+  including its idle promotions), a failed kernel expectation or
+  anchor install that is not capture-excluded, a failed kernel
+  session setup (creation error or setup file-descriptor shortage,
+  which stays failed so every later pass takes the plain userspace
+  path), and the explicit userspace identity backend (which never
+  reaches the witness). The pure-userspace sweep reads the ranges and
+  then refuses the join; the kernel ladder refuses without reading
+  them, except the oversized, cgroup, immediate and failed-install
+  paths which read and then refuse (still never an edge).
   One verdict covers the file: the deep-scan witness proves the first
   witness-requiring caller range, and a same-file verdict joins every
   range of the group. A process that maps one provider both before and

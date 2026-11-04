@@ -8,10 +8,11 @@
 //! The `v` command replicates the instance-continuity fixture's case-`v`
 //! verbatim: a synchronous `CLONE_VM` sharer maps and unmaps one page of
 //! provider A in the shared mm (`waitpid`), so the trigger carries no
-//! timing dependence in the router. The test paces alternating `a`/`b`
-//! call bursts across the whole capture and lands one churn mid-run,
-//! so the lane's own scans observe gen-0, the churn, and the tainted
-//! continuation no matter when attach completes.
+//! timing dependence in the router. The test waits for the lane-ready
+//! marker, paces gen-0 bursts on both providers, lands one churn, and
+//! paces alternating `a`/`b` bursts to the end, so the lane's own
+//! scans observe gen-0, the churn, and the tainted continuation no
+//! matter when attach completes.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -136,8 +137,14 @@ int main(int argc, char **argv)
 /// the whole run, the churn lands mid-capture, and the tail keeps the
 /// lane scanning (no re-yield).
 const CAPTURE_DURATION_SECS: u64 = 40;
-const CHURN_AT_SECS: u64 = 20;
 const PACE_SECS: u64 = 2;
+/// Pre-churn bursts after lane-ready: eight bursts (~16 s) put the
+/// first router observations several scans behind the churn even
+/// when early scans lag a late attach.
+const GEN0_BURSTS: u64 = 8;
+/// The capture-stderr line proving the semantic lane observes: the
+/// churn synchronizes on it, never on a wall clock.
+const READY_MARKER: &str = "semantic lane ready";
 const LINE_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(150);
 
@@ -348,9 +355,10 @@ struct Leg2Outcome {
     capture_secs: u64,
 }
 
-/// One installed capture over the two-provider driver: bursts across the
-/// run, the `v` churn of provider A in the middle when asked, then the
-/// parsed output document. The driver stays alive until the capture ends.
+/// One installed capture over the two-provider driver: wait for the
+/// lane-ready marker, pace gen-0 bursts, the `v` churn of provider A
+/// when asked, then bursts to the end, then the parsed output
+/// document. The driver stays alive until the capture ends.
 fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
     let directory = tempfile::tempdir()?;
     // Two distinct file identities of one provider source.
@@ -374,6 +382,10 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
     // (`Harness::start`), and an identical sharer-churn workload stages
     // the disclosure under singles while uprobe-multi links stage none
     // (a lane data gap outside leg 2; reported, not worked around here).
+    // Stderr is piped (and echoed) so the churn synchronizes on the
+    // lane becoming ready: a wall-clock churn can land before a late
+    // attach completes, and a churn with no pre-churn observation
+    // stages no disclosure.
     let mut capture = Command::new(&observer)
         .args([
             "inventory",
@@ -390,14 +402,80 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
             "-o",
             &out.to_string_lossy(),
         ])
+        .stderr(Stdio::piped())
         .spawn()
         .context("spawning the installed capture")?;
-    // Paced across the whole run: alternating `a`/`b` bursts keep both
-    // providers live whenever attach completes (a debug observer can
-    // take ~10 s to reach its first pass), and the churn lands
-    // mid-capture with twin-shaped calls on both sides of it.
-    let churn_at = started + Duration::from_secs(CHURN_AT_SECS);
-    let mut churn_done = !churn;
+    let capture_stderr = capture.stderr.take().context("capture stderr")?;
+    let (log_sender, log_lines) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(capture_stderr).lines() {
+            let Ok(line) = line else { break };
+            eprintln!("{line}");
+            if log_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut recent: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let last_lines = |recent: &std::collections::VecDeque<String>| {
+        recent
+            .iter()
+            .rev()
+            .take(5)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    loop {
+        if capture.try_wait()?.is_some() {
+            anyhow::bail!(
+                "the capture exited before the lane became ready: {}",
+                last_lines(&recent)
+            );
+        }
+        ensure!(
+            started.elapsed() < CAPTURE_TIMEOUT,
+            "the semantic lane never became ready"
+        );
+        match log_lines.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => {
+                if line.contains(READY_MARKER) {
+                    break;
+                }
+                recent.push_back(line);
+                while recent.len() > 20 {
+                    recent.pop_front();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if capture.try_wait()?.is_some() {
+                    anyhow::bail!(
+                        "the capture exited before the lane became ready: {}",
+                        last_lines(&recent)
+                    );
+                }
+            }
+        }
+    }
+    eprintln!("B17_LEG2_READY after {}s", started.elapsed().as_secs());
+    // A long gen-0 window so both providers are observed (joined,
+    // not shed) well before the churn: the disclosure needs a
+    // pre-churn router observation, and the first scans can lag a
+    // late attach by several bursts under load.
+    for index in 0..GEN0_BURSTS {
+        let burst = if index % 2 == 0 { b'a' } else { b'b' };
+        let answered = driver.command(burst)?;
+        ensure!(
+            answered == "CALLED_A" || answered == "CALLED_B",
+            "gen-0 pace answer: {answered}"
+        );
+        std::thread::sleep(Duration::from_secs(PACE_SECS));
+    }
+    if churn {
+        let churned = driver.command(b'v')?;
+        ensure!(churned == "SHARER", "churn answer: {churned}");
+    }
     let mut pace_a = true;
     let status = loop {
         if let Some(status) = capture.try_wait()? {
@@ -407,11 +485,6 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
             started.elapsed() < CAPTURE_TIMEOUT,
             "the installed capture did not finish in time"
         );
-        if !churn_done && Instant::now() >= churn_at {
-            let churned = driver.command(b'v')?;
-            ensure!(churned == "SHARER", "churn answer: {churned}");
-            churn_done = true;
-        }
         let burst = if pace_a { b'a' } else { b'b' };
         pace_a = !pace_a;
         let answered = driver.command(burst)?;
@@ -421,7 +494,6 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
         );
         std::thread::sleep(Duration::from_secs(PACE_SECS));
     };
-    ensure!(churn_done, "the capture ended before the churn");
     let capture_secs = started.elapsed().as_secs();
     ensure!(status.success(), "the installed capture exited {status}");
     let quit = driver.command(b'q')?;
@@ -431,6 +503,7 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
     let bytes = std::fs::read(&out).context("reading the output document")?;
     let document: serde_json::Value =
         serde_json::from_slice(&bytes).context("parsing the output document")?;
+    eprintln!("B17_LEG2_DOC {document}");
     Ok(Leg2Outcome {
         document,
         driver_pid,

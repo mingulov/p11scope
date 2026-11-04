@@ -6,6 +6,10 @@
 # P11SCOPE_PUBLIC_CLI_CELLS="cell ..." runs only the named gated lifecycle
 # cells (profile-pid, metrics-pid, trace-pid, mt-exact, system) instead of
 # the full campaign; anything else fails closed here as a usage error.
+# P11SCOPE_QUALIFY_GATED_BIN=PATH P11SCOPE_QUALIFY_MT_BIN=PATH: prebuilt
+# gated/mt workloads for tests-only hosts (no gcc); when both are set the
+# gcc builds are skipped. Setting only one, or a missing file, fails
+# closed before any campaign starts.
 # Every terminal result has cell/pass/detail/qualification. Exit 1 means failed
 # evidence, 2 means valid smoke/nonqualifying evidence, 0 qualifies the subset.
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
@@ -404,7 +408,13 @@ if [ "$CONTROL" = 1 ]; then
 fi
 SRC=$HERE/../tests/fixtures/public-cli
 FIX=$OUT/fix; mkdir -p "$FIX"
-gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread && gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
+if [ -n "${P11SCOPE_QUALIFY_GATED_BIN:-}" ] || [ -n "${P11SCOPE_QUALIFY_MT_BIN:-}" ]; then
+  [ -x "${P11SCOPE_QUALIFY_GATED_BIN:-}" ] && [ -x "${P11SCOPE_QUALIFY_MT_BIN:-}" ] || exit 65
+  cp -- "$P11SCOPE_QUALIFY_GATED_BIN" "$FIX/gated" && cp -- "$P11SCOPE_QUALIFY_MT_BIN" "$FIX/mt" || exit 65
+else
+  gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl && gcc -O2 -o "$FIX/mt" "$SRC/mt.c" -ldl -lpthread || exit 65
+fi
+gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
 GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use
 chmod 755 "$FIX" "$GATED" "$MT"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf

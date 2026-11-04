@@ -38,6 +38,17 @@
 #     scripts/qualify-public-cli.sh; STUB must write DESTDIR/results.jsonl
 #     oracle rows. For wrap/flip checks only; never set in CI. It never
 #     bypasses the root requirement, and a missing STUB is a harness error.
+#   LEGACY32_STOCK_MODULE=PATH
+#     provider for the stock control legs; default unset = system default
+#     (env -u MODULE selection). For tests-only hosts whose stock IS 2.7
+#     (e.g. Fedora), point at an unpacked 2.6.1 libsofthsm2.so.
+#   LEGACY32_PREBUILT_SO=PATH LEGACY32_PREBUILT_PROBE=PATH
+#     prebuilt fixture .so and shape probe for tests-only hosts (no cc);
+#     when both are set the cc builds are skipped but the probe facts
+#     and every gate still run. Setting only one, a missing file, or
+#     combining with build flags (LEGACY32_CFLAGS, extra args) is a
+#     harness error. On tests-only hosts also set
+#     P11SCOPE_QUALIFY_GATED_BIN/_MT_BIN (see qualify-public-cli.sh).
 #
 # Scan-flip note (porter): the scan lane task/v060-scan-legacy32
 # (8 commits c50029324..8d491f187) teaches render to report a proven
@@ -66,7 +77,9 @@ else
   OUT=$2
   [ "$(id -u)" = 0 ] || { echo 'must run as root' >&2; exit 64; }
 fi
-command -v cc >/dev/null || { echo 'cc required' >&2; exit 64; }
+if [ -z "${LEGACY32_PREBUILT_SO:-}" ] && [ -z "${LEGACY32_PREBUILT_PROBE:-}" ]; then
+  command -v cc >/dev/null || { echo 'cc required' >&2; exit 64; }
+fi
 command -v nm >/dev/null || { echo 'nm (binutils) required' >&2; exit 64; }
 mkdir -p "$OUT" && OUT=$(realpath -e -- "$OUT") || exit 64
 : > "$OUT/results.jsonl"
@@ -83,10 +96,26 @@ PY
 shape_build_and_judge() {
   local dir=$1; shift
   local so=$dir/legacy32.so probe=$dir/shape-probe facts
-  # shellcheck disable=SC2086
-  cc -std=c11 -O2 -fPIC -fno-ipa-icf -fno-merge-constants -Wall -Wextra -Werror \
-    -shared -Wl,-z,defs ${LEGACY32_CFLAGS:-} "$@" -o "$so" "$FIXSRC/legacy32.c" || return 2
-  cc -std=c11 -O2 -Wall -Wextra -Werror -o "$probe" "$FIXSRC/shape-probe.c" -ldl || return 2
+  if [ -n "${LEGACY32_PREBUILT_SO:-}" ] || [ -n "${LEGACY32_PREBUILT_PROBE:-}" ]; then
+    [ -n "${LEGACY32_PREBUILT_SO:-}" ] && [ -n "${LEGACY32_PREBUILT_PROBE:-}" ] || {
+      result legacy32-shape 0 'prebuilt seam needs both LEGACY32_PREBUILT_SO and LEGACY32_PREBUILT_PROBE' failed
+      return 2
+    }
+    [ -z "${LEGACY32_CFLAGS:-}" ] && [ $# = 0 ] || {
+      result legacy32-shape 0 'prebuilt seam cannot combine with build flags (LEGACY32_CFLAGS, extra args)' failed
+      return 2
+    }
+    [ -r "${LEGACY32_PREBUILT_SO}" ] && [ -x "${LEGACY32_PREBUILT_PROBE}" ] || {
+      result legacy32-shape 0 "prebuilt fixture missing or unusable: SO=${LEGACY32_PREBUILT_SO} PROBE=${LEGACY32_PREBUILT_PROBE}" failed
+      return 2
+    }
+    cp -- "${LEGACY32_PREBUILT_SO}" "$so" && cp -- "${LEGACY32_PREBUILT_PROBE}" "$probe" && chmod 755 "$so" "$probe" || return 2
+  else
+    # shellcheck disable=SC2086
+    cc -std=c11 -O2 -fPIC -fno-ipa-icf -fno-merge-constants -Wall -Wextra -Werror \
+      -shared -Wl,-z,defs ${LEGACY32_CFLAGS:-} "$@" -o "$so" "$FIXSRC/legacy32.c" || return 2
+    cc -std=c11 -O2 -Wall -Wextra -Werror -o "$probe" "$FIXSRC/shape-probe.c" -ldl || return 2
+  fi
   facts=$("$probe" "$so") || return 2
   printf '%s\n' "$facts"
   local major=${LEGACY32_EXPECT_MAJOR:-3} minor=${LEGACY32_EXPECT_MINOR:-2}
@@ -197,7 +226,8 @@ if run_qualify "$SO" "$OUT/legacy32"; then
 else
   harness=1
 fi
-if run_qualify '' "$OUT/stock"; then
+STOCK_MODULE=${LEGACY32_STOCK_MODULE:-}
+if run_qualify "$STOCK_MODULE" "$OUT/stock"; then
   wrap_cell "$OUT/stock/results.jsonl" profile-pid stock-pid control || {
     rc=$?; [ "$rc" = 1 ] && failed=1 || harness=1
   }

@@ -2576,7 +2576,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                     "loader BPF delivery failure suspected (0 hits, no EXEC acknowledgment)"
                         .to_string()
                 } else if loader.hits == 0 && loader.strategies.debug_state_every_hit >= 2 {
-                    "loader uprobe never fired despite EXEC acknowledgment (uprobe miss suspected)"
+                    "loader uprobe never fired despite EXEC processing (uprobe miss suspected)"
                         .to_string()
                 } else {
                     "live loader timing unproven".to_string()

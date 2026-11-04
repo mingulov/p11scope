@@ -1278,6 +1278,13 @@ impl JournalAdapter {
         self.stream_broken
     }
 
+    /// Break the linked stream while ingesting, as a non-contiguous cut
+    /// does in `IngestedRaw` ingestion (no raw disposal, custody held).
+    #[cfg(test)]
+    pub(crate) fn break_stream_for_test(&mut self) {
+        self.stream_broken = true;
+    }
+
     /// Test-only read of the adapter invalidation flag; see above.
     #[cfg(test)]
     pub(crate) fn invalidated_for_test(&self) -> bool {

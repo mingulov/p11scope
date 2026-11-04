@@ -8485,6 +8485,111 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     );
 }
 
+/// The ingest-break void abandons every pre-break key: its live sessions
+/// end Uncertain(Loss), its objects retire, its bootstrap voids. Those
+/// effects are the void's own original failure; they ride the next audit
+/// frame as its raw failure (never dropped), so the pre-break key's
+/// consumer sees its session end. S1 still joins the follow-up call.
+#[test]
+fn joint_machine_break_void_carries_pre_break_session_ends() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 1, "the primed key holds one live session");
+    // A non-contiguous cut breaks the linked stream while ingesting:
+    // no raw disposal, so the pre-break session is still Live when the
+    // Idle tick voids the lane.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    let before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut carried = None;
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        if carried.is_none()
+            && let Some(failure) = owner.pending_void_for_test()
+        {
+            carried = Some(failure.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session,
+                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                    } if *session == live[0]
+                )
+            }));
+        }
+        let adapter = owner.adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert_eq!(
+        carried,
+        Some(true),
+        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+    );
+    fixture.published_labeled("linked-break-followup", None);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the follow-up audit frame took the void's failure as its raw failure"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum::<u64>(),
+        before + 1,
+        "S1 joins the follow-up call"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
 /// A void the pool cannot pay for is all-or-nothing and retried: the
 /// lane stays broken and un-voided (no key refused, no custody dropped)
 /// while the pool is short, every Idle tick yields instead of refusing,

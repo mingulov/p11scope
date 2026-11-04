@@ -219,6 +219,19 @@ pub(crate) struct JointCaptureOwner {
     // still alive (transient underaccounting at teardown).
     model: ObjectSemantics,
     adapter: JournalAdapter,
+    // The ingest-break void's own original failure (every pre-break key's
+    // abandonment effects) with the storage it prepaid. The next ingested
+    // audit frame carries it as that frame's raw failure; until then the
+    // lease stays charged. Declared after the adapter: it holds no ledger
+    // charge, only a pool lease and the failure's own buffers.
+    pending_void: Option<PendingVoid>,
+}
+
+/// A void's original failure and the lease that paid for it.
+pub(crate) struct PendingVoid {
+    pub(crate) failure: SealFailure,
+    pub(crate) bytes: usize,
+    pub(crate) lease: ResourceLease,
 }
 
 impl JointCaptureOwner {
@@ -229,7 +242,11 @@ impl JointCaptureOwner {
         adapter: JournalAdapter,
         model: ObjectSemantics,
     ) -> Self {
-        Self { model, adapter }
+        Self {
+            model,
+            adapter,
+            pending_void: None,
+        }
     }
 
     /// Build the capture's owner over the registry's existing pool: the
@@ -241,6 +258,7 @@ impl JointCaptureOwner {
         Self {
             model: ObjectSemantics::new(),
             adapter: JournalAdapter::with_ledger(limits, StagingLedger::with_resources(reserver)),
+            pending_void: None,
         }
     }
 
@@ -309,21 +327,44 @@ impl JointCaptureOwner {
         }
         let bytes = super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
             .ok_or(RawQuantumRefusal::Capacity)?;
-        let _storage = self
+        let lease = self
             .adapter
             .ledger
             .resource_reserver()
             .ok_or(RawQuantumRefusal::ForeignLedger)?
             .reserve(bytes)
             .map_err(RawQuantumRefusal::Resource)?;
-        let _failure = self.adapter.refuse_disposed_raw(
+        let failure = self.adapter.refuse_disposed_raw(
             &mut self.model,
             std::iter::empty(),
             true,
             INGEST_BREAK_VOID_GAP,
         );
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+        // Keep the abandonment (sessions Uncertain(Loss), views and objects
+        // retired, bootstrap voided) for the next audit frame's consumers.
+        // An older void still awaiting its frame keeps its slot: it covers
+        // the earlier keys, and this one's effects are then dropped as
+        // before; its keys stay refused and its gap is still named.
+        if self.pending_void.is_none() {
+            self.pending_void = Some(PendingVoid {
+                failure,
+                bytes,
+                lease,
+            });
+        }
         Ok(true)
+    }
+
+    /// Take the void's failure for an audit frame's raw slot.
+    pub(crate) fn take_pending_void(&mut self) -> Option<PendingVoid> {
+        self.pending_void.take()
+    }
+
+    /// The void failure still awaiting its audit frame.
+    #[cfg(test)]
+    pub(crate) fn pending_void_for_test(&self) -> Option<&SealFailure> {
+        self.pending_void.as_ref().map(|pending| &pending.failure)
     }
 
     /// The capture's one object model, with its retained history (read

@@ -55,6 +55,8 @@ pub(crate) struct IngestedJointQuantum {
     targets_storage: Option<ResourceLease>,
     // Every owned failure buffer drops before its retained storage is refunded.
     _storage: ResourceLease,
+    // The carried ingest-break void's own prepaid lease (its raw failure).
+    _void_storage: Option<ResourceLease>,
 }
 
 pub(crate) type AuditAcquisition = Result<IngestedJointQuantum, (IngestedRaw, RawQuantumRefusal)>;
@@ -641,8 +643,20 @@ impl IngestedJointQuantum {
         let (provenance, frontier) = ingested.into_provenance();
         let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
         let (adapter, model) = owner.parts();
-        let raw_failure = adapter.refuse_s1only_subjects(model);
+        let mut raw_failure = adapter.refuse_s1only_subjects(model);
         let failure = adapter.audit_collected(model, &audit, fault).err();
+        // An ingest-break void's abandonment rides the first ingested frame
+        // with a free raw slot, so every pre-break consumer receives it.
+        let (void_storage, void_bytes) = match raw_failure {
+            Some(_) => (None, 0),
+            None => match owner.take_pending_void() {
+                Some(void) => {
+                    raw_failure = Some(void.failure);
+                    (Some(void.lease), void.bytes)
+                }
+                None => (None, 0),
+            },
+        };
         let frame = Self {
             provenance,
             ingress: FrameIngress::Ingested,
@@ -659,11 +673,12 @@ impl IngestedJointQuantum {
             failure_storage: None,
             targets_storage: None,
             _storage: storage,
+            _void_storage: void_storage,
         };
         assert!(
-            frame
-                .retained_storage_bytes()
-                .is_some_and(|owned| owned <= bytes),
+            frame.retained_storage_bytes().is_some_and(|owned| bytes
+                .checked_add(void_bytes)
+                .is_some_and(|paid| owned <= paid)),
             "audit loss storage exceeds its checked preflight bound"
         );
         Ok(frame)
@@ -761,6 +776,7 @@ impl IngestedJointQuantum {
             failure_storage: None,
             targets_storage: None,
             _storage: storage,
+            _void_storage: None,
         };
         assert!(
             frame

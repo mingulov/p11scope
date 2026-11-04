@@ -3345,8 +3345,12 @@ class RingLayoutTests(unittest.TestCase):
 
     def test_retained_event_validation_never_opens_live_bpf_maps(self):
         subject = load_subject(TARGET_BITS)
+        events = [event_bytes(index) for index in range(28)]
+        if TARGET_BITS == 32:
+            events[3] = event_bytes(3, mechanism=subject.UNKNOWN)
+            events[4] = event_bytes(4, mechanism=subject.MAXIMUM)
         retained = {
-            "EVENTS": [event_bytes(index) for index in range(28)],
+            "EVENTS": events,
             "DISCOVERY": [bytes(subject.DISCOVERY_RECORD_SIZE)],
         }
         positions = {name: (0, subject.RING_RECORD_STRIDES[name] * len(rows))
@@ -3796,6 +3800,9 @@ class RawSafeEventTests(unittest.TestCase):
     def test_safe_event_family_and_pid_mutation(self):
         subject = load_subject(TARGET_BITS)
         events = [event_bytes(index) for index in range(28)]
+        if TARGET_BITS == 32:
+            events[3] = event_bytes(3, mechanism=subject.UNKNOWN)
+            events[4] = event_bytes(4, mechanism=subject.MAXIMUM)
         subject.assert_event_records(events, "default-safe-profile", 0x555)
         bad = list(events)
         raw = bytearray(bad[0])

@@ -3207,6 +3207,11 @@ struct SessionsOut {
 struct CgroupMechOut {
     mechanism: u64,
     mechanism_hex: String,
+    /// The BPF return path found this id in `MECH_SHAPE` (registry
+    /// membership). `false` marks an unregistered publication:
+    /// numeric id plus call/error counts only, never decoded, never
+    /// named — the same flag as the top-level `mechanisms[]` rows.
+    registered: bool,
     calls: u64,
     errors: u64,
 }
@@ -3251,6 +3256,7 @@ fn cgroups_out(state: &crate::semantics::State) -> Vec<CgroupOut> {
                 .map(|(&mechanism, m)| CgroupMechOut {
                     mechanism,
                     mechanism_hex: format!("0x{mechanism:x}"),
+                    registered: !m.unregistered,
                     calls: m.calls,
                     errors: m.errors,
                 })

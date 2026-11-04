@@ -4550,12 +4550,17 @@ fn capture_return_facts<const DEFER_ROUTING: bool>(
                 // Mechanism ids are public constants: outside the
                 // journal lane, publish the id with its call/error
                 // counts even without registry membership, flagged
-                // unregistered. The journal lane keeps withholding
+                // unregistered — but only when the value fits the
+                // portable 32-bit mechanism space. A wider word is
+                // not a public constant (a truncating provider could
+                // pass through uninitialized upper bytes); it stays
+                // unpublished. The journal lane keeps withholding
                 // (its validator pins the capture transition set).
                 // Parameters stay undecoded in both; the evidence
-                // total counts every occurrence in both.
+                // total counts every occurrence in both, including
+                // wider-than-32-bit values.
                 let member = unsafe { MECH_SHAPE.get(&value) }.is_some();
-                if member || !DEFER_ROUTING {
+                if member || (!DEFER_ROUTING && value <= 0xFFFF_FFFF) {
                     mechanism = value;
                     capture_flags = (capture_flags & !capture::MECHANISM_MASK)
                         | capture::MECHANISM_VALUE;

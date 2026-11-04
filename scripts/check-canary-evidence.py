@@ -56,6 +56,7 @@ def target_oracle(bits):
 ALIASES = None
 MAXIMUM = None
 UNKNOWN = None
+TARGET_BITS = None
 POLICY_BOOLEANS = {
     "CKA_TOKEN", "CKA_PRIVATE", "CKA_SENSITIVE", "CKA_ENCRYPT",
     "CKA_DECRYPT", "CKA_WRAP", "CKA_UNWRAP", "CKA_SIGN", "CKA_VERIFY",
@@ -112,11 +113,13 @@ SENTINELS = None
 
 def initialize(bits):
     """Initialize width-dependent policy and checked-in source inputs."""
-    global ALIASES, MAXIMUM, UNKNOWN, BPF_MAP_DEFS, SAFE_MAPS, FEATURE_MAPS, SENTINELS
+    global ALIASES, MAXIMUM, UNKNOWN, TARGET_BITS
+    global BPF_MAP_DEFS, SAFE_MAPS, FEATURE_MAPS, SENTINELS
     if bits not in (32, 64):
         raise ValueError("target bits must be 32 or 64")
     ALIASES, MAXIMUM = target_oracle(bits)
     UNKNOWN = ALIASES["mechanism"]
+    TARGET_BITS = bits
     BPF_MAP_DEFS = runpy.run_path(
         str(SCRIPT_DIR / "check-bpf-map-defs.py"), run_name="canary_map_inventory"
     )
@@ -446,7 +449,20 @@ def assert_safe_profile(doc):
     profile_terminal(doc)
     mechanisms = mechanism_map(doc)
     assert REGISTERED in mechanisms, "registered standard mechanism was not useful"
-    assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
+    assert mechanisms[REGISTERED]["registered"] is True, mechanisms[REGISTERED]
+    if TARGET_BITS == 32:
+        # Narrow unknown ids publish as approved registered:false rows:
+        # the numeric id with its call count, null params, never named.
+        for value in (UNKNOWN, MAXIMUM):
+            assert value in mechanisms, f"32-bit safe profile missed {value:#x}"
+            row = mechanisms[value]
+            assert row["registered"] is False, row
+            assert row["params"] is None and row.get("params_omitted") == "policy", row
+            assert row["calls"] == 1, row
+            assert "name" not in row, row
+    else:
+        # Wider-than-32-bit words are counted, never published.
+        assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
     # F-21: the policy null names its cause.
     assert all(item["params"] is None and item.get("params_omitted") == "policy"
                for item in mechanisms.values()), mechanisms
@@ -466,8 +482,24 @@ def assert_safe_trace(text):
               ))]
     assert events, "safe trace has no rendered call"
     assert "C_DigestInit 0x250" in text, "registered mechanism missing from trace"
-    for value in set(ALIASES.values()) | {MAXIMUM}:
+    for value in set(ALIASES.values()) - {UNKNOWN}:
         assert str(value) not in text and f"0x{value:x}" not in text, value
+    if TARGET_BITS == 32:
+        # The narrow unknown ids may appear only as mechanism tokens
+        # (` C_<name> 0x… → `, exactly one occurrence on the line).
+        for value in (UNKNOWN, MAXIMUM):
+            assert str(value) not in text, value
+            token = f"0x{value:x}"
+            hits = [line for line in events if token in line]
+            assert hits, f"unregistered {token} missing from trace"
+            assert all(
+                re.search(rf" C_[A-Za-z0-9_]+ {token} → ", line) is not None
+                and line.count(token) == 1
+                for line in hits
+            ), hits
+    else:
+        for value in (UNKNOWN, MAXIMUM):
+            assert str(value) not in text and f"0x{value:x}" not in text, value
     assert ev["unregistered_mechanisms"] == 2, ev
     assert ev["semantic_capture_failures"] == 3, ev
     assert ev["async_target_failures"] == 2, ev
@@ -480,6 +512,10 @@ def assert_unsafe_profile(doc):
     mechanisms = mechanism_map(doc)
     for mechanism in (REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087):
         assert mechanism in mechanisms, f"diagnostic profile missed {mechanism:#x}"
+    for mechanism in (REGISTERED, 0xD, 0x1087):
+        assert mechanisms[mechanism]["registered"] is True, mechanisms[mechanism]
+    for mechanism in (UNKNOWN, MAXIMUM):
+        assert mechanisms[mechanism]["registered"] is False, mechanisms[mechanism]
     assert doc["evidence"]["unregistered_mechanisms"] == 0
 
     pss = mechanisms[0xD]["params"]
@@ -1369,8 +1405,47 @@ def assert_event_records(raw_records, lane, workload_pid):
     if "unsafe" not in lane:
         assert all(zero_metadata(event) for event in events), lane
         mechanisms = {event["mechanism"] for event in events}
-        assert mechanisms <= {MECH_NONE, REGISTERED, 0xD, 0x1087}, mechanisms
-        assert {REGISTERED, 0xD, 0x1087} <= mechanisms
+        if TARGET_BITS == 32:
+            # The narrow unknown ids publish as event mechanisms; the
+            # packed bytes may touch only the mechanism field and the
+            # two frozen-constant artifact offsets below — the final
+            # alias scan exempts this approved spill on 32-bit
+            # safe-lane EVENTS dumps (see
+            # assert_safe_lane_alias_privacy), so this oracle pins
+            # every other offset fail-closed.
+            assert mechanisms <= {MECH_NONE, REGISTERED, UNKNOWN, MAXIMUM,
+                                  0xD, 0x1087}, mechanisms
+            assert {REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087} <= mechanisms, \
+                mechanisms
+            for event in events:
+                raw = event["raw"]
+                for value in (UNKNOWN, MAXIMUM):
+                    packed = struct.pack("<Q", value)
+                    start = 0
+                    while True:
+                        found_at = raw.find(packed, start)
+                        if found_at < 0:
+                            break
+                        # An occurrence touching the mechanism field
+                        # (bytes 48-55) is the approved value or its
+                        # boundary artifact (MECH_NONE followed by
+                        # zeros spells packed MAXIMUM at 52); anything
+                        # else there would corrupt the mechanism value
+                        # the set assertion pins above. The two exact
+                        # (offset, value) pairs are the frozen
+                        # 0xFFFFFFFF constants abutting zeros:
+                        # FUNCTION_NONE target beside a zero user_type
+                        # (108, synthetic zero-fields) and
+                        # USER_TYPE_NONE beside zero shape (112,
+                        # live). A different value at those offsets,
+                        # or anything elsewhere, is a leak.
+                        approved = (41 <= found_at < 56) or (
+                            value == MAXIMUM and found_at in (108, 112))
+                        assert approved, (lane, hex(value), found_at)
+                        start = found_at + 1
+        else:
+            assert mechanisms <= {MECH_NONE, REGISTERED, 0xD, 0x1087}, mechanisms
+            assert {REGISTERED, 0xD, 0x1087} <= mechanisms
         return
     mechanisms = {event["mechanism"] for event in events}
     assert {REGISTERED, UNKNOWN, MAXIMUM, 0xD, 0x1087} <= mechanisms, mechanisms
@@ -1817,11 +1892,75 @@ def assert_final_artifact_privacy(artifacts):
     assert not leaks, f"ordinary pointer canaries leaked: {leaks}"
 
 
+# Safe profile/trace lanes whose own capture document legitimately
+# carries the narrow unknown ids on 32-bit targets (approved shape
+# only: registered:false rows in profile JSON, mechanism tokens in
+# trace text). Every other lane and every other artifact — observer
+# logs, map dumps, receipts, manifests, metrics, START and
+# object/journal lanes — gets no allowance.
+SAFE_PROFILE_TRACE_LANES = frozenset({
+    "default-safe-profile", "feature-safe-profile",
+    "default-safe-trace", "feature-safe-trace",
+})
+
+
+def strip_approved_unregistered_rows(content):
+    """Drop approved registered:false rows from a profile document.
+
+    Only rows whose mechanism is UNKNOWN or MAXIMUM and whose
+    registered flag is False are removed; anything else (a parameter
+    alias as a mechanism, a True flag, a corrupt document) is left
+    for the unchanged alias scan. A removed row carries only the
+    numeric id, counts, null params and fixed strings, so no other
+    alias spelling can hide in it.
+    """
+    try:
+        doc = json.loads(content)
+    except ValueError:
+        return content
+    mechanisms = doc.get("mechanisms")
+    if not isinstance(mechanisms, list):
+        return content
+    approved = {UNKNOWN, MAXIMUM}
+    kept = [row for row in mechanisms
+            if not (isinstance(row, dict) and row.get("mechanism") in approved
+                    and row.get("registered") is False)]
+    if len(kept) == len(mechanisms):
+        return content
+    return json.dumps({**doc, "mechanisms": kept}).encode()
+
+
+def strip_approved_mechanism_tokens(content):
+    """Drop exact ` C_<name> 0x<approved> → ` tokens from trace text."""
+    stripped = content
+    for value in (UNKNOWN, MAXIMUM):
+        token = f"0x{value:x}".encode()
+        stripped = re.sub(rb" C_[A-Za-z0-9_]+ " + re.escape(token) + " → ".encode(),
+                          b" ", stripped)
+    return stripped
+
+
 def assert_safe_lane_alias_privacy(lane, paths):
     for path in map(Path, paths):
         content = path.read_bytes()
+        if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
+                and path.name == f"{lane}.output"):
+            if lane.endswith("-profile"):
+                content = strip_approved_unregistered_rows(content)
+            elif lane.endswith("-trace"):
+                content = strip_approved_mechanism_tokens(content)
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
+        if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
+                and path.name == f"{lane}.EVENTS.raw"):
+            # The retained records legitimately carry the narrow unknown
+            # ids at the mechanism offset; the stop-time raw oracle
+            # (assert_event_records) already pinned every packed
+            # occurrence to that offset with true record framing, and
+            # this scan only runs after every lane's oracle passed, so
+            # the packed spill here is the approved position — every
+            # other alias spelling still fails.
+            found.discard("mechanism")
         assert not found, f"{lane}: scalar aliases {found} in {path}"
 
 
@@ -2042,6 +2181,11 @@ def main(argv=None):
                 "stats_entered": 7, "stats_returned": 5, "raw_calls": 3,
             }) + "\n"
 
+        # The safe profile/trace/raw sections pin both widths
+        # explicitly (64-bit rule first, then the 32-bit approved
+        # shape); the remainder of the self-test runs at entry width.
+        entry_bits = TARGET_BITS
+        initialize(64)
         safe = {
             "schema": "p11scope/observed-profile/v3",
             "capture": {"mode": "profile", "privacy_mode": "allowlisted"},
@@ -2049,7 +2193,7 @@ def main(argv=None):
                          "completeness": "PARTIAL", "unregistered_mechanisms": 2,
                          "semantic_capture_failures": 3, "async_target_failures": 2},
             "mechanisms": [{"mechanism": REGISTERED, "params": None,
-                            "params_omitted": "policy"}],
+                            "params_omitted": "policy", "registered": True}],
             "templates": {"operations": []},
         }
         assert_safe_profile(safe)
@@ -2138,6 +2282,7 @@ def main(argv=None):
                lambda: assert_safe_profile(param_leak))
         initialize(64)
 
+        initialize(64)
         safe_trace = "CAPTURE privacy=allowlisted\nC_DigestInit 0x250\n" + count_line() + \
             "EVIDENCE " + json.dumps(
             terminal("allowlisted", 3, 2)
@@ -2179,7 +2324,25 @@ def main(argv=None):
                lambda: assert_safe_trace(trace32.replace(
                    f"0x{UNKNOWN:x} → CKR_OK",
                    f"0x{UNKNOWN:x} → CKR_OK 0x{UNKNOWN:x}")))
-        initialize(64)
+
+        # The lane-scan strip removes only the approved positions: a
+        # parameter alias smuggled into a row, a misplaced token, or
+        # packed bytes all survive it for the unchanged alias scan.
+        stripped = strip_approved_unregistered_rows(json.dumps(safe32).encode())
+        assert alias_hits(stripped) == set(), stripped
+        smuggled = json.loads(json.dumps(safe32))
+        smuggled["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(smuggled).encode())) == {"pss_hash"}
+        token_line = f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(token_line)) == set()
+        misplaced = token_line + f"note 0x{UNKNOWN:x}\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
+        packed = struct.pack("<Q", UNKNOWN)
+        assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
+        initialize(entry_bits)
 
         pss = [{
             "shape": "rsa_pkcs_pss", "hash_alg": ALIASES["pss_hash"],
@@ -2198,11 +2361,11 @@ def main(argv=None):
             "evidence": {**terminal("unsafe-unvalidated-metadata", 7),
                          "templates_truncated": False},
             "mechanisms": [
-                {"mechanism": REGISTERED, "params": None},
-                {"mechanism": UNKNOWN, "params": None},
-                {"mechanism": MAXIMUM, "params": None},
-                {"mechanism": 0xD, "params": pss},
-                {"mechanism": 0x1087, "params": gcm},
+                {"mechanism": REGISTERED, "params": None, "registered": True},
+                {"mechanism": UNKNOWN, "params": None, "registered": False},
+                {"mechanism": MAXIMUM, "params": None, "registered": False},
+                {"mechanism": 0xD, "params": pss, "registered": True},
+                {"mechanism": 0x1087, "params": gcm, "registered": True},
             ],
             "templates": {"operations": [
                 {"names": ["C_CreateObject"], "requested": True,
@@ -2521,6 +2684,7 @@ def main(argv=None):
             struct.pack_into("<Q", raw_event, 320, root_affiliation)
             return bytes(raw_event)
 
+        initialize(64)
         safe_events = [event_bytes(index) for index in range(28)]
         safe_events[0] = event_bytes(0, root_affiliation=1)
         assert_event_records(safe_events, "default-safe-profile", 0x555)
@@ -2587,6 +2751,36 @@ def main(argv=None):
             mutated[0] = bytes(record)
             reject(f"raw root affiliation {root_affiliation}", lambda mutated=mutated:
                    assert_event_records(mutated, "default-safe-profile", 0x555))
+        # 32-bit safe lanes publish the narrow ids as event mechanisms;
+        # their packed bytes may touch only the mechanism field and
+        # two frozen-constant artifact offsets (see the oracle rule).
+        initialize(32)
+        safe32_events = [event_bytes(index) for index in range(28)]
+        safe32_events[0] = event_bytes(0, root_affiliation=1)
+        safe32_events[3] = event_bytes(3, mechanism=UNKNOWN)
+        safe32_events[4] = event_bytes(4, mechanism=MAXIMUM)
+        live_user_type = bytearray(safe32_events[6])
+        struct.pack_into("<I", live_user_type, 112, 0xFFFFFFFF)
+        safe32_events[6] = bytes(live_user_type)
+        assert_event_records(safe32_events, "default-safe-profile", 0x555)
+        reject("raw 32-bit safe events without published ids",
+               lambda: assert_event_records(
+                   safe_events, "default-safe-profile", 0x555))
+        smuggled = list(safe32_events)
+        record = bytearray(smuggled[5])
+        struct.pack_into("<Q", record, 32, UNKNOWN)
+        smuggled[5] = bytes(record)
+        reject("raw 32-bit packed id outside the mechanism field",
+               lambda smuggled=smuggled: assert_event_records(
+                   smuggled, "default-safe-profile", 0x555))
+        mistyped = list(safe32_events)
+        record = bytearray(mistyped[7])
+        struct.pack_into("<I", record, 112, UNKNOWN & 0xFFFFFFFF)
+        mistyped[7] = bytes(record)
+        reject("raw 32-bit wrong value at an artifact offset",
+               lambda mistyped=mistyped: assert_event_records(
+                   mistyped, "default-safe-profile", 0x555))
+        initialize(entry_bits)
         print("raw policy oracle self-test: OK")
 
         unsafe_events = list(safe_events)

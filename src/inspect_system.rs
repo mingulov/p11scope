@@ -3701,6 +3701,7 @@ pub(crate) struct IdentityRunShared {
     next_generation: u64,
     session: Option<crate::discovery::kernel_identity::IdentitySession>,
     checks: Box<dyn IdentityChecks>,
+    sweep_witness_rotation: u64,
 }
 
 pub(crate) type IdentityShared = std::sync::Arc<std::sync::Mutex<IdentityRunShared>>;
@@ -3739,6 +3740,7 @@ impl IdentityRunShared {
             next_generation: 1,
             session: None,
             checks,
+            sweep_witness_rotation: 0,
         }
     }
 
@@ -4304,6 +4306,15 @@ fn attribute_pass_with_kernel(
     pools: ProofPools<'_>,
     threshold: Option<usize>,
 ) -> Option<Attributed> {
+    // The witness budget covers a different candidate prefix each
+    // kernel pass, so callers past the per-pass budget still prove
+    // within a few passes instead of starving every pass.
+    let witness_start = {
+        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        let start = shared.sweep_witness_rotation;
+        shared.sweep_witness_rotation = start.wrapping_add(1);
+        start
+    };
     let Some(takeout) = takeout else {
         return attribute_sweep_with(
             collection,
@@ -4365,6 +4376,7 @@ fn attribute_pass_with_kernel(
                 shards,
                 &|| OsConfirmIo::with_pools(pools),
                 &mut probe,
+                witness_start,
             );
             drop(probe);
             drop(installed);
@@ -4456,6 +4468,7 @@ fn attribute_pass_with_kernel(
                             &mut hook,
                             &bound.aggregate,
                             &mut witness,
+                            witness_start,
                         )
                     } else {
                         crate::discovery::confirm_shards::attribute_unselected_with_policy(
@@ -4480,6 +4493,7 @@ fn attribute_pass_with_kernel(
 /// (index, selection, refused filtering) plus kernel slot
 /// expectations and the segment-proof hook. Setup failures return
 /// `None` so the caller runs the same-pin userspace fallback.
+#[allow(clippy::too_many_arguments)]
 fn attribute_sweep_with_kernel<Io, F>(
     collection: &mut Collection,
     bound: &Bound,
@@ -4488,6 +4502,7 @@ fn attribute_sweep_with_kernel<Io, F>(
     threads: usize,
     make_io: &F,
     probe: &mut crate::discovery::kernel_identity::KernelMemberProbe<'_, '_, '_, Io>,
+    witness_start: u64,
 ) -> (
     Option<Attributed>,
     Option<crate::discovery::kernel_identity::KernelFallbackReason>,
@@ -4530,6 +4545,7 @@ where
             &mut observing,
             &bound.aggregate,
             &mut witness,
+            witness_start,
         );
     let changed = retain_unchanged(&mut attribution, &bound.aggregate);
     let observed = observing.observed();

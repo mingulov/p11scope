@@ -3668,6 +3668,7 @@ fn k1_witness_round(
                 probe.segment_proof(),
                 pins,
                 &mut witness,
+                0,
             )
         }
         false => crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(

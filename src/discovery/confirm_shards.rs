@@ -96,13 +96,24 @@ pub(crate) trait SegmentProof {
     ) -> crate::discovery::kernel_identity::ProofDecision<'r>;
 }
 
+/// Rotation offset for one witness pass: the per-pass budget covers a
+/// different candidate prefix each pass, so callers past the budget
+/// prove within a few passes instead of starving every pass.
+fn rotated_start(candidates: usize, witness_start: u64) -> usize {
+    if candidates == 0 {
+        0
+    } else {
+        (witness_start % candidates as u64) as usize
+    }
+}
+
 /// Prove overlay-refused ranges via the private witness session (K1-R2,
-/// live capture watched providers): one query per (pid, key), first
-/// refused range; SameFile replaces all that key's refused ranges with
-/// [`RangeProof::Witnessed`] (join), anything else keeps refused (named
-/// loss, never a userspace join). Ranges under no entry, non-overlay
-/// keys, keys without a pinned file, and budget exhaustion all keep
-/// refused (fail-closed).
+/// live capture watched providers): one query per (pid, key) over every
+/// refused range of the key; SameFile replaces all that key's refused
+/// ranges with [`RangeProof::Witnessed`] (join), anything else keeps
+/// refused (named loss, never a userspace join). Ranges under no entry,
+/// non-overlay keys, keys without a pinned file, and budget exhaustion
+/// all keep refused (fail-closed).
 #[allow(clippy::too_many_arguments)]
 fn witness_overlay_refused(
     pid: u32,
@@ -112,6 +123,7 @@ fn witness_overlay_refused(
     pins: &PinnedObjects,
     witness: &mut dyn SweepWitness,
     budget: &mut CaptureWorkBudget,
+    witness_start: u64,
 ) {
     use crate::discovery::identity::MappedFile;
     use crate::discovery::overlay_witness::WitnessVerdict;
@@ -134,7 +146,10 @@ fn witness_overlay_refused(
         }
         by_key.entry(*key).or_default().push(*range);
     }
-    for (key, ranges) in by_key {
+    let mut keys: Vec<(ObjectKey, Vec<(u64, u64)>)> = by_key.into_iter().collect();
+    let offset = rotated_start(keys.len(), witness_start);
+    keys.rotate_left(offset);
+    for (key, ranges) in keys {
         let Some((object, expected)) = index.match_pin(key) else {
             continue;
         };
@@ -147,10 +162,10 @@ fn witness_overlay_refused(
             identity: expected,
             fs_magic: Some(OVERLAYFS_SUPER_MAGIC),
         };
-        let Some(first) = ranges.first().copied() else {
+        if ranges.is_empty() {
             continue;
-        };
-        if witness.prove(pid, file, &held, key, first, budget) == WitnessVerdict::SameFile {
+        }
+        if witness.prove(pid, file, &held, key, &ranges, budget) == WitnessVerdict::SameFile {
             for range in ranges {
                 mapped.insert(range, RangeProof::Witnessed);
             }
@@ -186,13 +201,14 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
 ) -> Confirmation {
-    prove_and_finish_prepared_with_witness(io, pid, prepared, hook, resources, budget, None)
+    prove_and_finish_prepared_with_witness(io, pid, prepared, hook, resources, budget, None, 0)
 }
 
 /// Scalar confirm with an optional sweep witness for overlay refusals
 /// with no sweep route (live capture watched providers). `None` keeps
 /// today's named loss; `Some` proves each refused overlay key through
 /// the private session under the D-P1 budget.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
@@ -201,6 +217,7 @@ pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
     witness: Option<(&KnownKeyIndex, &PinnedObjects, &mut dyn SweepWitness)>,
+    witness_start: u64,
 ) -> Confirmation {
     let batch = AcceptedBatch {
         requests: vec![AcceptedRequest {
@@ -222,7 +239,16 @@ pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
     if witness_qualifies(&decision)
         && let (Some((index, pins, runner)), Some(map)) = (witness, answers.as_mut())
     {
-        witness_overlay_refused(pid, map, &prepared.entries, index, pins, runner, budget);
+        witness_overlay_refused(
+            pid,
+            map,
+            &prepared.entries,
+            index,
+            pins,
+            runner,
+            budget,
+            witness_start,
+        );
     }
     // A complete kernel answer needs no userspace reads; otherwise the
     // member returns to the stash for the fallback proofs, like the scalar
@@ -1198,6 +1224,7 @@ where
         make_io,
         Some(hook),
         None,
+        0,
     )
 }
 
@@ -1219,6 +1246,7 @@ pub(crate) fn attribute_unselected_with_segment_proof_with_witness<Io, F>(
     hook: &mut impl SegmentProof,
     pins: &PinnedObjects,
     witness: &mut dyn SweepWitness,
+    witness_start: u64,
 ) -> SweepAttribution
 where
     Io: ShardableIo,
@@ -1237,6 +1265,7 @@ where
         make_io,
         Some(hook),
         Some((pins, witness)),
+        witness_start,
     )
 }
 
@@ -1269,6 +1298,7 @@ where
         make_io,
         None,
         None,
+        0,
     )
 }
 
@@ -1285,6 +1315,7 @@ fn attribute_unselected_with_optional_proof<Io, F>(
     make_io: &F,
     mut hook: Option<&mut dyn SegmentProof>,
     mut witness: Option<(&PinnedObjects, &mut dyn SweepWitness)>,
+    witness_start: u64,
 ) -> SweepAttribution
 where
     Io: ShardableIo,
@@ -1441,14 +1472,24 @@ where
             && let Some((pins, runner)) = witness.as_mut()
         {
             let pins = *pins;
-            for (at, prepared) in prepared.iter_mut() {
-                if !prepared
-                    .mapped
-                    .values()
-                    .any(|proof| *proof == RangeProof::OverlayRefused)
-                {
-                    continue;
-                }
+            // The budget covers a rotated candidate prefix each pass,
+            // so the same callers never starve every pass.
+            let mut order: Vec<usize> = prepared
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry
+                        .1
+                        .mapped
+                        .values()
+                        .any(|proof| *proof == RangeProof::OverlayRefused)
+                })
+                .map(|(slot, _)| slot)
+                .collect();
+            let offset = rotated_start(order.len(), witness_start);
+            order.rotate_left(offset);
+            for slot in order {
+                let (at, prepared) = &mut prepared[slot];
                 let (pid, sweep_entries) = &sweep[*at];
                 let entries: &[MapEntry] = match &prepared.state {
                     PreparedState::Confirm { plan, .. } => &plan.entries,
@@ -1462,6 +1503,7 @@ where
                     pins,
                     &mut **runner,
                     budget,
+                    witness_start,
                 );
             }
         }
@@ -1545,7 +1587,14 @@ where
                                 (index, *pins, &mut **runner as &mut dyn SweepWitness)
                             });
                             prove_and_finish_prepared_with_witness(
-                                &mut io, *pid, prepared, hook, &immediate, budget, w,
+                                &mut io,
+                                *pid,
+                                prepared,
+                                hook,
+                                &immediate,
+                                budget,
+                                w,
+                                witness_start,
                             )
                         }
                         Err(confirmation) => confirmation,

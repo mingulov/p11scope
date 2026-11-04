@@ -5001,12 +5001,14 @@ impl ScanIo for ProcScanIo {
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict {
         // The per-scan budget spends before the run: a failed attempt
-        // still spends, and exhaustion refuses without running.
+        // still spends, and exhaustion refuses without running. The
+        // deep scan keeps its single trigger range; only the sweep
+        // passes every refused range of the key.
         if self.witness_used >= OVERLAY_WITNESS_QUERIES_PER_SCAN {
             return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
         }
         self.witness_used += 1;
-        prove_original_file(view.pid(), file, held, key, range, budget)
+        prove_original_file(view.pid(), file, held, key, &[range], budget)
     }
 
     fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {

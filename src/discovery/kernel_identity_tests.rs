@@ -6764,9 +6764,9 @@ mod sweep_witness_mixed {
     use crate::discovery::caller_registry::ExeIdentity;
     use crate::discovery::confirm_shards::{
         AcceptedBatch, SegmentProof, attribute_unselected_with_policy,
-        attribute_unselected_with_segment_proof,
-        attribute_unselected_with_segment_proof_with_witness,
+        attribute_unselected_with_segment_proof, attribute_unselected_with_segment_proof_with_witness,
     };
+    use crate::discovery::identity::ExaminedObject;
     use crate::discovery::identity::FileIdentity;
     use crate::discovery::identity::{MappedFile, PinnedObjectId, PinnedObjects};
     use crate::discovery::overlay_witness::{
@@ -6783,8 +6783,10 @@ mod sweep_witness_mixed {
 
     const OVERLAY_INO: u64 = 7_101;
     const PLAIN_INO: u64 = 7_102;
+    const EXAMINED_INO: u64 = 7_103;
     const OVERLAY_RANGE: (u64, u64) = (0x1000_0000, 0x1000_1000);
     const PLAIN_RANGE: (u64, u64) = (0x2000_0000, 0x2000_1000);
+    const EXAMINED_RANGE: (u64, u64) = (0x3000_0000, 0x3000_1000);
     const PID: u32 = 7200;
 
     fn key(inode: u64) -> ObjectKey {
@@ -6840,6 +6842,77 @@ mod sweep_witness_mixed {
         }
     }
 
+    /// Partial kernel answer: refuses the first range of each request
+    /// (the overlay range in these worlds) inside a `Kernel` decision,
+    /// like a run that proved nothing but answered.
+    struct KernelRefusedHook {
+        binding: super::PassBinding,
+    }
+
+    impl KernelRefusedHook {
+        fn new() -> Self {
+            Self {
+                binding: super::PassBinding {
+                    session: Arc::new(()),
+                    generation: 1,
+                    arena_base: 0,
+                    arena_len: 64,
+                },
+            }
+        }
+    }
+
+    impl SegmentProof for KernelRefusedHook {
+        fn prove<'r>(
+            &'r mut self,
+            batch: &AcceptedBatch<'_>,
+            _budget: &mut CaptureWorkBudget,
+            _resources: &crate::discovery::sweep_attribution::IoResources,
+        ) -> super::ProofDecision<'r> {
+            let mut answers = Vec::new();
+            for request in batch.requests() {
+                let mut map = MappedIdentities::new();
+                if let Some(first) = request.ranges().first() {
+                    map.insert(*first, RangeProof::OverlayRefused);
+                }
+                answers.push(Some(map));
+            }
+            super::ProofDecision::Kernel(super::ValidatedTargetSegment {
+                binding: &self.binding,
+                batch: batch.token().clone(),
+                answers,
+            })
+        }
+    }
+
+    /// Refuses exactly the overlay ranges of each request (no sweep
+    /// route), leaving every other range for userspace reads.
+    struct OverlayOnlyHook;
+
+    impl SegmentProof for OverlayOnlyHook {
+        fn prove<'r>(
+            &'r mut self,
+            batch: &AcceptedBatch<'_>,
+            _budget: &mut CaptureWorkBudget,
+            _resources: &crate::discovery::sweep_attribution::IoResources,
+        ) -> super::ProofDecision<'r> {
+            let mut refused = Vec::new();
+            for request in batch.requests() {
+                let mut map = MappedIdentities::new();
+                for range in request.ranges() {
+                    if *range == OVERLAY_RANGE {
+                        map.insert(*range, RangeProof::OverlayRefused);
+                    }
+                }
+                refused.push(map);
+            }
+            super::ProofDecision::UserspaceExceptOverlay {
+                reason: super::RunFailure::AnchorNotInstalled,
+                refused,
+            }
+        }
+    }
+
     struct ReasonHook {
         reason: super::RunFailure,
     }
@@ -6866,7 +6939,7 @@ mod sweep_witness_mixed {
         }
     }
 
-    type WitnessCalls = Arc<Mutex<Vec<(u32, ObjectKey, (u64, u64))>>>;
+    type WitnessCalls = Arc<Mutex<Vec<(u32, ObjectKey, Vec<(u64, u64)>)>>>;
     type IoReads = Arc<Mutex<Vec<(u32, u64, u64)>>>;
 
     struct ScriptedSweepWitness {
@@ -6911,14 +6984,14 @@ mod sweep_witness_mixed {
             _file: &std::fs::File,
             _held: &MappedFile,
             key: ObjectKey,
-            range: (u64, u64),
+            ranges: &[(u64, u64)],
             _budget: &mut CaptureWorkBudget,
         ) -> WitnessVerdict {
             if self.used >= self.limit {
                 return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
             }
             self.used += 1;
-            self.calls.lock().unwrap().push((pid, key, range));
+            self.calls.lock().unwrap().push((pid, key, ranges.to_vec()));
             self.verdict
         }
     }
@@ -6932,6 +7005,13 @@ mod sweep_witness_mixed {
         type Pin = std::fs::File;
         fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
             self.reads.lock().unwrap().push((pid, start, end));
+            if (start, end) == EXAMINED_RANGE {
+                // The examined mapping vanished between the phase-one
+                // read and the confirm: the Idle preparation promotes.
+                return Err(
+                    crate::discovery::sweep_attribution::RANGE_NOT_MAPPED.to_string(),
+                );
+            }
             if (start, end) == OVERLAY_RANGE {
                 Ok(vm_file(OVERLAY_INO))
             } else {
@@ -7000,7 +7080,7 @@ mod sweep_witness_mixed {
         }
     }
 
-    fn world() -> (PinnedObjects, KnownKeyIndex, Vec<(u32, Vec<MapEntry>)>) {
+    fn world_with(examined: Vec<ExaminedObject>) -> (PinnedObjects, KnownKeyIndex) {
         let pins = crate::discovery::identity::test_fixture::pin_set(
             &[
                 (key(OVERLAY_INO), "overlay-digest", 1),
@@ -7028,18 +7108,41 @@ mod sweep_witness_mixed {
                 (key(PLAIN_INO), Some(plain_id)),
             ],
             &BTreeMap::from([(key(OVERLAY_INO), overlay_id), (key(PLAIN_INO), plain_id)]),
-            [],
+            examined,
             &checks,
         )
         .0;
         assert!(index.is_overlay_key(key(OVERLAY_INO)));
         assert!(!index.is_overlay_key(key(PLAIN_INO)));
+        (pins, index)
+    }
+
+    fn world() -> (PinnedObjects, KnownKeyIndex, Vec<(u32, Vec<MapEntry>)>) {
+        let (pins, index) = world_with(Vec::new());
         let sweep = vec![(
             PID,
             vec![
                 entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
                 entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
             ],
+        )];
+        (pins, index, sweep)
+    }
+
+    /// A caller whose phase-one maps only an examined key (Idle
+    /// preparation) while the live maps hold the overlay and plain
+    /// keys: the examined read reports the mapping gone, so the Idle
+    /// preparation promotes and the promotion's witness proves the
+    /// refused overlay key from the live maps.
+    fn promotion_world() -> (PinnedObjects, KnownKeyIndex, Vec<(u32, Vec<MapEntry>)>) {
+        let (pins, index) = world_with(vec![ExaminedObject {
+            key: key(EXAMINED_INO),
+            identity: vm_file(EXAMINED_INO),
+            key_is_identity: false,
+        }]);
+        let sweep = vec![(
+            PID,
+            vec![entry(EXAMINED_RANGE, EXAMINED_INO, "/opt/examined.so")],
         )];
         (pins, index, sweep)
     }
@@ -7079,6 +7182,7 @@ mod sweep_witness_mixed {
         reason: super::RunFailure,
         reads: &IoReads,
         witness: &mut dyn SweepWitness,
+        witness_start: u64,
     ) -> crate::discovery::sweep_attribution::SweepAttribution {
         let make_io = || MixedIo {
             reads: reads.clone(),
@@ -7101,6 +7205,7 @@ mod sweep_witness_mixed {
             &mut hook,
             pins,
             witness,
+            witness_start,
         )
     }
 
@@ -7130,6 +7235,7 @@ mod sweep_witness_mixed {
             super::RunFailure::AnchorNotInstalled,
             &reads,
             &mut witness,
+            0,
         );
         assert_eq!(after.members.len(), 1, "{:?}", after.member_losses);
         let mut keys: Vec<_> = after.members[0].objects.iter().map(|o| o.key).collect();
@@ -7145,7 +7251,7 @@ mod sweep_witness_mixed {
         );
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &[(PID, key(OVERLAY_INO), OVERLAY_RANGE)],
+            &[(PID, key(OVERLAY_INO), vec![OVERLAY_RANGE])],
             "one witness query for the refused overlay key"
         );
     }
@@ -7162,6 +7268,7 @@ mod sweep_witness_mixed {
             super::RunFailure::AnchorNotInstalled,
             &reads,
             &mut witness,
+            0,
         );
         assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
         let keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
@@ -7192,6 +7299,7 @@ mod sweep_witness_mixed {
             super::RunFailure::AnchorNotInstalled,
             &reads,
             &mut witness,
+            0,
         );
         assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
         let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
@@ -7223,6 +7331,7 @@ mod sweep_witness_mixed {
             super::RunFailure::TargetLimit,
             &reads,
             &mut witness,
+            0,
         );
         assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
         let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
@@ -7242,6 +7351,7 @@ mod sweep_witness_mixed {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_with_hook(
         sweep: &[(u32, Vec<MapEntry>)],
         index: &KnownKeyIndex,
@@ -7250,6 +7360,7 @@ mod sweep_witness_mixed {
         hook: &mut impl SegmentProof,
         witness: &mut dyn SweepWitness,
         plain_only: bool,
+        witness_start: u64,
     ) -> crate::discovery::sweep_attribution::SweepAttribution {
         let make_io = || MixedIo {
             reads: reads.clone(),
@@ -7271,6 +7382,7 @@ mod sweep_witness_mixed {
             hook,
             pins,
             witness,
+            witness_start,
         )
     }
 
@@ -7297,6 +7409,212 @@ mod sweep_witness_mixed {
             1,
             &make_io,
         )
+    }
+
+    fn overlay_joined(out: &crate::discovery::sweep_attribution::SweepAttribution) -> Vec<u32> {
+        let mut pids: Vec<u32> = out
+            .members
+            .iter()
+            .filter(|member| {
+                member
+                    .objects
+                    .iter()
+                    .any(|object| object.key == key(OVERLAY_INO))
+            })
+            .map(|member| member.pid)
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    #[test]
+    fn witness_start_rotates_the_budget_across_passes() {
+        // Ten swept callers share one watched overlay key with a
+        // budget of 8: the first pass joins the first eight, the next
+        // pass starts one later, so the ninth caller joins instead of
+        // starving every pass.
+        let (pins, index, one) = world();
+        let entries = one[0].1.clone();
+        let sweep: Vec<(u32, Vec<MapEntry>)> =
+            (0..10).map(|i| (PID + i, entries.clone())).collect();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, _) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let first = run_with_witness(
+            &sweep,
+            &index,
+            &pins,
+            super::RunFailure::AnchorNotInstalled,
+            &reads,
+            &mut witness,
+            0,
+        );
+        assert_eq!(
+            overlay_joined(&first),
+            (PID..PID + 8).collect::<Vec<_>>(),
+            "{:?}",
+            first.member_losses
+        );
+        let mut losers: Vec<u32> = first.member_losses.keys().copied().collect();
+        losers.sort_unstable();
+        assert_eq!(losers, [PID + 8, PID + 9], "{:?}", first.member_losses);
+        // The second pass slides the window by one: the ninth caller
+        // joins, and the first and tenth keep the loss.
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let second = run_with_witness(
+            &sweep,
+            &index,
+            &pins,
+            super::RunFailure::AnchorNotInstalled,
+            &reads,
+            &mut witness,
+            1,
+        );
+        assert_eq!(
+            overlay_joined(&second),
+            (PID + 1..PID + 9).collect::<Vec<_>>(),
+            "{:?}",
+            second.member_losses
+        );
+        let mut losers: Vec<u32> = second.member_losses.keys().copied().collect();
+        losers.sort_unstable();
+        assert_eq!(losers, [PID, PID + 9], "{:?}", second.member_losses);
+        assert_eq!(
+            calls.lock().unwrap()[0].0,
+            PID + 1,
+            "the second pass queries from the second caller"
+        );
+    }
+
+    #[test]
+    fn partial_kernel_answer_samefile_joins_without_overlay_read() {
+        // A partial kernel answer (overlay ranges only) qualifies for
+        // the witness exactly like the unavailable run: SameFile joins
+        // without reading the overlay range.
+        let (pins, index, sweep) = world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let mut hook = KernelRefusedHook::new();
+        let out = run_with_hook(
+            &sweep, &index, &pins, &reads, &mut hook, &mut witness, false, 0,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let mut keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        keys.sort();
+        let mut expected = vec![key(OVERLAY_INO), key(PLAIN_INO)];
+        expected.sort();
+        assert_eq!(keys, expected, "{:?}", out.member_losses);
+        assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)],
+            "the witness joins without reading the overlay range"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(PID, key(OVERLAY_INO), vec![OVERLAY_RANGE])],
+            "one witness query for the refused overlay key"
+        );
+        // Control: the same partial answer without the witness keeps
+        // the named loss on the overlay key.
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+            plain_only: false,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = KernelRefusedHook::new();
+        let before = attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        );
+        assert_eq!(before.members.len(), 1, "{:?}", before.member_losses);
+        let keys: Vec<_> = before.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", before.member_losses);
+        let labels: Vec<&str> = before.losses.keys().map(|loss| loss.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            before.member_losses
+        );
+    }
+
+    #[test]
+    fn idle_promotion_witnesses_the_refused_overlay() {
+        // The examined mapping vanished between the reads, so the Idle
+        // preparation promotes; the promotion's witness proves the live
+        // overlay key and both live keys join with no overlay reads.
+        let (pins, index, sweep) = promotion_world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let mut hook = OverlayOnlyHook;
+        let out = run_with_hook(
+            &sweep, &index, &pins, &reads, &mut hook, &mut witness, false, 0,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let mut keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        keys.sort();
+        let mut expected = vec![key(OVERLAY_INO), key(PLAIN_INO)];
+        expected.sort();
+        assert_eq!(keys, expected, "{:?}", out.member_losses);
+        assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[
+                (PID, EXAMINED_RANGE.0, EXAMINED_RANGE.1),
+                (PID, PLAIN_RANGE.0, PLAIN_RANGE.1),
+            ],
+            "the examined read reports the mapping gone, then the promotion reads plain"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(PID, key(OVERLAY_INO), vec![OVERLAY_RANGE])],
+            "exactly the promotion queries the witness"
+        );
+        // Control: the same promotion without the witness keeps the
+        // named loss on the live overlay key.
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+            plain_only: false,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = OverlayOnlyHook;
+        let before = attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        );
+        assert_eq!(before.members.len(), 1, "{:?}", before.member_losses);
+        let keys: Vec<_> = before.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", before.member_losses);
+        let labels: Vec<&str> = before.losses.keys().map(|loss| loss.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            before.member_losses
+        );
     }
 
     #[test]
@@ -7344,6 +7662,7 @@ mod sweep_witness_mixed {
             &mut hook,
             &mut witness,
             false,
+            0,
         );
         assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
         let mut keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
@@ -7359,7 +7678,7 @@ mod sweep_witness_mixed {
         );
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            &[(PID, key(OVERLAY_INO), OVERLAY_RANGE)],
+            &[(PID, key(OVERLAY_INO), vec![OVERLAY_RANGE])],
             "one witness query for the refused overlay key"
         );
     }
@@ -7384,6 +7703,7 @@ mod sweep_witness_mixed {
             &mut hook,
             &mut witness,
             true,
+            0,
         );
         assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
         let keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();

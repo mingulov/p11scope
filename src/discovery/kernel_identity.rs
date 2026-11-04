@@ -676,7 +676,9 @@ impl From<RunFailure> for KernelFallbackReason {
 /// requested proof fell back or was refused, distinct affected PIDs/keys
 /// once per pass, summed across the capture, with the first finite reason
 /// preserved. Overlay keys with no kernel route count here as refused
-/// (never a userspace fallback edge).
+/// (never a userspace fallback edge). Counting happens when the kernel
+/// answer is recorded, before the sweep witness runs, so a refused key
+/// the witness later proves still counts here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct KernelFallbackTotals {
     pub(crate) passes: u64,

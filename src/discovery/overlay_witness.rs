@@ -57,7 +57,7 @@ pub(crate) trait SweepWitness {
         file: &File,
         held: &MappedFile,
         key: ObjectKey,
-        range: (u64, u64),
+        ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict;
 }
@@ -86,14 +86,14 @@ impl SweepWitness for KernelSweepWitness {
         file: &File,
         held: &MappedFile,
         key: ObjectKey,
-        range: (u64, u64),
+        ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict {
         if self.used >= OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS {
             return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
         }
         self.used += 1;
-        prove_original_file(pid, file, held, key, range, budget)
+        prove_original_file(pid, file, held, key, ranges, budget)
     }
 }
 
@@ -245,7 +245,7 @@ pub(crate) fn prove_original_file(
     file: &File,
     held: &MappedFile,
     key: ObjectKey,
-    range: (u64, u64),
+    ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
 ) -> WitnessVerdict {
     // Scoped collection deliberately deactivates the kernel proof
@@ -258,7 +258,7 @@ pub(crate) fn prove_original_file(
         return WitnessVerdict::Failed(WitnessFailure::Unavailable);
     }
     let started = Instant::now();
-    let verdict = prove_original_file_inner(pid, file, held, key, range, budget);
+    let verdict = prove_original_file_inner(pid, file, held, key, ranges, budget);
     let wall = started.elapsed();
     WITNESS_QUERIES.fetch_add(1, Ordering::SeqCst);
     WITNESS_NANOS.fetch_add(wall.as_nanos() as u64, Ordering::SeqCst);
@@ -277,7 +277,7 @@ fn prove_original_file_inner(
     file: &File,
     held: &MappedFile,
     key: ObjectKey,
-    range: (u64, u64),
+    ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
 ) -> WitnessVerdict {
     let anchor = match file.try_clone() {
@@ -367,7 +367,7 @@ fn prove_original_file_inner(
     let confirmation = probe.confirm(pid, &BTreeSet::from([key]), budget);
     drop(probe);
     drop(installed);
-    verdict_for_confirmation(&confirmation, range)
+    verdict_for_confirmation(&confirmation, ranges)
 }
 
 fn load_witness_session() -> Result<IdentitySession, &'static str> {
@@ -394,19 +394,30 @@ fn witness_deadline(budget: &CaptureWorkBudget) -> Option<Instant> {
     Some(deadline)
 }
 
-/// Read the trigger range's kernel proof directly. Only the lone
-/// anchor's slot joins; a userspace proof is impossible by construction
-/// (the confirm IO refuses it) and fail-closes if ever seen.
-fn verdict_for_confirmation(confirmation: &Confirmation, range: (u64, u64)) -> WitnessVerdict {
+/// Read every refused range's kernel proof from the one confirmation.
+/// Only the lone anchor's slot joins, and only when every refused
+/// range proves it; one another-file range refuses the whole key, one
+/// unproven range fails it closed. A userspace proof is impossible by
+/// construction (the confirm IO refuses it) and fail-closes if seen.
+fn verdict_for_confirmation(confirmation: &Confirmation, ranges: &[(u64, u64)]) -> WitnessVerdict {
     let Confirmation::Confirmed(read) = confirmation else {
         return WitnessVerdict::Failed(WitnessFailure::Unavailable);
     };
-    match read.mapped.get(&range) {
-        Some(RangeProof::Kernel(slot)) if *slot == WITNESS_SINGLE_ANCHOR_SLOT => {
-            WitnessVerdict::SameFile
+    let mut other = false;
+    let mut unknown = false;
+    for range in ranges {
+        match read.mapped.get(range) {
+            Some(RangeProof::Kernel(slot)) if *slot == WITNESS_SINGLE_ANCHOR_SLOT => {}
+            Some(RangeProof::Kernel(_)) | Some(RangeProof::KernelNone) => other = true,
+            _ => unknown = true,
         }
-        Some(RangeProof::Kernel(_)) | Some(RangeProof::KernelNone) => WitnessVerdict::OtherFile,
-        _ => WitnessVerdict::Failed(WitnessFailure::Unavailable),
+    }
+    if other {
+        WitnessVerdict::OtherFile
+    } else if unknown || ranges.is_empty() {
+        WitnessVerdict::Failed(WitnessFailure::Unavailable)
+    } else {
+        WitnessVerdict::SameFile
     }
 }
 
@@ -508,7 +519,7 @@ mod tests {
         let range = (0x7f00_0000, 0x7f00_1000);
         let mapped = BTreeMap::from([(range, RangeProof::Kernel(WITNESS_SINGLE_ANCHOR_SLOT))]);
         assert_eq!(
-            verdict_for_confirmation(&confirmed_with(mapped), range),
+            verdict_for_confirmation(&confirmed_with(mapped), &[range]),
             WitnessVerdict::SameFile
         );
         for proof in [
@@ -518,11 +529,62 @@ mod tests {
         ] {
             let mapped = BTreeMap::from([(range, proof)]);
             assert_eq!(
-                verdict_for_confirmation(&confirmed_with(mapped), range),
+                verdict_for_confirmation(&confirmed_with(mapped), &[range]),
                 WitnessVerdict::OtherFile,
                 "a kernel non-membership proof refuses, never joins"
             );
         }
+    }
+
+    #[test]
+    fn verdict_joins_when_every_refused_range_matches() {
+        let fresh = (0x7f00_0000, 0x7f00_1000);
+        let fresh2 = (0x7f00_1000, 0x7f00_2000);
+        let mapped = BTreeMap::from([
+            (fresh, RangeProof::Kernel(WITNESS_SINGLE_ANCHOR_SLOT)),
+            (fresh2, RangeProof::Kernel(WITNESS_SINGLE_ANCHOR_SLOT)),
+        ]);
+        assert_eq!(
+            verdict_for_confirmation(&confirmed_with(mapped), &[fresh, fresh2]),
+            WitnessVerdict::SameFile
+        );
+    }
+
+    #[test]
+    fn verdict_refuses_when_any_refused_range_proves_another_file() {
+        // RED: the mixed-mapping corner (one range same-file, one
+        // range another file) must refuse the whole key, not join on
+        // the first range.
+        let fresh = (0x7f00_0000, 0x7f00_1000);
+        let stale = (0x7f00_1000, 0x7f00_2000);
+        for proof in [
+            RangeProof::Kernel(Slot(1)),
+            RangeProof::Kernel(Slot(u32::MAX)),
+            RangeProof::KernelNone,
+        ] {
+            let mapped = BTreeMap::from([
+                (fresh, RangeProof::Kernel(WITNESS_SINGLE_ANCHOR_SLOT)),
+                (stale, proof),
+            ]);
+            assert_eq!(
+                verdict_for_confirmation(&confirmed_with(mapped), &[fresh, stale]),
+                WitnessVerdict::OtherFile,
+                "one stale range refuses the whole key"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_is_unavailable_when_any_refused_range_is_unproven() {
+        // RED: a refused range with no proof in the confirmation
+        // (unmapped since the sweep read) fail-closes the whole key.
+        let fresh = (0x7f00_0000, 0x7f00_1000);
+        let gone = (0x7f00_1000, 0x7f00_2000);
+        let mapped = BTreeMap::from([(fresh, RangeProof::Kernel(WITNESS_SINGLE_ANCHOR_SLOT))]);
+        assert_eq!(
+            verdict_for_confirmation(&confirmed_with(mapped), &[fresh, gone]),
+            WitnessVerdict::Failed(WitnessFailure::Unavailable)
+        );
     }
 
     #[test]
@@ -537,12 +599,12 @@ mod tests {
         ] {
             let mapped = BTreeMap::from([(range, proof)]);
             assert_eq!(
-                verdict_for_confirmation(&confirmed_with(mapped), range),
+                verdict_for_confirmation(&confirmed_with(mapped), &[range]),
                 unavailable
             );
         }
         assert_eq!(
-            verdict_for_confirmation(&confirmed_with(BTreeMap::new()), range),
+            verdict_for_confirmation(&confirmed_with(BTreeMap::new()), &[range]),
             unavailable,
             "an unproven range never joins"
         );
@@ -552,12 +614,12 @@ mod tests {
                     crate::discovery::sweep_attribution::AttributionLoss::MapFilesUnavailable,
                     "refused".into()
                 ),
-                range
+                &[range]
             ),
             unavailable
         );
         assert_eq!(
-            verdict_for_confirmation(&Confirmation::Exited, range),
+            verdict_for_confirmation(&Confirmation::Exited, &[range]),
             unavailable
         );
     }
@@ -580,7 +642,7 @@ mod tests {
                 },
                 inode: 7,
             },
-            (0x7f00_0000, 0x7f00_1000),
+            &[(0x7f00_0000, 0x7f00_1000)],
             &mut budget,
         );
         assert_eq!(verdict, WitnessVerdict::Failed(WitnessFailure::Unavailable));
@@ -613,7 +675,7 @@ mod tests {
             &file,
             &held,
             key,
-            (0x1000_0000, 0x1000_1000),
+            &[(0x1000_0000, 0x1000_1000)],
             &mut budget,
         );
         assert_eq!(

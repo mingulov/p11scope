@@ -715,7 +715,7 @@ fn prove_match(
                     AttributionLoss::OverlayKernelUnavailable,
                     format!(
                         "the range {:x}-{:x} needs the kernel proof (overlayfs or an \
-                         unproven filesystem) and its run was unavailable",
+                         unproven filesystem) and no kernel proof covered it",
                         entry.start, entry.end
                     ),
                 ));

@@ -1268,38 +1268,43 @@ The old bounds are measurements, not a product startup SLA.
   for the whole batch: non-overlay requests there take kernel proofs
   instead of the below-threshold userspace path (identical only in
   batches with no overlay key) and spend the pass's 3-attempt budget.
-  In live capture, a watched overlay provider (attach-set exclusion,
-  for example a provider inside a container) proves through the K1
-  private witness session with no exclusions, one query per watched
-  (pid, key) under the D-P1 per-pass budget (8 queries); SameFile
-  joins, anything else (OtherFile, failure, budget exhaustion) keeps
-  the named loss, never a userspace join. A pass whose anchors never
-  installed because every anchor is watched takes the same witness
-  route with no sweep kernel run. The remaining sweep paths keep the
-  named loss with no witness query: cgroup-scoped collection (the
-  userspace-only path), a segment after the pass's third kernel run
-  (`TargetLimit`) or another run failure (sticky, deadline, stream,
-  headroom), an oversized single caller (which reads its ranges and
-  then refuses), file-descriptor pressure (every pid takes the
-  immediate path, which reads and then refuses, including its idle
-  promotions), a failed kernel expectation or anchor install that is
-  not capture-excluded, and the explicit userspace identity backend
-  (which never reaches the witness). The pure-userspace sweep reads
-  the ranges and then refuses the join; the kernel ladder refuses
-  without reading them, except the oversized, cgroup, immediate and
-  failed-install paths which read and then refuse (still never an
-  edge).
-  One verdict covers the file: the witness proves the first
-  witness-requiring caller range,
-  and a same-file verdict joins every range of the group. A process
-  that maps one provider both before and after a copy-up (mappings on
-  both sides of the boundary) would join its stale ranges with the
-  fresh ones; per-range proving would exhaust the per-scan budget on
-  honest multi-range joins, so the packet keeps one query per file
-  and discloses this corner; the witness runs at most 8 queries per
-  process scan; past the budget
-  further provider files are unknown with the same gap, while
-  files that prove not to be providers never spend witness work.
+  In `inventory --system` with the kernel identity backend, a watched
+  overlay provider (attach-set exclusion, for example a provider
+  inside a container) proves through a private witness session with no
+  exclusions, one query per watched (pid, key) under a per-pass budget
+  of 8 queries, starting one candidate later each pass; a same-file
+  verdict joins, anything else (another file, failure, budget
+  exhaustion) keeps the named loss, never a userspace join. The
+  witness also covers refused overlay ranges from unproven requests in
+  an ordinary kernel batch: callers the run never visited, demoted
+  duplicates, and zombie batches. A pass whose anchors never installed
+  because every anchor is watched takes the same witness route with no
+  sweep kernel run. The remaining sweep paths keep the named loss with
+  no witness query: cgroup-scoped collection (the userspace-only
+  path), a segment after the pass's third kernel run or another run
+  failure (sticky, deadline, stream, headroom), an oversized single
+  caller (which reads its ranges and then refuses), file-descriptor
+  pressure (every pid takes the immediate path, which reads and then
+  refuses, including its idle promotions), a failed kernel expectation
+  or anchor install that is not capture-excluded, and the explicit
+  userspace identity backend (which never reaches the witness). The
+  pure-userspace sweep reads the ranges and then refuses the join; the
+  kernel ladder refuses without reading them, except the oversized,
+  cgroup, immediate and failed-install paths which read and then
+  refuse (still never an edge).
+  One verdict covers the file: the deep-scan witness proves the first
+  witness-requiring caller range, and a same-file verdict joins every
+  range of the group. A process that maps one provider both before and
+  after a copy-up (mappings on both sides of the boundary) would join
+  its stale ranges with the fresh ones; per-range proving would
+  exhaust the per-scan budget on honest multi-range joins, so the
+  packet keeps one query per file and discloses this corner; the
+  witness runs at most 8 queries per process scan; past the budget
+  further provider files are unknown with the same gap, while files
+  that prove not to be providers never spend witness work. The sweep
+  witness instead requires every refused range of the key to prove the
+  held file from its one confirmation: one another-file range refuses
+  the whole key, one unproven range fails it closed (no extra query).
   With xino off,
   equal real file numbers on distinct layers collide on the overlay
   device on 6.8+ (a named mismatch, never an edge), while before 6.8
@@ -1320,10 +1325,11 @@ The old bounds are measurements, not a product startup SLA.
   under the provider path, with one of four fixed causes (the witness
   proved another file, the witness query budget was exhausted, the
   witness was unavailable, the anchor binding failed). A swept overlay
-  caller whose kernel run is unavailable surfaces as an
-  `overlay_kernel_unavailable` maps-attribution loss (live capture
-  watched providers first try the private witness session, 8 queries
-  per pass; exhaustion keeps the same loss).
+  caller with no covering kernel proof surfaces as an
+  `overlay_kernel_unavailable` maps-attribution loss (`inventory
+  --system` with the kernel identity backend first tries the private
+  witness session, 8 queries per pass; exhaustion keeps the same
+  loss).
 - Workaround: restart processes that loaded a provider before the file
   changed inside the container (for example by chmod, touch or an
   in-place write) to get exact attribution for their later calls.

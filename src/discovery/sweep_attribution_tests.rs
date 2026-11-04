@@ -8214,9 +8214,14 @@ fn k2_prove_match_overlay_refuses_userspace_joins_kernel() {
         .expect_err("overlay userspace equality refuses");
     assert_eq!(loss, AttributionLoss::OverlayKernelUnavailable);
     let mapped = MappedIdentities::from([(range, RangeProof::OverlayRefused)]);
-    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, true)
+    let (loss, detail) = prove_match(expected, None, &[&entry], &mapped, true)
         .expect_err("overlay refusal marker refuses");
     assert_eq!(loss, AttributionLoss::OverlayKernelUnavailable);
+    assert_eq!(
+        detail,
+        "the range 7f000000-7f001000 needs the kernel proof (overlayfs or an \
+         unproven filesystem) and no kernel proof covered it"
+    );
     let slots = BTreeSet::from([Slot(0)]);
     let mapped = MappedIdentities::from([(range, RangeProof::Kernel(Slot(0)))]);
     prove_match(expected, Some(&slots), &[&entry], &mapped, true)

@@ -284,5 +284,89 @@ class ShortLivedTests(unittest.TestCase):
         self.assertIn("exe hints", row["detail"])
 
 
+LIFECYCLE_CELLS = [
+    "profile-pid-reload", "run-exec-chain", "profile-system-exec-churn",
+    "profile-pid-reuse", "prearm-late-dlopen", "prearm-late-dlopen-noflag",
+    "track-short-lived-cgroup", "track-short-lived-refused",
+    "track-short-lived-pid",
+]
+
+
+def extract_python_block(path, marker):
+    text = Path(path).read_text(encoding="utf-8")
+    start = text.index(marker)
+    heredoc = text.index("<<'PY'", start) + len("<<'PY'")
+    code_start = text.index("\n", heredoc) + 1
+    code_end = text.index("\nPY", code_start)
+    return text[code_start:code_end]
+
+
+def write_results(tmp, *, nonqualifying_cell=None):
+    path = Path(tmp) / "results.jsonl"
+    with open(path, "w", encoding="utf-8") as handle:
+        for cell in LIFECYCLE_CELLS:
+            if cell == nonqualifying_cell:
+                row = {"cell": cell, "pass": False,
+                       "qualification": "nonqualifying",
+                       "detail": "smoke; not a qualifying proof"}
+            elif cell == "prearm-late-dlopen":
+                row = {"cell": cell, "pass": False,
+                       "qualification": "expected-failure",
+                       "detail": "lossy observation [WU-13]"}
+            else:
+                row = {"cell": cell, "pass": True,
+                       "qualification": "qualified",
+                       "detail": "ok"}
+            handle.write(json.dumps(row) + "\n")
+    return path
+
+
+class WrapperTests(unittest.TestCase):
+    def test_ci_wrapper_rejects_unlisted_nonqualifying(self):
+        code = extract_python_block(
+            ROOT / "scripts/ci/lifecycle-cli.sh", "python3 - ")
+        with tempfile.TemporaryDirectory() as raw:
+            bad = write_results(
+                raw, nonqualifying_cell="profile-pid-reload")
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", str(bad)],
+                input=code, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(
+                completed.returncode, 0,
+                f"unlisted nonqualifying accepted: {completed.stdout}")
+            good = write_results(raw, nonqualifying_cell=None)
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", str(good)],
+                input=code, capture_output=True, text=True, timeout=30)
+            self.assertEqual(completed.returncode, 0,
+                             f"qualified rows rejected: {completed.stdout}")
+
+    def test_qualify_summary_rejects_unlisted_nonqualifying(self):
+        code = extract_python_block(
+            ROOT / "scripts/qualify-lifecycle-cli.sh", 'python3 - "$@"')
+        with tempfile.TemporaryDirectory() as raw:
+            bad = write_results(
+                raw, nonqualifying_cell="profile-pid-reload")
+            # The summary block reads results.jsonl from its cwd.
+            target = Path(raw) / "results.jsonl"
+            if bad != target:
+                target.write_text(bad.read_text(encoding="utf-8"),
+                                  encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", *LIFECYCLE_CELLS],
+                input=code, capture_output=True, text=True, timeout=30,
+                cwd=raw)
+            self.assertNotEqual(
+                completed.returncode, 0,
+                f"unlisted nonqualifying accepted: {completed.stdout}")
+            write_results(raw, nonqualifying_cell=None)
+            completed = subprocess.run(
+                [sys.executable, "-I", "-", *LIFECYCLE_CELLS],
+                input=code, capture_output=True, text=True, timeout=30,
+                cwd=raw)
+            self.assertEqual(completed.returncode, 0,
+                             f"qualified rows rejected: {completed.stdout}")
+
+
 if __name__ == "__main__":
     unittest.main()

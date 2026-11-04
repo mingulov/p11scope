@@ -460,12 +460,32 @@ def assert_safe_profile(doc):
             assert row["params"] is None and row.get("params_omitted") == "policy", row
             assert row["calls"] == 1, row
             assert "name" not in row, row
+            assert row.get("mechanism_hex") == f"0x{value:x}", row
+        assert {mid for mid, row in mechanisms.items()
+                if row.get("registered") is False} == {UNKNOWN, MAXIMUM}, \
+            mechanisms.keys()
     else:
         # Wider-than-32-bit words are counted, never published.
         assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
+        assert all(row.get("registered") is not False for row in mechanisms.values()), \
+            mechanisms
     # F-21: the policy null names its cause.
     assert all(item["params"] is None and item.get("params_omitted") == "policy"
                for item in mechanisms.values()), mechanisms
+    cgroups = doc.get("cgroups", [])
+    assert isinstance(cgroups, list), doc.get("cgroups")
+    for entry in cgroups:
+        rows = entry.get("mechanisms", [])
+        assert isinstance(rows, list), entry
+        for row in rows:
+            assert set(row) == {"mechanism", "mechanism_hex", "registered",
+                                "calls", "errors"}, row
+            assert row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
+            if TARGET_BITS == 32:
+                if row["registered"] is False:
+                    assert row["mechanism"] in (UNKNOWN, MAXIMUM), row
+            else:
+                assert row["registered"] is True, row
     assert doc["templates"]["operations"] == [], doc["templates"]
     ev = doc["evidence"]
     assert ev["unregistered_mechanisms"] == 2, ev
@@ -1909,37 +1929,50 @@ SAFE_TRACE_LANES = frozenset({
 
 
 def strip_approved_unregistered_rows(content):
-    """Drop approved registered:false rows from a profile document.
+    """Remove only the approved id fields from approved rows.
 
-    Only rows whose mechanism is UNKNOWN or MAXIMUM and whose
-    registered flag is False are removed, from the top-level
-    mechanisms[] breakdown and from each cgroups[] entry's own
-    breakdown (same approved shape); anything else (a parameter
-    alias as a mechanism, a True flag, a corrupt document) is left
-    for the unchanged alias scan. A removed row carries only the
-    numeric id, counts, null params and fixed strings, so no other
-    alias spelling can hide in it.
+    Only `mechanism` and `mechanism_hex` are removed, and only from
+    rows whose mechanism is UNKNOWN or MAXIMUM, whose registered flag
+    is False, and whose hex spelling exactly matches the id. Every
+    other field (calls, errors, ops, params, note, any future key)
+    stays for the unchanged alias scan, in the top-level mechanisms[]
+    breakdown and in each cgroups[] entry's own breakdown. A duplicated
+    JSON key refuses the strip: the raw content is scanned instead.
     """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+
     try:
-        doc = json.loads(content)
+        doc = json.loads(content, object_pairs_hook=unique_object)
     except ValueError:
         return content
     approved = {UNKNOWN, MAXIMUM}
 
-    def drop_approved(rows):
-        return [row for row in rows
-                if not (isinstance(row, dict) and row.get("mechanism") in approved
-                        and row.get("registered") is False)]
+    def strip_row(row):
+        if (isinstance(row, dict) and row.get("mechanism") in approved
+                and row.get("registered") is False
+                and row.get("mechanism_hex") == f"0x{row['mechanism']:x}"):
+            return {key: value for key, value in row.items()
+                    if key not in ("mechanism", "mechanism_hex")}
+        return row
+
+    def strip_rows(rows):
+        return [strip_row(row) for row in rows]
 
     mechanisms = doc.get("mechanisms")
     if not isinstance(mechanisms, list):
         return content
     stripped = dict(doc)
-    stripped["mechanisms"] = drop_approved(mechanisms)
+    stripped["mechanisms"] = strip_rows(mechanisms)
     cgroups = stripped.get("cgroups")
     if isinstance(cgroups, list):
         stripped["cgroups"] = [
-            {**entry, "mechanisms": drop_approved(entry["mechanisms"])}
+            {**entry, "mechanisms": strip_rows(entry["mechanisms"])}
             if isinstance(entry, dict) and isinstance(entry.get("mechanisms"), list)
             else entry
             for entry in cgroups

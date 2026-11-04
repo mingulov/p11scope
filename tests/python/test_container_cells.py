@@ -224,6 +224,15 @@ class ContainerCellsTests(unittest.TestCase):
                 (self.outdir / "results.jsonl").read_text().splitlines()}
         self.assertFalse(rows["pidns"]["pass"])
 
+    def test_documents_non_root_wiring_requirement(self):
+        # Union with WP-1: run-cell-script.sh requires root, this entry point
+        # requires non-root. The header must state the wiring so the porter
+        # wires it directly or adds a non-root mode to the template.
+        header = ENTRY.read_text(encoding="utf-8")
+        self.assertIn("run-cell-script", header)
+        self.assertIn("non-root", header)
+        self.assertIn("direct", header)
+
 
 if __name__ == "__main__":
     unittest.main()

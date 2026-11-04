@@ -248,6 +248,20 @@ pin then carries the note `provider's maps rendering unproven;
 callers mapping it may stay unbound`, and callers mapping that provider
 may stay unbound. This key split does not happen on Linux 6.8 and later.
 
+On kernels before 6.8, two pre-arm shapes still disclose instead of
+joining. A manifest accepted without a scan in view, with the scan
+arriving on a later tick, keeps the manifest module on the fd-keyed
+entry while the scan files the maps-keyed entry; the live rebuild never
+re-files the manifest alias, so that tick still fails with `candidate
+contains the same exact provider more than once` (the initial build
+joins both halves, and the live rebuild joins the pre-arm half). And a
+live 6.6 capture whose scan and pre-arm halves join across the live id
+change keeps `unobserved_windows` as `[late_discovery,
+mapped_unattached]`: the exactness proof maps are keyed by object id
+and cannot span the fd-to-scan id change, so the windows stay disclosed
+rather than reading `[]`. Both are fail-closed disclosures; the
+structural merge, evidence union and exact observation hold.
+
 File identity on some filesystems has known edge cases, found by a
 dedicated test study on 2026-11-03 (Linux 7.0) and not yet covered by
 automated tests:

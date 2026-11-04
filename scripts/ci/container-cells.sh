@@ -31,10 +31,11 @@
 # Wiring: run as a non-root user with passwordless sudo. This entry point
 # cannot run through scripts/ci/run-cell-script.sh as written: that template
 # requires root and runs the cell as root, while this script and its subcells
-# (verify-docker, verify-shared-layer, verify-fork-scope, d1) require a
-# non-root caller. Wire it direct in the workflow (non-root caller, then
-# validate OUTDIR/results.jsonl with scripts/ci/check-cell-results.py), or add
-# a non-root mode to the template on port.
+# (verify-docker, verify-shared-layer, d1; fork-scope has no caller check but
+# runs under this entry point) require a non-root caller. Wire it direct in
+# the workflow (non-root caller, then validate OUTDIR/results.jsonl with
+# scripts/ci/check-cell-results.py, which needs WP-1's fixed checker with
+# --require), or add a non-root mode to the template on port.
 set -u
 cd "$(dirname "$0")/../.." || exit 2
 

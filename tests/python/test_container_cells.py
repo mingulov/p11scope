@@ -13,7 +13,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -230,8 +229,19 @@ class ContainerCellsTests(unittest.TestCase):
         # wires it directly or adds a non-root mode to the template.
         header = ENTRY.read_text(encoding="utf-8")
         self.assertIn("run-cell-script", header)
-        self.assertIn("non-root", header)
-        self.assertIn("direct", header)
+        self.assertIn("Wire it direct", header)
+        self.assertIn("non-root mode", header)
+
+    def test_proxy_stack_uses_prebuilt_product(self):
+        # Proxy-stack must honor P11SCOPE_BIN like its siblings so it can run
+        # on hosts without cargo (quiet-host proof). Lives here because this
+        # lane owns the proxy probe changes; the porter may relocate it.
+        proxy = ROOT / "scripts/matrix/verify-proxy-stack.sh"
+        text = proxy.read_text(encoding="utf-8")
+        self.assertIn("matrix_prebuilt_product", text)
+        self.assertIn("P11SCOPE_EXE", text)
+        self.assertIn("P11SCOPE_EXE=$WORK/build/release/p11scope", text)
+        self.assertNotIn('"$WORK/build/release/p11scope"', text)
 
 
 if __name__ == "__main__":

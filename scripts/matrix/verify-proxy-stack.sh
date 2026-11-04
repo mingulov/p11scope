@@ -21,6 +21,8 @@
 # attached. LD_PRELOAD maps SoftHSM2 at exec instead, so both providers are
 # mapped before attach; p11-kit then dlopens the same inode and its refcount
 # rises, which is exactly the "two providers, one process" shape being tested.
+#
+# P11SCOPE_BIN=/abs/p11scope reuses a prebuilt product instead of building one.
 set -eu
 cd "$(dirname "$0")/../.."
 
@@ -33,6 +35,7 @@ NESTED_ROOT_PID=
 NESTED_ROOT_START=
 NESTED=
 . scripts/lib.sh
+. scripts/matrix/matrix-lib.sh
 require_non_root_caller
 
 # Probe provider paths (Debian + Fedora); a missing prerequisite exits 77.
@@ -84,7 +87,11 @@ cleanup() {
 . scripts/cleanup-traps.sh
 
 echo "=== build ==="
-scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace --target-dir "$WORK/build"
+if ! matrix_prebuilt_product; then
+    scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --release --workspace --target-dir "$WORK/build"
+    P11SCOPE_EXE=$WORK/build/release/p11scope
+fi
+matrix_report_product
 sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 77; }
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
@@ -119,7 +126,7 @@ WPID=$!
 wait_for_mapped_provider "$WPID" libsofthsm2.so
 wait_for_mapped_provider "$WPID" p11-kit
 sudo --preserve-env=SOFTHSM2_CONF --preserve-env=XDG_CONFIG_HOME \
-    "$WORK/build/release/p11scope" profile --pid "$WPID" \
+    "$P11SCOPE_EXE" profile --pid "$WPID" \
     --mode metrics --duration 20 -o "$WORK/observed.json" > "$WORK/profile.log" 2>&1 &
 SPID=$!
 wait_for_capture_ready "$WORK/profile.log" aggregate-only metrics || {
@@ -184,7 +191,7 @@ WPID=$!
 wait_for_mapped_provider "$WPID" provider-1.so
 wait_for_mapped_provider "$WPID" provider-2.so
 launch_root_recorded_process "$NESTED/observer.pid" "$NESTED/profile.log" \
-    "$WORK/build/release/p11scope" profile --pid "$WPID" \
+    "$P11SCOPE_EXE" profile --pid "$WPID" \
     --mode metrics --duration 10 -o "$NESTED/observed.json"
 SPID=$ROOT_LAUNCH_PID
 NESTED_ROOT_PID=$ROOT_PROCESS_PID

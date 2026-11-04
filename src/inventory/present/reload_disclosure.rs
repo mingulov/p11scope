@@ -1,3 +1,4 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! B17 leg-2 inventory projection of the staged reload-disclosure ledger.
 //!
 //! The projection resolves each ledger identity's router IDs through their

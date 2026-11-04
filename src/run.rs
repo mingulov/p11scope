@@ -2400,8 +2400,8 @@ fn owned_prearm_hold(
 /// run's pre-spawn scope start — which bridges the barrier-held prefix
 /// before the pause segment — in place of the coordinator's arm bound.
 /// The barrier-release bound travels alongside: the builder requires every
-/// declared first-stamp at or before it, since the child runs free between
-/// release and its first pause stop.
+/// declared first-stamp at or before it, since the child may run its
+/// command before the first *verified* pause stop.
 fn compose_prearm_hold(
     hold: Option<crate::discovery::pause::PauseGateHold>,
     scope_start_ns: Option<u64>,

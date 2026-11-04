@@ -390,11 +390,11 @@ enum AuthorizationSource {
     Removal,
 }
 
-/// Proven continuous hold of the owned child across the first pause epoch
+/// Gap-free hold of the owned child across the first pause epoch
 /// (R2-D1-6 proof source (i)): the pause-proven segment of the from-start
 /// hold the pre-arm exactness builder checks. A held child can neither map
-/// nor call. The segment alone does not prove the window: the child runs
-/// free between the barrier release and its first pause stop, so the
+/// nor call. The segment alone does not prove the window: the child may
+/// run its command before the first *verified* pause stop, so the
 /// builder additionally requires every declared first-stamp to precede the
 /// barrier release — pre-release windows are barrier-covered exactly, and
 /// post-release stamps withhold the proof. The owned `run` path composes
@@ -413,7 +413,7 @@ pub(crate) struct PauseGateHold {
     /// sampled after the cycle's attach batch. `None` until the first
     /// resume freezes a hold (an armed-but-never-stopped child ran free).
     pub(crate) end_ns: Option<u64>,
-    /// Still a continuous from-start hold. Anything unproven before the
+    /// The first epoch stayed gap-free. Anything unproven before the
     /// first resume voids it, sticky: a failed cycle, a rejected or
     /// refuted stop, a revalidation failure, a missing clock. The freeze at
     /// the first completing resume is immutable: a re-arm starts a new

@@ -28999,9 +28999,9 @@ impl Engine {
     /// member's real stamp, never a subset maximum); the capture must own
     /// its child, the hold must be continuous, clocked on both bounds,
     /// sane, and reach the attach instant, and every declared first-stamp
-    /// must precede the barrier release — the child runs free between
-    /// release and its first pause stop, so a post-release stamp is outside
-    /// any proven hold. Anything else emits no proof, and assembly still
+    /// must precede the barrier release — the child may run its command
+    /// before the first *verified* pause stop, so a post-release stamp is
+    /// outside any proven hold. Anything else emits no proof, and assembly still
     /// exact-matches each emitted interval against the would-be window, so
     /// a mismatched hold fails closed there too.
     fn pause_gate_exactness_proofs(

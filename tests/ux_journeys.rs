@@ -1322,3 +1322,22 @@ fn test_fn_name(segment: &str) -> Option<&str> {
     let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_')?;
     Some(&rest[..end])
 }
+
+/// Static guard: the staged-binary override `bin()` reads is the dedicated
+/// `P11SCOPE_E2E_OBSERVER` variable. A stray matrix export must not silently
+/// switch the binary in an ordinary `cargo test`, so `bin()` must not read
+/// that variable. (The needle is spelled in two halves so this guard does
+/// not match its own source.)
+#[test]
+fn observer_override_uses_the_dedicated_variable() {
+    let path = format!("{}/tests/ux_journeys.rs", env!("CARGO_MANIFEST_DIR"));
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        source.contains(r#"std::env::var("P11SCOPE_E2E_OBSERVER")"#),
+        "bin() must read P11SCOPE_E2E_OBSERVER in {path}"
+    );
+    assert!(
+        !source.contains(&["P11SCOPE", "BIN"].join("_")),
+        "bin() must not read the matrix override variable in {path}"
+    );
+}

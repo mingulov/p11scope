@@ -3684,6 +3684,13 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
 /// pinned, so any strict lossless verdict over this batch must fail.
 /// Own episode, own capture, fresh ticket budget.
 ///
+/// Cgroup-scoped by determinism, not by product need (the 257 cell's
+/// pattern): under System scope ambient EXECs share the burst batches,
+/// so batch purity is host-churn luck. The engine paths are
+/// scope-independent, so the twin pins the identical episode with the
+/// ambient lottery removed; the REFUSED gates below stay as scope-leak
+/// detectors.
+///
 /// The pre-twin shape (257 genuine EXECs in one batch, head last) is NOT
 /// all-blocked: it converges to admitted-head under any working fix, so
 /// its refusal asserts encoded the lane-A stall. That shape is preserved
@@ -3701,11 +3708,41 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
 
     let fixtures = FixtureBuild::compile_all("twin");
     let hints = vec![fixtures.early.clone()];
-    let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
+    let cgroup = OwnedCgroup::create("twin", WHAT);
+    let started = Instant::now();
+    let scope = crate::scope::capture_cgroup(&cgroup.path)
+        .unwrap_or_else(|error| panic!("{WHAT}: cgroup scope failed: {error:#}"));
+    let mut engine = Engine::discover(&cgroup_args(hints, cgroup.path.clone()), &scope, None)
+        .expect("live cgroup discovery");
+    let mut session = engine
+        .start_session(
+            CapturePolicy::Allowlisted,
+            None,
+            BackendSelection::default(),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: start_session failed: {error:#}"));
+    println!("t8: {WHAT}: capture live after {:?}", started.elapsed());
+    assert_eq!(
+        engine.loader_arms, 0,
+        "{WHAT}: capture startup arms nothing"
+    );
 
     // Phase 1: 256 retained provider children, no head yet. Release 1
     // warms every provider table (cold tables publish nothing) and ledgers
     // the old independent calls.
+    //
+    // Born inside the scope: the test moves itself in, spawns the wave
+    // there, then moves itself back out. No tick runs on this path, so
+    // enumeration only ever sees the wave.
+    let this = std::process::id();
+    cgroup.move_in(this, WHAT);
+    // Armed before any fallible step: a panic below still vacates the
+    // cgroup, so the directory removes instead of littering root-owned.
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
+    assert!(
+        cgroup.members(WHAT).contains(&this),
+        "{WHAT}: the test must spawn from inside the cgroup"
+    );
     let mut population =
         Population::spawn_on(fixtures, 256, LIVE_REPEAT, false, false, Some(LIVE_REPEAT2));
     assert_eq!(population.children.len(), 256);
@@ -3713,12 +3750,22 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         engine.loader_arms, 0,
         "{WHAT}: no arming before the first drain"
     );
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
     population.release_and_wait_ledgers();
     let owned: BTreeSet<u32> = population.pids();
     assert_eq!(owned.len(), 256);
+    assert_eq!(
+        cgroup.members(WHAT),
+        owned,
+        "{WHAT}: the cgroup holds exactly the 256 owned providers"
+    );
 
     // Burst 1 must be pure-owned: any ambient EXEC would park against the
-    // filling map and spend work the armed checkpoint forbids.
+    // filling map and spend work the armed checkpoint forbids. The cgroup
+    // scope gates ambient EXECs at event time, so the gate below is a
+    // scope-leak detector, not a noise lottery.
     let serial_before = engine.last_refresh_serial;
     let (records, malformed, _) = engine
         .collect_frame_discovery(&mut session)
@@ -3737,7 +3784,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     let ambient_execs = ambient_exec_pids(&records, &owned);
     assert!(
         ambient_execs.is_empty(),
-        "{WHAT}: REFUSED: ambient EXECs in the burst 1 batch ({ambient_execs:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: ambient EXECs in the burst 1 batch ({ambient_execs:?}); refuses the cell as a scope leak"
     );
     println!(
         "t8: {WHAT}: burst 1 collected: {} records, 256 owned EXECs",
@@ -3750,10 +3797,10 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     let settle1 = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
 
     // The armed checkpoint: 256 live obligations, exactly 256 arms, zero
-    // loss. Passes and attempts are observations only here: a provider-free
-    // ambient EXEC during the full-map window parks and is serviced
-    // without arming (the positive tolerates the same), so only the
-    // refusal's own deltas pin zero transactions/attempts.
+    // loss. Passes and attempts are observations only here: the cgroup
+    // scope admits no ambient EXEC to park, so they reflect owned-only
+    // service (the positive tolerates the same); only the refusal's own
+    // deltas pin zero transactions/attempts.
     assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
     assert_eq!(
         minted_ids(&engine),
@@ -3815,14 +3862,13 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     );
     twin_census(&engine, &owned, "armed", WHAT);
 
-    // One extra drain+service tick for lagging ambient: the refill needs
-    // an empty map, and an ambient request dispatched in the settle's last
-    // drain may still need one service. A lingering ambient request would
-    // either refuse an owned refill (corrupting the exactly-once refusal)
-    // or sit in the snapshot as an unblocked candidate (breaking
-    // all-blocked for real), so anything more than one tick of lag —
-    // residue or fresh loss — refuses the cell. No extended drain loop: on
-    // a noisy host extra drains only extend storm exposure.
+    // One extra drain+service tick for lagging requests: the refill needs
+    // an empty map, and a request dispatched in the settle's last drain
+    // may still need one service. The cgroup scope admits no ambient, so
+    // anything more than one tick of lag — residue or fresh loss — refuses
+    // the cell as a scope leak. No extended drain loop: under System scope
+    // extra drains only extend storm exposure, and the single tick keeps
+    // the twin and the control identical here.
     engine
         .drain_discovery_shallow(&mut session, false)
         .unwrap_or_else(|error| panic!("{WHAT}: lag drain failed: {error:#}"));
@@ -3831,12 +3877,12 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         .unwrap_or_else(|error| panic!("{WHAT}: lag service failed: {error:#}"));
     assert_eq!(
         engine.discovery_truncated, 0,
-        "{WHAT}: REFUSED: fresh loss in the seam window (truncated={}); rerun in a quiet window",
+        "{WHAT}: REFUSED: fresh loss in the seam window (truncated={}); refuses the cell as a scope leak",
         engine.discovery_truncated
     );
     assert!(
         engine.refresh_requested.is_empty(),
-        "{WHAT}: REFUSED: ambient residue in the map ({} keys: {:?}); rerun in a quiet window",
+        "{WHAT}: REFUSED: residue in the map ({} keys: {:?}); refuses the cell as a scope leak",
         engine.refresh_requested.len(),
         engine.refresh_requested.keys().take(8).collect::<Vec<_>>()
     );
@@ -3860,9 +3906,20 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     // The fresh head parks against the full blocked map. Its batch must
     // hold no other request-creating arrival: at a full blocked map any
     // unknown-pid consumed record would corrupt the exactly-once refusal.
+    // Born inside the scope, like the wave: move in, spawn, move out.
+    cgroup.move_in(this, WHAT);
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
     let head_pid = population.spawn_head(WHAT);
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
     let owned2 = population.pids();
     assert_eq!(owned2.len(), 257);
+    assert_eq!(
+        cgroup.members(WHAT),
+        owned2,
+        "{WHAT}: the cgroup holds exactly the 257 owned pids"
+    );
     let (head_records, head_malformed, _) = engine
         .collect_frame_discovery(&mut session)
         .unwrap_or_else(|error| panic!("{WHAT}: head collect failed: {error:#}"));
@@ -3880,7 +3937,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     let head_ambient = ambient_exec_pids(&head_records, &owned2);
     assert!(
         head_ambient.is_empty(),
-        "{WHAT}: REFUSED: ambient EXECs in the head batch ({head_ambient:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: ambient EXECs in the head batch ({head_ambient:?}); refuses the cell as a scope leak"
     );
     let foreign: BTreeSet<u32> = head_records
         .iter()
@@ -3889,7 +3946,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         .collect();
     assert!(
         foreign.is_empty(),
-        "{WHAT}: REFUSED: foreign records in the head batch ({foreign:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: foreign records in the head batch ({foreign:?}); refuses the cell as a scope leak"
     );
     println!(
         "t8: {WHAT}: head batch collected: {} records, head EXEC present",
@@ -4060,11 +4117,11 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         "{WHAT}: the suffix performed scan work"
     );
     // The loss is sticky: later service never erases it, so any strict
-    // lossless verdict over this batch must fail. The counts are lower
-    // bounds, not exact: ambient newcomers arriving during the suffix at
-    // the full blocked map are genuinely refused too, so a stormy host
-    // adds refusals past the head's one. The exact-once pin stands above,
-    // taken before the suffix ran.
+    // lossless verdict over this batch must fail. The counts stay lower
+    // bounds, not exact, though the cgroup scope admits no ambient
+    // newcomers to refuse past the head's one: the bounds are retained so
+    // the twin keeps pinning at least the head's refusal. The exact-once
+    // pin stands above, taken before the suffix ran.
     assert!(
         engine.discovery_truncated >= 1,
         "{WHAT}: the historical loss survives service"
@@ -4126,6 +4183,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     population.terminate_all(WHAT, &|_| 0);
     drop(session);
     drop(engine);
+    cgroup.remove(WHAT);
     let fds_end = fd_count();
     println!(
         "t8: twin: PASS: 1 refusal, sticky loss, FIFO progress (minted 256->{minted_floor}), 256 contexts survive refusal; serial_delta={serial_delta} arm_ticks={} suffix_ticks=8 passes={passes_end} attempts={attempts_end} arms={arms_end} inter_drain_max={:?} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",
@@ -4148,6 +4206,11 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
 /// match the twin (the control's small map additionally settles, which
 /// the twin's full map structurally cannot), so the request-map refill
 /// is the only variable.
+///
+/// Cgroup-scoped by determinism like the twin (the 257 cell's pattern):
+/// the engine paths are scope-independent, so the control pins the
+/// identical admission with the ambient lottery removed; the REFUSED
+/// gates below stay as scope-leak detectors.
 #[test]
 #[ignore = "privileged: live BPF unparked-head control; run as root with --ignored --test-threads=1 under the privileged lane"]
 fn pressure_live256_unparked_head_control_admits() {
@@ -4159,10 +4222,40 @@ fn pressure_live256_unparked_head_control_admits() {
 
     let fixtures = FixtureBuild::compile_all("unparked");
     let hints = vec![fixtures.early.clone()];
-    let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
+    let cgroup = OwnedCgroup::create("unparked", WHAT);
+    let started = Instant::now();
+    let scope = crate::scope::capture_cgroup(&cgroup.path)
+        .unwrap_or_else(|error| panic!("{WHAT}: cgroup scope failed: {error:#}"));
+    let mut engine = Engine::discover(&cgroup_args(hints, cgroup.path.clone()), &scope, None)
+        .expect("live cgroup discovery");
+    let mut session = engine
+        .start_session(
+            CapturePolicy::Allowlisted,
+            None,
+            BackendSelection::default(),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: start_session failed: {error:#}"));
+    println!("t8: {WHAT}: capture live after {:?}", started.elapsed());
+    assert_eq!(
+        engine.loader_arms, 0,
+        "{WHAT}: capture startup arms nothing"
+    );
 
     // Phase 1, identical to the twin: 256 retained provider children, no
     // head yet; release 1 warms every provider table and ledgers burst 1.
+    //
+    // Born inside the scope: the test moves itself in, spawns the wave
+    // there, then moves itself back out. No tick runs on this path, so
+    // enumeration only ever sees the wave.
+    let this = std::process::id();
+    cgroup.move_in(this, WHAT);
+    // Armed before any fallible step: a panic below still vacates the
+    // cgroup, so the directory removes instead of littering root-owned.
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
+    assert!(
+        cgroup.members(WHAT).contains(&this),
+        "{WHAT}: the test must spawn from inside the cgroup"
+    );
     let mut population =
         Population::spawn_on(fixtures, 256, LIVE_REPEAT, false, false, Some(LIVE_REPEAT2));
     assert_eq!(population.children.len(), 256);
@@ -4170,9 +4263,17 @@ fn pressure_live256_unparked_head_control_admits() {
         engine.loader_arms, 0,
         "{WHAT}: no arming before the first drain"
     );
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
     population.release_and_wait_ledgers();
     let owned: BTreeSet<u32> = population.pids();
     assert_eq!(owned.len(), 256);
+    assert_eq!(
+        cgroup.members(WHAT),
+        owned,
+        "{WHAT}: the cgroup holds exactly the 256 owned providers"
+    );
 
     let serial_before = engine.last_refresh_serial;
     let (records, malformed, _) = engine
@@ -4192,7 +4293,7 @@ fn pressure_live256_unparked_head_control_admits() {
     let ambient_execs = ambient_exec_pids(&records, &owned);
     assert!(
         ambient_execs.is_empty(),
-        "{WHAT}: REFUSED: ambient EXECs in the burst 1 batch ({ambient_execs:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: ambient EXECs in the burst 1 batch ({ambient_execs:?}); refuses the cell as a scope leak"
     );
     println!(
         "t8: {WHAT}: burst 1 collected: {} records, 256 owned EXECs",
@@ -4205,7 +4306,8 @@ fn pressure_live256_unparked_head_control_admits() {
     let settle1 = settle_live_episode(&mut engine, &mut session, &owned, WHAT);
 
     // The same armed checkpoint as the twin. Passes and attempts are
-    // observations only: provider-free ambient parks without arming.
+    // observations only: the cgroup scope admits no ambient to park, so
+    // they reflect owned-only service.
     assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
     assert_eq!(
         minted_ids(&engine),
@@ -4233,21 +4335,31 @@ fn pressure_live256_unparked_head_control_admits() {
         .unwrap_or_else(|error| panic!("{WHAT}: lag service failed: {error:#}"));
     assert_eq!(
         engine.discovery_truncated, 0,
-        "{WHAT}: REFUSED: fresh loss in the seam window (truncated={}); rerun in a quiet window",
+        "{WHAT}: REFUSED: fresh loss in the seam window (truncated={}); refuses the cell as a scope leak",
         engine.discovery_truncated
     );
     assert!(
         engine.refresh_requested.is_empty(),
-        "{WHAT}: REFUSED: ambient residue in the map ({} keys: {:?}); rerun in a quiet window",
+        "{WHAT}: REFUSED: residue in the map ({} keys: {:?}); refuses the cell as a scope leak",
         engine.refresh_requested.len(),
         engine.refresh_requested.keys().take(8).collect::<Vec<_>>()
     );
 
     // The same fresh head against the empty map, under the same batch
-    // purity gates as the twin.
+    // purity gates as the twin. Born inside the scope, like the wave.
+    cgroup.move_in(this, WHAT);
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
     let head_pid = population.spawn_head(WHAT);
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
     let owned2 = population.pids();
     assert_eq!(owned2.len(), 257);
+    assert_eq!(
+        cgroup.members(WHAT),
+        owned2,
+        "{WHAT}: the cgroup holds exactly the 257 owned pids"
+    );
     let (head_records, head_malformed, _) = engine
         .collect_frame_discovery(&mut session)
         .unwrap_or_else(|error| panic!("{WHAT}: head collect failed: {error:#}"));
@@ -4265,7 +4377,7 @@ fn pressure_live256_unparked_head_control_admits() {
     let head_ambient = ambient_exec_pids(&head_records, &owned2);
     assert!(
         head_ambient.is_empty(),
-        "{WHAT}: REFUSED: ambient EXECs in the head batch ({head_ambient:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: ambient EXECs in the head batch ({head_ambient:?}); refuses the cell as a scope leak"
     );
     let foreign: BTreeSet<u32> = head_records
         .iter()
@@ -4274,7 +4386,7 @@ fn pressure_live256_unparked_head_control_admits() {
         .collect();
     assert!(
         foreign.is_empty(),
-        "{WHAT}: REFUSED: foreign records in the head batch ({foreign:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: foreign records in the head batch ({foreign:?}); refuses the cell as a scope leak"
     );
     println!(
         "t8: {WHAT}: head batch collected: {} records, head EXEC present",
@@ -4377,6 +4489,7 @@ fn pressure_live256_unparked_head_control_admits() {
     population.terminate_all(WHAT, &|_| 0);
     drop(session);
     drop(engine);
+    cgroup.remove(WHAT);
     let fds_end = fd_count();
     println!(
         "t8: unparked: PASS: head admitted with zero loss, 256 tickets intact; serial_delta={serial_delta} arm_ticks={} admit_ticks={} passes={passes_end} attempts={attempts_end} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",

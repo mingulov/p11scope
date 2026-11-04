@@ -139,7 +139,8 @@ list each one as a bare hex number with its call/error counts
 total, which still counts every occurrence. Like `selected_detail`,
 this is a v3-additive disclosure that introduces no new schema
 revision; historical v2 documents list registered ids only and lack
-the `registered` key.
+the `registered` key. `cgroups[].mechanisms[]` rows carry the same
+`registered` flag with the same meaning.
 
 The observer and `p11scope inspect` make zero PKCS #11 calls. Only the explicit
 offline `p11scope-discover` helper loads a provider and makes exactly ten

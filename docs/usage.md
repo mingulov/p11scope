@@ -986,6 +986,9 @@ Limits that matter in pods:
   From 0.6.0, once populated, it counts completions per operation
   category, e.g.
   `key operations: rev 1 populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active operations`.
+  In v0.6.0 key-operation rows name only registered mechanisms: the
+  journal lane keeps withholding unregistered ids, which appear with
+  counts in the profile and trace mechanism tables instead.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.

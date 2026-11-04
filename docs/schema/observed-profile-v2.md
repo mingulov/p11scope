@@ -518,6 +518,10 @@ captured.
 
 Each item has numeric `cgroup_id`, best-effort `label`, calls, errors, and a
 per-mechanism breakdown. A missing label is `null`; the resolver never guesses.
+Each per-mechanism row carries the numeric id (`mechanism`,
+`mechanism_hex`), calls and errors; v3 documents additionally carry
+`registered` with the same meaning as `mechanisms[]` `registered`
+(absent from historical v2 documents).
 
 ## v1.4 → v2 migration
 

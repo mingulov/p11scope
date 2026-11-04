@@ -421,6 +421,9 @@ or device identity.
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.
+- Journal/key-operation uniformity for unregistered mechanism ids
+  (0.7.0): in v0.6.0 key-operation rows name only registered
+  mechanisms.
 - A named unknown edge for the copy-up case above instead of silent
   misattribution, and for a late provider's unwatched window.
 - Accounting for remaining exit-caused loader rejects that lack a

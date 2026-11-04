@@ -1427,30 +1427,21 @@ counters); allowlist-v1 bytes are unchanged.
 
 ## Unregistered mechanism id publication (owner, 2026-11-03)
 
-**Status: IMPLEMENTED in v0.6.0 by owner decision 2026-11-03:
-mechanism ids are public constants, so the observer publishes the
-numeric id (hex) of every mechanism it counts as unregistered, with
-its call/error counts, instead of only a total.** For the mechanism
-word in the Detailed object this retires v1's finite-published-set
-membership rule and replaces it with provider acceptance: a readable
-value is published only when the provider returned `CKR_OK` or
-`CKR_PENDING` for the call, so in practice the published set is the
-provider's own finite, enumerable mechanism list. Residual risk: a
-provider that accepts anything (or validates late), combined with a
-caller that aliases `pMechanism` into its own readable memory,
-publishes one word of that memory per call as a bare number —
-bounded by the capture's key budget, never decoded, never named, and
-carrying no type or provenance claim. The published value is therefore
-not necessarily an id. Allowlist-v1 bytes are unchanged.
+**Status: IMPLEMENTED in v0.6.0 by owner decision 2026-11-03 (rulings
+KG-1/KG-2): mechanism ids are public constants, so the observer publishes
+the numeric id (hex) of every 32-bit mechanism id it counts as
+unregistered, with its call/error counts, instead of only a total.** This
+extends v1's finite-published-set rule for the mechanism-id scalar only: a
+readable, provider-accepted id outside `MECH_SHAPE` and at most
+`0xFFFFFFFF` is published as a bare number with counts, never decoded,
+never named. Allowlist-v1 bytes are unchanged.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| Unregistered mechanism id | The existing guarded return-time `CK_MECHANISM.mechanism` word read under `allowlisted` (same descriptor, return-code and span gates as a registered publication); only the membership outcome differs, so no new read exists. `pParameter` and `ulParameterLen` are never touched for these ids. Detailed object only: the journal lane keeps withholding (its validator pins the capture transition set). In unsafe diagnostic builds the allowlisted return gate is off, so unsafe entry flags membership misses the same way (unsafe builds never carry the journal object). | The numeric id beside `MECHANISM_VALUE` with the `MECHANISM_UNREGISTERED` capture bit; userspace aggregates per-id calls/errors through the existing bounded semantic path (the 16,384-key capture budget, the event ring). Public `mechanisms[]` rows carry `registered: false` with hex id, calls and errors; text surfaces show the bare hex id with call/error counts. No name is assigned: unknown ids render as hex, never guessed from any header. | An unreadable id stays `MECHANISM_UNREADABLE` with `ARG_READ_FAILURE` as before. Every occurrence still counts in `evidence.unregistered_mechanisms` under `allowlisted` in both lanes, including occurrences lost later (unsafe diagnostic documents mark rows but keep the total at 0, unchanged); ring loss and state-budget refusals disclose through their existing `PARTIAL`-forcing evidence, never silently. Required evidence: the unregistered/registered/overflow twins at the semantic seam plus a live before/after capture listing every remaining unregistered id. |
+| Unregistered mechanism id (`registered: false`) | The existing guarded return-time `CK_MECHANISM.mechanism` word, read under `allowlisted` with the same descriptor, span and `return_allows_mechanism` gates as a registered publication; only the membership outcome differs, so no new read exists. Published only when the value is at most `0xFFFFFFFF` (every standard and portable vendor id; `CK_ULONG` is 32-bit on ILP32 and Windows); a wider word stays unpublished. `pParameter` and `ulParameterLen` are never touched for these ids. Detailed object only; the journal object keeps withholding (its validator pins the capture transition set). Unsafe diagnostic builds, whose allowlisted return gate is off, flag membership misses at entry; they never carry the journal object. | The id beside `MECHANISM_VALUE` with the `MECHANISM_UNREGISTERED` capture bit, aggregated per id through the existing bounded semantic path (16,384-key capture budget, event ring), private until publication. Public: `mechanisms[]` and `cgroups[].mechanisms[]` rows with `registered: false`, hex id, calls, errors and null params; trace text shows the bare hex id. Key-operation rows never carry an unregistered id. No name is assigned or guessed from any header. | An unreadable id stays `MECHANISM_UNREADABLE` with `ARG_READ_FAILURE`. Every occurrence, including wider-than-32-bit values and journal-lane occurrences, counts in `evidence.unregistered_mechanisms`; ring loss and state-budget refusals disclose through their existing `PARTIAL`-forcing evidence, never silently. Required evidence: unregistered/registered/sticky/overflow twins and a wider-than-32-bit twin (counted, unpublished) at the semantic seam; journal withholding pins; the bits-aware live canary on 32- and 64-bit targets; a live before/after capture listing every remaining unregistered id. |
 
-The published word is mechanism-id-sized but untyped: when `pMechanism`
-aliases a PIN buffer, key bytes or a heap pointer and the provider
-still returns OK, the profile contains that memory's first `CK_ULONG`
-as `mechanism_hex`. What limits this is the return-code gate, not the
-value: a conforming provider returns OK only for a mechanism it
-supports. The v1 function-name rule is untouched: function words still
-reach output only by exact membership in the 104 published names.
+The provider accepted each published id (return gate) and the bound
+excludes full-width words, so the published value is a 32-bit
+mechanism-id scalar plus counts, never a buffer, parameter, handle or key
+fact. The v1 function-name rule is untouched: function words still reach
+output only by exact membership in the 104 published names.

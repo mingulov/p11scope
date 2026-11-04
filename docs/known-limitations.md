@@ -361,7 +361,13 @@ per-call view and a `Joint birth unavailable; retained S1` gap names
 `joint_image_refused`. A call from an untracked process that is still in
 progress when key operations are sealed cannot be accounted for; tracking
 then ends after about 6 s with a `joint audit made no progress` gap
-instead of waiting for the run deadline.
+instead of waiting for the run deadline. This ends tracking; it never
+hangs, and the plain per-call counts are unaffected.
+The memory of refused processes holds 16,448 entries. Past that, every
+new untracked caller keeps the plain per-call view with the same
+`joint_image_refused` reason; processes refused earlier stay refused and
+tracked callers are unaffected. At one new foreign client every 3 seconds
+that is about 14 hours of capture.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are

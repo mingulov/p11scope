@@ -2170,7 +2170,8 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
     let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
     let mut engine = Engine::empty();
     engine.pinned = pins;
-    let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
     assert!(skipped.is_empty(), "{skipped:?}");
     let closure_object = modules[0].object;
     let mut counters = DiscoveryCounters::default();
@@ -2223,7 +2224,11 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
     let mut candidate_pins = engine.pinned.clone();
     let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
     let candidate = engine
-        .live_candidate(candidate_pins, vec![closure.clone(), provider.clone()], skipped)
+        .live_candidate(
+            candidate_pins,
+            vec![closure.clone(), provider.clone()],
+            skipped,
+        )
         .expect("the later provider's rebuild");
     let provider_object = candidate
         .pinned
@@ -2238,7 +2243,11 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
             .filter(|slot| slot.object == object)
             .count()
     };
-    assert_eq!(slots_of(provider_object), 68, "the provider is admitted whole");
+    assert_eq!(
+        slots_of(provider_object),
+        68,
+        "the provider is admitted whole"
+    );
     assert_eq!(slots_of(closure_object), 0, "the closure stays at zero");
     assert!(
         candidate

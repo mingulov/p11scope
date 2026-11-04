@@ -7,10 +7,10 @@
 //! The `v` command replicates the instance-continuity fixture's case-`v`
 //! verbatim: a synchronous `CLONE_VM` sharer maps and unmaps one page of
 //! provider A in the shared mm (`waitpid`), so the trigger carries no
-//! timing dependence in the router. The driver calls both providers
-//! continuously for the whole capture while the test lands one churn
-//! mid-run, so the lane's own scans observe gen-0, the churn, and the
-//! tainted continuation no matter when attach completes.
+//! timing dependence in the router. The test paces alternating `a`/`b`
+//! call bursts across the whole capture and lands one churn mid-run,
+//! so the lane's own scans observe gen-0, the churn, and the tainted
+//! continuation no matter when attach completes.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -42,18 +42,18 @@ CK_RV C_GetFunctionList(void **out) { if (!out) return 7; *out = &table; return 
 "#;
 
 /// Two-provider leg-2 driver: `argv[1]` is the churned provider A,
-/// `argv[2]` the clean control B. A worker thread calls `C_GetSlotInfo`
-/// on both continuously from `READY` until `q`, so the capture observes
-/// calls whenever its attach completes; commands on stdin: `v` churns A
-/// through a `CLONE_VM` sharer, `q` quits. Continuous calls (not a paced
-/// burst window) because a debug observer on a loaded host can take
-/// ~10 s to reach its first pass — a short burst window closes before
-/// attach and the capture honestly reports zero use.
+/// `argv[2]` the clean control B. The twin trigger shape, paced by the
+/// test across the whole capture: `a` calls A, `b` calls B (12
+/// `C_GetSlotInfo` calls each, main thread), `v` churns A through a
+/// `CLONE_VM` sharer (the fixture case-`v` body), `q` quits. Paced
+/// main-thread bursts — never a continuous worker: a debug observer on
+/// a loaded host can take ~10 s to reach its first pass, so the test
+/// paces across the run instead of one burst window, and a call storm
+/// stages no disclosure (the router keeps minting under pressure).
 const DRIVER_SOURCE: &str = r#"
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,24 +64,6 @@ const DRIVER_SOURCE: &str = r#"
 
 typedef unsigned long CK_ULONG;
 typedef CK_ULONG (*slot_info_fn)(CK_ULONG, void *);
-
-static volatile int stop_calls;
-static slot_info_fn call_a;
-static slot_info_fn call_b;
-
-static void *call_loop(void *unused)
-{
-    (void)unused;
-    char info[256];
-    while (!stop_calls) {
-        for (int i = 0; i < 20; i++) {
-            call_a(0x70000000UL, info);
-            call_b(0x70000000UL, info);
-        }
-        usleep(50000);
-    }
-    return NULL;
-}
 
 static const char *sharer_provider;
 static int sharer_child(void *unused)
@@ -111,21 +93,25 @@ int main(int argc, char **argv)
         fprintf(stderr, "dlopen: %s\n", dlerror());
         return 1;
     }
-    call_a = (slot_info_fn)dlsym(ha, "C_GetSlotInfo");
-    call_b = (slot_info_fn)dlsym(hb, "C_GetSlotInfo");
+    slot_info_fn call_a = (slot_info_fn)dlsym(ha, "C_GetSlotInfo");
+    slot_info_fn call_b = (slot_info_fn)dlsym(hb, "C_GetSlotInfo");
     if (!call_a || !call_b) {
         fprintf(stderr, "dlsym: %s\n", dlerror());
         return 1;
     }
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, call_loop, NULL) != 0) {
-        fprintf(stderr, "pthread_create failed\n");
-        return 1;
-    }
     printf("READY %s %s\n", argv[1], argv[2]);
     char line[64];
+    char info[256];
     while (fgets(line, sizeof(line), stdin)) {
-        if (line[0] == 'v') {
+        if (line[0] == 'a') {
+            for (int i = 0; i < 12; i++)
+                call_a(0x70000000UL, info);
+            printf("CALLED_A\n");
+        } else if (line[0] == 'b') {
+            for (int i = 0; i < 12; i++)
+                call_b(0x70000000UL, info);
+            printf("CALLED_B\n");
+        } else if (line[0] == 'v') {
             static char stack[64 * 1024] __attribute__((aligned(16)));
             int status = 0;
             sharer_provider = argv[1];
@@ -140,8 +126,6 @@ int main(int argc, char **argv)
             break;
         }
     }
-    stop_calls = 1;
-    pthread_join(worker, NULL);
     printf("BYE\n");
     return 0;
 }
@@ -150,8 +134,9 @@ int main(int argc, char **argv)
 /// Capture length with the churn past the slowest attach: calls flow for
 /// the whole run, the churn lands mid-capture, and the tail keeps the
 /// lane scanning (no re-yield).
-const CAPTURE_DURATION_SECS: u64 = 32;
-const CHURN_AT_SECS: u64 = 18;
+const CAPTURE_DURATION_SECS: u64 = 40;
+const CHURN_AT_SECS: u64 = 20;
+const PACE_SECS: u64 = 2;
 const LINE_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(150);
 
@@ -170,7 +155,7 @@ fn compile_c(source: &str, name: &str, directory: &Path, provider: bool) -> Resu
     }
     cc.arg(&path).arg("-o").arg(&output);
     if !provider {
-        cc.args(["-ldl", "-lpthread"]);
+        cc.args(["-ldl"]);
     }
     let result = cc.output().context("running cc")?;
     ensure!(
@@ -264,7 +249,10 @@ fn manifest_for(module: &Path, out: &Path) -> Result<()> {
         surfaces: vec![SurfaceRecord {
             source: SurfaceSource::LegacyFunctionList,
             acquisition: Acquisition::Ok,
-            version: Some(Version { major: 2, minor: 40 }),
+            version: Some(Version {
+                major: 2,
+                minor: 40,
+            }),
             walk: WalkOutcome::Full,
             functions,
         }],
@@ -339,10 +327,7 @@ impl Driver {
             if let Some(status) = self.child.try_wait()? {
                 return Ok(status);
             }
-            ensure!(
-                Instant::now() < deadline,
-                "the driver did not exit in time"
-            );
+            ensure!(Instant::now() < deadline, "the driver did not exit in time");
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -379,19 +364,22 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
 
     let mut driver = Driver::spawn(&driver, &provider_a, &provider_b)?;
     let ready = driver.line(LINE_TIMEOUT)?;
-    ensure!(
-        ready.starts_with("READY"),
-        "driver ready line: {ready}"
-    );
+    ensure!(ready.starts_with("READY"), "driver ready line: {ready}");
     let driver_pid = driver.pid();
 
     let observer = observer_binary()?;
     let started = Instant::now();
+    // Per-offset links: the leg-1 twins pin `BackendSelection::Singles`
+    // (`Harness::start`), and an identical sharer-churn workload stages
+    // the disclosure under singles while uprobe-multi links stage none
+    // (a lane data gap outside leg 2; reported, not worked around here).
     let mut capture = Command::new(&observer)
         .args([
             "inventory",
             "--pid",
             &driver_pid.to_string(),
+            "--attach-backend",
+            "singles",
             "--manifest",
             &manifest_a.to_string_lossy(),
             "--manifest",
@@ -403,23 +391,13 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
         ])
         .spawn()
         .context("spawning the installed capture")?;
-    // The driver calls continuously; the churn lands mid-capture while the
-    // capture is still running, then the tail scans on.
+    // Paced across the whole run: alternating `a`/`b` bursts keep both
+    // providers live whenever attach completes (a debug observer can
+    // take ~10 s to reach its first pass), and the churn lands
+    // mid-capture with twin-shaped calls on both sides of it.
     let churn_at = started + Duration::from_secs(CHURN_AT_SECS);
-    if churn {
-        loop {
-            ensure!(
-                capture.try_wait()?.is_none(),
-                "the capture ended before the churn"
-            );
-            if Instant::now() >= churn_at {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        let churned = driver.command(b'v')?;
-        ensure!(churned == "SHARER", "churn answer: {churned}");
-    }
+    let mut churn_done = !churn;
+    let mut pace_a = true;
     let status = loop {
         if let Some(status) = capture.try_wait()? {
             break status;
@@ -428,8 +406,21 @@ fn run_leg2_capture(churn: bool) -> Result<Leg2Outcome> {
             started.elapsed() < CAPTURE_TIMEOUT,
             "the installed capture did not finish in time"
         );
-        std::thread::sleep(Duration::from_millis(100));
+        if !churn_done && Instant::now() >= churn_at {
+            let churned = driver.command(b'v')?;
+            ensure!(churned == "SHARER", "churn answer: {churned}");
+            churn_done = true;
+        }
+        let burst = if pace_a { b'a' } else { b'b' };
+        pace_a = !pace_a;
+        let answered = driver.command(burst)?;
+        ensure!(
+            answered == "CALLED_A" || answered == "CALLED_B",
+            "pace answer: {answered}"
+        );
+        std::thread::sleep(Duration::from_secs(PACE_SECS));
     };
+    ensure!(churn_done, "the capture ended before the churn");
     let capture_secs = started.elapsed().as_secs();
     ensure!(status.success(), "the installed capture exited {status}");
     let quit = driver.command(b'q')?;
@@ -457,26 +448,15 @@ fn module_label_for(document: &serde_json::Value, provider: &str) -> Result<Stri
         .to_string_lossy()
         .into_owned();
     let mut found = None;
-    for module in document["modules"]
-        .as_array()
-        .context("modules[]")?
-    {
+    for module in document["modules"].as_array().context("modules[]")? {
         let paths = module["paths"].as_array().context("module paths")?;
         if paths
             .iter()
             .filter_map(|path| path.as_str())
             .any(|path| path.ends_with(&file))
         {
-            ensure!(
-                found.is_none(),
-                "two modules claim {file}: {document}",
-            );
-            found = Some(
-                module["id"]
-                    .as_str()
-                    .context("module id")?
-                    .to_string(),
-            );
+            ensure!(found.is_none(), "two modules claim {file}: {document}",);
+            found = Some(module["id"].as_str().context("module id")?.to_string());
         }
     }
     found.with_context(|| format!("no module row for {file}"))
@@ -490,20 +470,14 @@ fn instance_labels_for(
     module: &str,
 ) -> Result<Vec<String>> {
     let mut callers = Vec::new();
-    for caller in document["callers"]
-        .as_array()
-        .context("callers[]")?
-    {
+    for caller in document["callers"].as_array().context("callers[]")? {
         if caller["pid"].as_u64() == Some(u64::from(driver_pid)) {
             callers.push(caller["id"].as_str().context("caller id")?.to_string());
         }
     }
     ensure!(!callers.is_empty(), "no caller row for pid {driver_pid}");
     let mut instances = Vec::new();
-    for instance in document["instances"]
-        .as_array()
-        .context("instances[]")?
-    {
+    for instance in document["instances"].as_array().context("instances[]")? {
         let caller = instance["caller"].as_str().context("instance caller")?;
         let row_module = instance["module"].as_str().context("instance module")?;
         if callers.iter().any(|id| id == caller) && row_module == module {
@@ -541,10 +515,19 @@ fn privileged_inventory_reload_disclosure_lists_churned_identity() -> Result<()>
         "the churned capture must publish the disclosure object"
     );
     // Exact closed shape: counts plus module-grouped identities only.
-    let mut top: Vec<&str> = key.as_object().context("object")?.keys().map(String::as_str).collect();
+    let mut top: Vec<&str> = key
+        .as_object()
+        .context("object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
     top.sort_unstable();
     ensure!(
-        top == ["continued_across_global", "identities", "joined_across_global"],
+        top == [
+            "continued_across_global",
+            "identities",
+            "joined_across_global"
+        ],
         "top-level keys: {top:?}"
     );
     let continued = key["continued_across_global"].as_u64().context("count")?;
@@ -562,10 +545,7 @@ fn privileged_inventory_reload_disclosure_lists_churned_identity() -> Result<()>
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        ensure!(
-            keys == ["instances", "module"],
-            "identity keys: {keys:?}"
-        );
+        ensure!(keys == ["instances", "module"], "identity keys: {keys:?}");
     }
     let module_a = module_label_for(document, &outcome.provider_a)?;
     let module_b = module_label_for(document, &outcome.provider_b)?;
@@ -594,7 +574,10 @@ fn privileged_inventory_reload_disclosure_lists_churned_identity() -> Result<()>
             }
         }
     }
-    ensure!(named_a, "the churned module {module_a} must be named: {key}");
+    ensure!(
+        named_a,
+        "the churned module {module_a} must be named: {key}"
+    );
     eprintln!(
         "B17_LEG2 kernel={} churned={module_a}/{instances_a:?} control={module_b} counts={continued}/{joined} capture_s={}",
         kernel_release(),

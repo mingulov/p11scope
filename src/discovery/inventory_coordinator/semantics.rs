@@ -3998,18 +3998,21 @@ mod binding_window_tests {
             initial_scope_cut: false,
             pending_gap: None,
         };
-        set.admission_images.insert(CallerId(20), history(bound, 55));
+        set.admission_images
+            .insert(CallerId(20), history(bound, 55));
         assert!(
             set.proves_unbound_caller(bound, image(99)),
             "a different same-domain history keeps the proof"
         );
-        set.admission_images.insert(CallerId(21), history(bound, 99));
+        set.admission_images
+            .insert(CallerId(21), history(bound, 99));
         assert!(
             !set.proves_unbound_caller(bound, image(99)),
             "a history entry holding the call's cookie could be that caller"
         );
         set.admission_images.remove(&CallerId(21));
-        set.admission_images.insert(CallerId(22), history(domain, 56));
+        set.admission_images
+            .insert(CallerId(22), history(domain, 56));
         assert!(
             !set.proves_unbound_caller(bound, image(99)),
             "a history entry of another domain is another ticket space"

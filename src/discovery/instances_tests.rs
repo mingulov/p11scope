@@ -2544,7 +2544,11 @@ fn hook_miss_carry_gives_way_before_a_live_key_at_the_key_limit() {
         ObserveOutcome::New
     );
     let (keys, carry_keys, _) = r.retained_keys_and_carry();
-    assert_eq!((keys, carry_keys), (1, 2), "one live key beside two carried");
+    assert_eq!(
+        (keys, carry_keys),
+        (1, 2),
+        "one live key beside two carried"
+    );
     assert_eq!(
         r.observe_legacy(miss_era_observation(&r, 0x54, 0, 1, BASE_A))
             .0,
@@ -2557,7 +2561,11 @@ fn hook_miss_carry_gives_way_before_a_live_key_at_the_key_limit() {
         (2, 1),
         "one carried entry gave way; the live key stayed"
     );
-    assert_eq!(r.counters().observed_evictions, 0, "no live key was evicted");
+    assert_eq!(
+        r.counters().observed_evictions,
+        0,
+        "no live key was evicted"
+    );
     assert!(keys + carry_keys <= limits.observed_keys);
     assert!(r.ranges_retained() + carry_ranges <= limits.ranges);
     assert_eq!(

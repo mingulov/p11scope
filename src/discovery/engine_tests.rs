@@ -25140,6 +25140,353 @@ fn manifest_join_keeps_the_miss_when_the_probe_refuses_the_split() {
     );
 }
 
+/// The pre-6.8 overlayfs pre-arm join, forged: a scan pin filed under the
+/// maps/backing key and a pre-arm pin for the same file under the opened
+/// fd's overlay key, as `pin_scanned_object` and `pin_prearm_objects` file
+/// them. The pre-arm pin carries the pin-time probe's maps rendering, and
+/// both pins are backed by one real file.
+fn split_prearm_join_fixture() -> (
+    tempfile::TempDir,
+    ScannedModule,
+    PinnedObjects,
+    PrearmInput,
+    p11scope_manifest::maps::ObjectKey,
+    p11scope_manifest::maps::ObjectKey,
+) {
+    use crate::discovery::identity::test_fixture::{
+        PATH as PROVIDER_PATH, split_prearm_pin, split_scan_pin,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let file = overlay_backing_file(&dir, "provider.so");
+    let maps_key = overlay_key(21);
+    let fd_key = overlay_key(41);
+    let module = overlay_module(maps_key);
+    let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut scan, &file);
+    let mut prearm_pins = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut prearm_pins, &file);
+    let prearm = PrearmInput {
+        pins: prearm_pins.clone(),
+        inputs: vec![PrearmPinnedInput {
+            path: PROVIDER_PATH.to_string(),
+            key: fd_key,
+            proved: vec![("C_Initialize".to_string(), 0x1000)],
+            non_executable: Vec::new(),
+        }],
+    };
+    (dir, module, scan, prearm, maps_key, fd_key)
+}
+
+/// On a pre-6.8 overlay split the scan and the `--prearm-module` pin of one
+/// provider file must resolve to one provider with both sources, exactly as
+/// on >= 6.8 where the maps/fd identity agrees and the two collapse at
+/// absorb. Today the two objects keep converging timing keys into
+/// `bind_plan_module_ids`, which bails before the capture is ready.
+#[test]
+fn scan_and_prearm_for_one_split_file_build_one_provider() {
+    use crate::discovery::identity::test_fixture::PATH as PROVIDER_PATH;
+    let (_dir, module, scan_pins, prearm, maps_key, fd_key) = split_prearm_join_fixture();
+    let view = module.view;
+    let mut discovered = lifecycle_discovered(Vec::new());
+    discovered.scan_inputs.insert(
+        view,
+        ScanInput {
+            modules: vec![module],
+            pins: scan_pins,
+            counters: DiscoveryCounters::default(),
+        },
+    );
+    discovered.prearm_input = Some(prearm);
+    match rebuild_discovered(&mut discovered) {
+        Ok(()) => {}
+        Err(error) => panic!("expected one merged provider, rebuild bailed: {error:#}"),
+    }
+    assert_eq!(
+        discovered.plan.modules.len(),
+        1,
+        "scan and pre-arm of one file plan one provider"
+    );
+    assert_eq!(discovered.plan.modules[0].source, "scan+prearm");
+    assert!(
+        discovered.plan.modules[0].corroborated,
+        "two independent sources describing one object agree"
+    );
+    let object = discovered.plan.modules[0].object;
+    assert_eq!(
+        discovered.pinned.summary(object).unwrap().key,
+        maps_key,
+        "the scan pin's maps key stays canonical downstream"
+    );
+    assert_eq!(
+        discovered.pinned.sources(object),
+        vec!["scan", "prearm"],
+        "the re-filed pin carries both authorities, as on >= 6.8"
+    );
+    assert_eq!(
+        discovered.pinned.id_for_prearm(fd_key, PROVIDER_PATH),
+        Some(object),
+        "the pre-arm alias resolves to the scan pin under its own key"
+    );
+}
+
+/// The live twin of the initial-build join: pre-armed before any mapping,
+/// then the target maps the file on a pre-6.8 overlay split. The live
+/// candidate must join the late scan pin onto the pre-arm pin instead of
+/// bailing on two objects with converging timing keys.
+#[test]
+fn live_scan_for_a_prearmed_split_file_joins_one_provider() {
+    let (_dir, module, scan_pins, prearm, maps_key, _fd_key) = split_prearm_join_fixture();
+    let mut discovered = lifecycle_discovered(Vec::new());
+    discovered.prearm_input = Some(prearm);
+    rebuild_discovered(&mut discovered).unwrap();
+    assert_eq!(
+        discovered.plan.modules.len(),
+        1,
+        "pre-arm alone plans its provider before any mapping"
+    );
+    let mut candidate_pins = discovered.pinned.clone();
+    let absorbed = candidate_pins.absorb(scan_pins);
+    assert!(
+        absorbed.is_empty(),
+        "the late scan pin files without ambiguity: {absorbed:?}"
+    );
+    let candidate = match discovered.live_candidate(candidate_pins, vec![module], Vec::new()) {
+        Ok(candidate) => candidate,
+        Err(error) => panic!("expected one joined provider, live rebuild bailed: {error:#}"),
+    };
+    assert_eq!(
+        candidate.plan.modules.len(),
+        1,
+        "the late scan and the pre-arm plan one provider"
+    );
+    assert_eq!(candidate.plan.modules[0].source, "scan+prearm");
+    let object = candidate.plan.modules[0].object;
+    assert_eq!(
+        candidate.pinned.summary(object).unwrap().key,
+        maps_key,
+        "the scan pin's maps key stays canonical downstream"
+    );
+    assert_eq!(
+        candidate.pinned.sources(object),
+        vec!["scan", "prearm"],
+        "the joined pin carries both authorities, as on >= 6.8"
+    );
+}
+
+/// Characterization twin: two genuinely distinct files with identical bytes
+/// keep today's behavior — two providers, no join. The split re-filing must
+/// never merge on digest alone.
+#[test]
+fn scan_and_prearm_for_distinct_same_content_files_keep_two_providers() {
+    use crate::discovery::identity::test_fixture::{
+        INODE, PATH as PROVIDER_PATH, split_prearm_pin, split_scan_pin,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let scan_file = overlay_backing_file(&dir, "provider.so");
+    let prearm_file = overlay_backing_file(&dir, "other.so");
+    let maps_key = overlay_key(21);
+    let fd_key = overlay_key(41);
+    // A different file with the same bytes: its own inode under both the
+    // maps rendering and the opened fd.
+    let other_inode = INODE + 1;
+    let other_maps_key = p11scope_manifest::maps::ObjectKey {
+        device: maps_key.device,
+        inode: other_inode,
+    };
+    let other_fd_key = p11scope_manifest::maps::ObjectKey {
+        device: Device {
+            major: 0,
+            minor: 41,
+        },
+        inode: other_inode,
+    };
+    assert_ne!(fd_key, other_fd_key);
+    let module = overlay_module(maps_key);
+    let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut scan, &scan_file);
+    let mut prearm_pins = split_prearm_pin(other_fd_key, other_maps_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut prearm_pins, &prearm_file);
+    let view = module.view;
+    let mut discovered = lifecycle_discovered(Vec::new());
+    discovered.scan_inputs.insert(
+        view,
+        ScanInput {
+            modules: vec![module],
+            pins: scan,
+            counters: DiscoveryCounters::default(),
+        },
+    );
+    discovered.prearm_input = Some(PrearmInput {
+        pins: prearm_pins.clone(),
+        inputs: vec![PrearmPinnedInput {
+            path: PROVIDER_PATH.to_string(),
+            key: other_fd_key,
+            proved: vec![("C_Initialize".to_string(), 0x1000)],
+            non_executable: Vec::new(),
+        }],
+    });
+    rebuild_discovered(&mut discovered).unwrap();
+    assert_eq!(
+        discovered.plan.modules.len(),
+        2,
+        "distinct files plan distinct providers"
+    );
+    let mut sources: Vec<&str> = discovered
+        .plan
+        .modules
+        .iter()
+        .map(|module| module.source)
+        .collect();
+    sources.sort_unstable();
+    assert_eq!(sources, vec!["prearm", "scan"]);
+    let scan_object = discovered.modules[0].object;
+    let prearm_object = discovered
+        .pinned
+        .id_for_prearm(other_fd_key, PROVIDER_PATH)
+        .expect("the pre-arm alias keeps resolving");
+    assert_ne!(
+        scan_object, prearm_object,
+        "a distinct file never joins the scan pin"
+    );
+}
+
+/// On pre-6.8 the split pre-arm alias re-files onto its scan pin, so the
+/// engine merge, plan lowering and every per-function join resolve one
+/// provider exactly as on >= 6.8.
+#[test]
+fn prearm_join_refiles_a_pre68_overlay_split_onto_its_scan_pin() {
+    use crate::discovery::identity::test_fixture::{
+        PATH as PROVIDER_PATH, split_prearm_pin, split_scan_pin,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let file = overlay_backing_file(&dir, "provider.so");
+    let maps_key = overlay_key(21);
+    let fd_key = overlay_key(41);
+    let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut scan, &file);
+    let mut prearm = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
+    overlay_reback(&mut prearm, &file);
+    let mut pinned = scan;
+    assert!(pinned.absorb(prearm).is_empty());
+    let module = overlay_module(maps_key);
+    let scan_id = pinned
+        .id_for_scanned(&module, maps_key, PROVIDER_PATH)
+        .expect("the scan pin files under the maps key");
+    assert_ne!(
+        pinned.id_for_prearm(fd_key, PROVIDER_PATH),
+        Some(scan_id),
+        "the split files two objects"
+    );
+    pinned.refile_split_prearm_alias(PROVIDER_PATH);
+    assert_eq!(
+        pinned.id_for_prearm(fd_key, PROVIDER_PATH),
+        Some(scan_id),
+        "the re-filed alias resolves to the scan pin under its own key"
+    );
+    assert_eq!(
+        pinned.summary(scan_id).unwrap().key,
+        maps_key,
+        "the scan pin's maps key stays canonical downstream"
+    );
+    assert_eq!(
+        pinned.sources(scan_id),
+        vec!["scan", "prearm"],
+        "the re-filed pin carries both authorities, as on >= 6.8"
+    );
+    assert_eq!(
+        pinned.id_for_path(PROVIDER_PATH),
+        Some(scan_id),
+        "one alias names the provider after re-filing"
+    );
+    assert_eq!(pinned.pinned().count(), 1, "one object survives the join");
+}
+
+/// The >= 6.8 shape needs no re-filing: maps and fd agree, so the absorb
+/// already merged the pre-arm alias onto the scan pin, and the re-file is
+/// a no-op that leaves the joined pins untouched.
+#[test]
+fn prearm_join_is_a_noop_once_the_alias_shares_its_scan_pin() {
+    use crate::discovery::identity::test_fixture::{
+        PATH as PROVIDER_PATH, prearm_pin, split_scan_pin,
+    };
+    let key = overlay_key(21);
+    let scan = split_scan_pin(key, key, OVERLAY_SHA, 1);
+    let prearm = prearm_pin(key, OVERLAY_SHA, 1);
+    let mut pinned = scan;
+    assert!(pinned.absorb(prearm).is_empty());
+    let joined = pinned
+        .id_for_prearm(key, PROVIDER_PATH)
+        .expect("the absorb joins the agreeing alias");
+    assert_eq!(pinned.sources(joined), vec!["scan", "prearm"]);
+    assert_eq!(pinned.pinned().count(), 1);
+    pinned.refile_split_prearm_alias(PROVIDER_PATH);
+    assert_eq!(
+        pinned.id_for_prearm(key, PROVIDER_PATH),
+        Some(joined),
+        "an already-joined alias never moves"
+    );
+    assert_eq!(pinned.sources(joined), vec!["scan", "prearm"]);
+    assert_eq!(pinned.pinned().count(), 1);
+}
+
+/// A manifest alias may share the fd-keyed entry with the pre-arm alias.
+/// The manifest twin refuses a shared entry, so the engine re-files
+/// pre-arm first; then both aliases share one scan pin.
+#[test]
+fn prearm_and_manifest_aliases_share_one_scan_pin_after_split_refiling() {
+    use crate::discovery::identity::test_fixture::{
+        FakeSelfMappingProbe, PATH as PROVIDER_PATH, split_prearm_pin,
+    };
+    let (_dir, manifest, mut pinned, maps_key, fd_key) = split_manifest_join_fixture();
+    let prearm = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
+    assert!(pinned.absorb(prearm).is_empty());
+    let manifest_object = pinned
+        .id_for_manifest(fd_key, PROVIDER_PATH)
+        .expect("the manifest alias files under the fd key");
+    assert_eq!(
+        pinned.id_for_prearm(fd_key, PROVIDER_PATH),
+        Some(manifest_object),
+        "the pre-arm pin merges onto the manifest pin's fd-keyed entry"
+    );
+    // Manifest first refuses: the shared entry cannot retire either alias
+    // alone. This pins why the engine re-files pre-arm first.
+    let mut reversed = pinned.clone();
+    let mut budget = CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    refile_recorded_aliases(&manifest, &mut reversed, &mut budget, &probe);
+    assert_eq!(
+        manifest_module_object(&manifest, &reversed),
+        None,
+        "the shared entry refuses the manifest move"
+    );
+    assert_eq!(
+        reversed.id_for_prearm(fd_key, PROVIDER_PATH),
+        Some(manifest_object),
+        "a refused re-filing leaves the pre-arm alias untouched"
+    );
+    // Pre-arm first joins all three aliases onto the scan pin.
+    pinned.refile_split_prearm_alias(PROVIDER_PATH);
+    refile_recorded_aliases(&manifest, &mut pinned, &mut budget, &probe);
+    let found = manifest_module_object(&manifest, &pinned)
+        .expect("the manifest alias joins after pre-arm moved");
+    assert_eq!(
+        pinned.id_for_prearm(fd_key, PROVIDER_PATH),
+        Some(found),
+        "both operator aliases resolve to the scan pin"
+    );
+    assert_eq!(
+        pinned.sources(found),
+        vec!["scan", "manifest", "prearm"],
+        "the joined pin carries all three authorities"
+    );
+    assert_eq!(
+        pinned.id_for_path(PROVIDER_PATH),
+        Some(found),
+        "one object names the provider after re-filing"
+    );
+    assert_eq!(pinned.pinned().count(), 1);
+}
+
 #[test]
 fn loader_pin_collision_cannot_commit_a_plan_with_missing_pin_id() {
     let (plan, pins) = plan_with_pins(1, 0);

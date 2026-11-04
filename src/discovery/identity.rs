@@ -1894,6 +1894,100 @@ impl PinnedObjects {
         );
     }
 
+    /// Re-files one pre-arm alias split by pre-6.8 overlayfs onto its scan pin.
+    ///
+    /// The pre-arm twin of
+    /// [`refile_split_manifest_alias`](Self::refile_split_manifest_alias):
+    /// the scan files the maps/backing key while the pre-arm pin files the
+    /// opened fd's overlay key, so the absorb keeps two objects whose
+    /// complete opened identities agree — and the candidate then bails on
+    /// the same exact provider twice. The join needs no fresh probe: the
+    /// fd-keyed entry carries the pin-time self-mapping proof
+    /// (`Entry::probed_maps_key`) — filed by pre-arm pinning and preserved
+    /// across same-file merges — and the scan pin's own acceptance proved
+    /// its fd renders at its maps key. The alias moves only when exactly
+    /// one scan pin carries the proved maps key with the same complete
+    /// opened-file identity; the scan pin's maps key stays canonical and
+    /// its retained fd stays canonical for attach, exactly as on >= 6.8
+    /// where the absorb merges the two. The pre-arm raw keeps its own fd
+    /// key, so `id_for_prearm` still resolves the operator input after the
+    /// move. Unlike the manifest twin this moves only its own alias and
+    /// never requires owning the entry alone: a manifest alias may share
+    /// the fd-keyed entry, and the engine re-files pre-arm first so the
+    /// manifest twin runs after onto an alone entry. Any ambiguity, any
+    /// missing pin-time proof, or an already-joined alias leaves the pins
+    /// untouched, so a >= 6.8 capture never moves an alias here.
+    pub(crate) fn refile_split_prearm_alias(&mut self, path: &str) {
+        let Some(normalized) = normalize_target_path(path) else {
+            return;
+        };
+        // The one pre-arm alias filed for this path. More than one is a
+        // genuine change during discovery, not a split. Manifest and scan
+        // aliases file separately and never join this count.
+        let mut prearm_aliases = self.raw_to_id.iter().filter(|(raw, _)| {
+            raw.mount_namespace.is_none() && raw.prearm && raw.path == normalized
+        });
+        let Some((prearm_raw, prearm_id)) = prearm_aliases.next() else {
+            return;
+        };
+        if prearm_aliases.next().is_some() {
+            return;
+        }
+        let prearm_raw = prearm_raw.clone();
+        let prearm_id = *prearm_id;
+        // Already joined: the alias shares its object with a scan alias, as
+        // the absorb files it on >= 6.8. Exact captures never reach further.
+        if self
+            .raw_to_id
+            .iter()
+            .any(|(raw, id)| *id == prearm_id && raw.mount_namespace.is_some())
+        {
+            return;
+        }
+        // The split, proved at pin time: this opened fd may stand for the
+        // recorded maps identity only when the kernel rendered it exactly
+        // there. Without that proof there is no split to re-file.
+        let Some(recorded) = self
+            .by_id
+            .get(&prearm_id)
+            .and_then(|entry| entry.probed_maps_key)
+        else {
+            return;
+        };
+        // The scan pin for this file: the recorded key, the same opened
+        // file. Same-key same-file pins merge at absorb, so more than one
+        // match is ambiguity, never identity.
+        let mut scans = BTreeSet::new();
+        for (raw, id) in &self.raw_to_id {
+            if raw.mount_namespace.is_none() || raw.key != recorded {
+                continue;
+            }
+            if self.exactly_matches(*id, self, prearm_id) {
+                scans.insert(*id);
+            }
+        }
+        if scans.len() != 1 {
+            return;
+        }
+        let scan_id = *scans.first().unwrap();
+        if !self.by_id.contains_key(&scan_id) {
+            return;
+        }
+        self.bump_copy_version();
+        self.raw_to_id.remove(&prearm_raw);
+        let referenced = self.raw_to_id.values().any(|id| *id == prearm_id)
+            || self.ownership.values().any(|claims| {
+                claims.tables.contains(&prearm_id)
+                    || claims.pins.contains(&prearm_id)
+                    || claims.targets.iter().any(|(id, _)| *id == prearm_id)
+            });
+        if !referenced {
+            self.by_id.remove(&prearm_id);
+            self.bump_revision();
+        }
+        self.raw_to_id.insert(prearm_raw, scan_id);
+    }
+
     /// Re-file one manifest raw split by pre-6.8 overlayfs onto its probed
     /// maps key, at pin time.
     ///
@@ -2146,6 +2240,19 @@ impl PinnedObjects {
                 && let Some(kept) = self.by_id.get_mut(&id)
             {
                 kept.collapsed = true;
+            }
+            // The dropped entry's pin-time maps rendering survives on the
+            // kept entry when both describe one mount: the kernel renders
+            // one file in one mount one way, so the proof stays true for
+            // the kept fd, and the split re-filing reads it there. Gated
+            // on the full mapping — never across the same-open-file arm's
+            // mount-namespace escape, and never into the overlay heuristic
+            // below, which proves no physical identity.
+            if let Some(kept) = self.by_id.get_mut(&id)
+                && kept.mapping == entry.mapping
+                && kept.probed_maps_key.is_none()
+            {
+                kept.probed_maps_key = entry.probed_maps_key;
             }
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
@@ -8266,6 +8373,63 @@ pub(crate) mod test_fixture {
         pins
     }
 
+    /// A pre-arm pin as `pin_prearm_objects` files it: under the opened
+    /// fd's key, with the same mapping, pin and digest as its scan pin. The
+    /// pin's inode is the key's, as a real pin's always is.
+    pub(crate) fn prearm_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
+        let raw = RawObjectInstance::prearm(fd_key, PATH.to_string()).unwrap();
+        let entry = Entry {
+            mapping: MappingFileKey {
+                mount_id: SPLIT_MOUNT_ID,
+                device_major: fd_key.device.major,
+                device_minor: fd_key.device.minor,
+                inode: fd_key.inode,
+            },
+            raw,
+            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
+            pin: Pin {
+                ino: fd_key.inode,
+                size: 4096,
+                ctime: (ctime, 7),
+            },
+            path: PATH.into(),
+            sha256: sha256.into(),
+            build_id: None,
+            abi: ElfAbi::Lp64,
+            exports: Arc::from(Vec::new()),
+            getter_present: false,
+            witness_fault: false,
+            overlay: true,
+            collapsed: false,
+            probed_maps_unproven: false,
+            probed_maps_key: None,
+            last_ok_ns: std::cell::Cell::new(None),
+            changed: std::cell::Cell::new(false),
+            detected_ns: std::cell::Cell::new(None),
+        };
+        let mut pins = PinnedObjects::empty();
+        pins.insert_entry(entry, &mut Vec::new());
+        pins
+    }
+
+    /// A pre-arm pin for a pre-6.8 overlayfs split: filed under the opened
+    /// fd's overlay key while carrying the pin-time probe's maps/backing
+    /// rendering — the shape `pin_prearm_objects` records through the
+    /// self-mapping probe when the kernel splits the two.
+    pub(crate) fn split_prearm_pin(
+        fd_key: ObjectKey,
+        maps_key: ObjectKey,
+        sha256: &str,
+        ctime: i64,
+    ) -> PinnedObjects {
+        let mut pins = prearm_pin(fd_key, sha256, ctime);
+        for entry in pins.by_id.values_mut() {
+            entry.probed_maps_key = Some(maps_key);
+        }
+        pins
+    }
+
     /// A scripted self-mapping probe: `overlay` answers the overlayfs
     /// question and `key` answers the kernel-rendered maps key, counting both
     /// consultations. Real overlayfs is unmountable without privileges, so
@@ -9950,6 +10114,79 @@ mod tests {
 
         assert_eq!(first.pinned().count(), 1, "{skipped:?}");
         assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    /// A same-file merge preserves the dropped entry's pin-time maps
+    /// rendering on the kept entry: one file in one mount renders one way,
+    /// so the proof stays true for the kept fd and the split re-filing
+    /// reads it there.
+    #[test]
+    fn absorbing_same_file_preserves_the_probed_maps_rendering() {
+        use super::test_fixture::{PATH, SHA, manifest_pin, overlay, split_prearm_pin};
+        let fd_key = overlay(41);
+        let maps_key = overlay(21);
+        let mut kept = manifest_pin(fd_key, SHA, 1);
+        let id = kept.id_for_manifest(fd_key, PATH).unwrap();
+        assert!(
+            !kept.object_matches_key(
+                id,
+                maps_key.device.major,
+                maps_key.device.minor,
+                maps_key.inode
+            ),
+            "no maps rendering before the merge"
+        );
+        let incoming = split_prearm_pin(fd_key, maps_key, SHA, 1);
+        assert!(kept.absorb(incoming).is_empty());
+        assert!(
+            kept.object_matches_key(
+                id,
+                maps_key.device.major,
+                maps_key.device.minor,
+                maps_key.inode
+            ),
+            "the kept entry answers the proved maps rendering after the merge"
+        );
+    }
+
+    /// The cross-mount-namespace escape preserves no maps rendering: a maps
+    /// key proved in another namespace must never ride along onto the kept
+    /// entry.
+    #[test]
+    fn absorbing_across_mount_namespaces_preserves_no_maps_rendering() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let first_file = backing_file(&dir, "provider.so");
+        let second_file = Arc::new(std::fs::File::open(dir.path().join("provider.so")).unwrap());
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &first_file);
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &second_file);
+        let rendered = ObjectKey {
+            device: Device { major: 0, minor: 9 },
+            inode: INODE,
+        };
+        {
+            let entry = second.by_id.values_mut().next().unwrap();
+            entry.mapping.mount_id += 1;
+            entry.probed_maps_key = Some(rendered);
+        }
+        let skipped = first.absorb(second);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(first.pinned().count(), 1, "{skipped:?}");
+        let id = first.pinned().next().unwrap().id;
+        assert!(
+            !first.object_matches_key(
+                id,
+                rendered.device.major,
+                rendered.device.minor,
+                rendered.inode
+            ),
+            "a maps rendering from another mount namespace never rides along"
+        );
     }
 
     #[test]

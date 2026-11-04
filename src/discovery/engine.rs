@@ -8232,6 +8232,21 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         counters.object_skips.extend(absorbed);
     }
 
+    // Pre-6.8 overlayfs splits the pre-arm join the same way it splits
+    // the manifest join: the scan files the maps/backing key while the
+    // pre-arm pin files the opened fd's overlay key, so the absorb keeps two
+    // objects for one file and the candidate bails on the same exact
+    // provider twice. Re-file every split alias onto its scan pin — proved
+    // by the pin-time self-mapping proof the pre-arm pin carries — so plan
+    // lowering and every later exact join resolve one provider. Pre-arm
+    // first: a manifest alias may share the fd-keyed entry, and moving the
+    // pre-arm alias first leaves the manifest alias owning alone for its own
+    // re-filing below. Exact captures never move an alias.
+    if let Some(prearm) = discovered.prearm_input.as_ref() {
+        for input in &prearm.inputs {
+            pinned.refile_split_prearm_alias(&input.path);
+        }
+    }
     // Pre-6.8 overlayfs splits the manifest join: the helper recorded the
     // maps/backing key while each manifest pin files the opened fd's overlay
     // key. Re-file every split alias onto its scan pin — proved by the shared
@@ -13225,6 +13240,16 @@ impl Engine {
         let plan_start = crate::attach::monotonic_ns();
         let broad_admit = self.broad_admit;
         let counter_hint = self.counter_hint;
+        // The live twin of the initial-build pre-arm join: a target mapping
+        // its provider after startup files a maps-keyed scan pin beside the
+        // fd-keyed pre-arm pin on pre-6.8 overlayfs. Re-file the split alias
+        // onto its scan pin before resolving pieces, or the rebuilt
+        // candidate bails on the same exact provider twice.
+        if let Some(prearm) = self.prearm_input.as_ref() {
+            for input in &prearm.inputs {
+                pinned.refile_split_prearm_alias(&input.path);
+            }
+        }
         let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &pinned);
         let mut rebuilt = self.plan.rebuild_from_sources_broad_with_prearm(
             &modules,

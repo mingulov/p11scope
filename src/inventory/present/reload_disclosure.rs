@@ -319,6 +319,21 @@ mod tests {
         );
     }
 
+    /// An identity whose every router ID is unregistered is dropped
+    /// whole, while the key stays present with exact counts: the
+    /// router observed continuations it could not attribute.
+    #[test]
+    fn all_unregistered_identity_is_dropped_with_exact_counts() {
+        let mut seam = seam();
+        disclose(&mut seam, IMAGE_A, SLOT_A, vec![999998, 999999], 3, 7);
+        let document = document(&seam);
+        let key = &document["instance_reload_not_excluded"];
+        assert!(key.is_object(), "the key stays present: {document}");
+        assert_eq!(key["identities"], serde_json::json!([]));
+        assert_eq!(key["continued_across_global"], 3);
+        assert_eq!(key["joined_across_global"], 7);
+    }
+
     /// (e) The rendered disclosure carries no private identity: no file
     /// slot, router ID, task cookie or exec ID in field names or values —
     /// only `mN`/`iN` references and counts.

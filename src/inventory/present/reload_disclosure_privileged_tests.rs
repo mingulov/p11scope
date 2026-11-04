@@ -596,10 +596,8 @@ fn privileged_inventory_reload_disclosure_omits_key_without_churn() -> Result<()
     let outcome = run_leg2_capture(false)?;
     let document = &outcome.document;
     ensure!(
-        document
-            .get("instance_reload_not_excluded")
-            .is_none_or(serde_json::Value::is_null),
-        "the clean capture must omit the disclosure key"
+        document.get("instance_reload_not_excluded").is_none(),
+        "the clean capture must omit the disclosure key (absent, never null)"
     );
     let module_a = module_label_for(document, &outcome.provider_a)?;
     let module_b = module_label_for(document, &outcome.provider_b)?;

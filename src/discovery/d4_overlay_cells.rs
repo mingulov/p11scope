@@ -3524,6 +3524,554 @@ fn privileged_k2_sweep_overlay_no_fallback() {
     eprintln!("K2_SWEEP lane={lane:?} modes=on,off,same-fs verdict=no-fallback");
 }
 
+/// K1 sweep-side private-witness cell (privileged): over real loop-overlay
+/// fixtures with the capture watching the held provider file (attach-set
+/// exclusion), the sweep kernel run refuses the watched overlay key with
+/// no sweep route, and the production `KernelSweepWitness` proves it
+/// through its private session: the fresh-upper row joins, the stale-lower
+/// row keeps the named `overlay_kernel_unavailable` loss, and the
+/// no-witness RED run keeps the loss on the fresh row (the edge needs the
+/// witness). With only the excluded anchor admitted, the install fails and
+/// the userspace path keeps the loss with no witness query (the gap when
+/// every anchor is watched).
+#[test]
+#[ignore = "root: loop overlay mounts drive the sweep-side witness cell"]
+fn privileged_k1_sweep_witness_fresh_joins_stale_refuses() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session =
+        crate::discovery::kernel_identity::IdentitySession::probe_and_load(&btf, probe_dir.path())
+            .expect("strict-loaded kernel session; no refused/fallback positive");
+    let mut generation = 0u64;
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        k1_sweep_witness_fresh_row(work.path(), mode, lane, &mut session, &mut generation)
+            .unwrap_or_else(|error| panic!("mode {mode:?} fresh: {error}"));
+        k1_sweep_witness_stale_row(work.path(), mode, lane, &mut session, &mut generation)
+            .unwrap_or_else(|error| panic!("mode {mode:?} stale: {error}"));
+    }
+    eprintln!(
+        "K1_SWEEP_WITNESS lane={lane:?} modes=on,off,same-fs verdict=join-fresh-refuse-stale"
+    );
+}
+
+/// One install-and-sweep round over the witnessed fixture: admit the held
+/// key plus the unwatched anchor, exclude the held file, install, and
+/// drive the sweep with (or, for the RED run, without) the production
+/// witness. Returns the attribution and the witness query count.
+#[allow(clippy::too_many_arguments)]
+fn k1_witness_round(
+    pins: &crate::discovery::identity::PinnedObjects,
+    object: crate::discovery::identity::PinnedObjectId,
+    object2: crate::discovery::identity::PinnedObjectId,
+    key: ObjectKey,
+    key2: ObjectKey,
+    pid: u32,
+    snapshot: Vec<MapEntry>,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: &mut u64,
+    with_witness: bool,
+) -> Result<(SweepAttribution, u32), String> {
+    use crate::discovery::kernel_identity::{
+        AnchorPass, ExaminedCustody, KernelAnchorExclusions, KernelMemberProbe,
+    };
+    let (mut index, refused) = KnownKeyIndex::build(
+        [(key, Some(object)), (key2, Some(object2))],
+        &BTreeMap::from([(key, object), (key2, object2)]),
+        [],
+        pins,
+    );
+    if !refused.is_empty() {
+        return Err(format!("k1 witness index admission refuses: {refused:?}"));
+    }
+    let watched_target = pins
+        .retain_inventory_target(object)
+        .map_err(|error| format!("k1 witness retain watched: {error}"))?;
+    let exclusions = KernelAnchorExclusions::from_targets([&watched_target]);
+    let owner = ReservationOwner::for_examined(
+        SegmentPolicy::try_snapshot(0, 0).map_err(|error| format!("k1 witness census: {error}"))?,
+        0,
+    );
+    let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+    custody
+        .reconcile(
+            SegmentPolicy::try_snapshot(1, 1)
+                .map_err(|error| format!("k1 witness confirm census: {error}"))?,
+        )
+        .map_err(|error| format!("k1 witness reconcile: {error}"))?;
+    // The sweep driver below reuses this same owner: the segment hook
+    // refuses with `FdHeadroom` unless its batch resources share the
+    // anchor pass's owner (production shares one owner the same way).
+    let sweep_owner = owner.clone();
+    let pass =
+        AnchorPass::prepare_excluding(pins, [(key, object), (key2, object2)], custody, &exclusions);
+    if pass.fallback.get(&key)
+        != Some(&crate::discovery::kernel_identity::AnchorDeny::CaptureWatched)
+    {
+        return Err(format!(
+            "k1 witness premise broken: held anchor not capture-watched: {:?}",
+            pass.fallback
+        ));
+    }
+    if pass.fallback.contains_key(&key2) {
+        return Err(format!(
+            "k1 witness premise broken: unwatched anchor refused: {:?}",
+            pass.fallback
+        ));
+    }
+    *generation += 1;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut installed = session
+        .install_anchors(pass, *generation, deadline)
+        .map_err(|error| format!("k1 witness install: {error}"))?;
+    let mut probe = KernelMemberProbe::new(&mut installed, OsConfirmIo::with_pool(None), deadline);
+    probe
+        .install_expectations(&mut index)
+        .map_err(|error| format!("k1 witness expectations: {error}"))?;
+    if index
+        .match_slots
+        .get(&key)
+        .is_some_and(|slots| !slots.is_empty())
+    {
+        return Err("k1 witness premise broken: held key holds sweep slots".into());
+    }
+    if !index
+        .match_slots
+        .get(&key2)
+        .is_some_and(|slots| !slots.is_empty())
+    {
+        return Err("k1 witness premise broken: unwatched anchor holds no slots".into());
+    }
+    let mut budget = CaptureWorkBudget::default();
+    if budget.has_collection_work() {
+        return Err("k1 witness premise broken: scoped collection fallback".into());
+    }
+    let policy = SegmentPolicy::from_headroom(16, 1, 1);
+    let sweep = vec![(pid, snapshot)];
+    let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
+    let out = match with_witness {
+        true => {
+            crate::discovery::confirm_shards::attribute_unselected_with_segment_proof_with_witness(
+                &sweep,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &index,
+                &mut budget,
+                policy,
+                &sweep_owner,
+                1,
+                &|| OsConfirmIo::with_pool(None),
+                probe.segment_proof(),
+                pins,
+                &mut witness,
+            )
+        }
+        false => crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut budget,
+            policy,
+            &sweep_owner,
+            1,
+            &|| OsConfirmIo::with_pool(None),
+            probe.segment_proof(),
+        ),
+    };
+    drop(probe);
+    drop(installed);
+    Ok((out, witness.used()))
+}
+
+/// One fresh-upper sweep row through the production witness: the watched
+/// overlay key has no sweep route, the private session proves the mapping
+/// is the held file, and the row joins; the RED run without the witness
+/// keeps the named loss. With only the excluded anchor the install fails
+/// (every anchor watched) and userspace keeps the loss with no witness.
+#[allow(clippy::too_many_lines)]
+fn k1_sweep_witness_fresh_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: &mut u64,
+) -> Result<(), String> {
+    eprintln!("K1_SWEEP_WITNESS start mode={mode:?} row=fresh-upper lane={lane:?}");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE2u8; 8192])
+        .map_err(|error| format!("k1 fresh lower write: {error}"))?;
+    std::fs::write(fixture.lower_path("lib2.so"), vec![0xE3u8; 8192])
+        .map_err(|error| format!("k1 fresh lib2 write: {error}"))?;
+    let xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    let merged2 = fixture.merged_path("lib2.so");
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    let anchor = SwapChild::spawn(&merged);
+    let target = SwapChild::spawn(&merged);
+    let anchor2 = SwapChild::spawn(&merged2);
+    let a_line = find_line(&anchor.maps(), anchor_range(&anchor), *b"r-xp")?;
+    let t_line = find_line(&target.maps(), target_range(&target), *b"r-xp")?;
+    let key = ObjectKey::of(&a_line);
+    if ObjectKey::of(&t_line) != key {
+        return Err("k1 fresh premise broken: target key differs from the anchor key".into());
+    }
+    let line2 = find_line(&anchor2.maps(), target_range(&anchor2), *b"r-xp")?;
+    let key2 = ObjectKey::of(&line2);
+    if key2 == key {
+        return Err("k1 fresh premise broken: unwatched key collides with the held key".into());
+    }
+    let held_file =
+        std::fs::File::open(&merged).map_err(|error| format!("k1 fresh held open: {error}"))?;
+    let held = crate::discovery::identity::self_mapped_file(&held_file)
+        .map_err(|error| format!("k1 fresh held identity: {error}"))?;
+    if held.fs_magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC) {
+        return Err(format!("k1 fresh held file is not on overlayfs: {held:?}"));
+    }
+    let (mut pins, object) = overlay_pin(&merged, key)?;
+    {
+        use sha2::{Digest, Sha256};
+        let bytes =
+            std::fs::read(&merged2).map_err(|error| format!("k1 fresh lib2 read: {error}"))?;
+        let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+        let skipped = pins.absorb(crate::discovery::identity::test_fixture::real_scan_pin(
+            &merged2,
+            Some(key2),
+            0,
+            &digest,
+        ));
+        if !skipped.is_empty() {
+            return Err(format!("k1 fresh lib2 pin skipped: {skipped:?}"));
+        }
+    }
+    let object2 = pins
+        .pinned()
+        .find(|summary| summary.key == key2)
+        .map(|summary| summary.id)
+        .ok_or_else(|| "k1 fresh premise broken: unwatched pin missing".to_string())?;
+    if object2 == object {
+        return Err("k1 fresh premise broken: pins share one object".into());
+    }
+    let pid = target.pid as u32;
+    let t_range = target_range(&target);
+    let stable = if mode == XinoMode::Off {
+        Some(map_files_stable(pid, t_range)?)
+    } else {
+        None
+    };
+    let backing = fixture.upper_path("lib.so");
+    let a_truth = record_truth(
+        anchor.pid as u32,
+        anchor_range(&anchor),
+        &held_file,
+        &backing,
+        xino.clone(),
+        None,
+    )?;
+    let t_truth = record_truth(pid, t_range, &held_file, &backing, xino, stable)?;
+    if held.identity != a_truth.map_files_identity() {
+        return Err(format!(
+            "k1 fresh held file is not the current upper file: held {:?} vs upper {:?}",
+            held.identity,
+            a_truth.map_files_identity()
+        ));
+    }
+    let branch = takes_identity_key_branch(&t_truth, &a_truth);
+    let n4 = lane == OverlayLane::A && branch;
+    if lane == OverlayLane::B && branch {
+        return Err("unexpected backing rendering on lane B".into());
+    }
+    let (scratch, _) = KnownKeyIndex::build(
+        [(key, Some(object)), (key2, Some(object2))],
+        &BTreeMap::from([(key, object), (key2, object2)]),
+        [],
+        &pins,
+    );
+    if n4 && scratch.map_files_keys().contains(&key) {
+        return Err("k1 fresh N4 premise broken: identity key needs no per-range proof".into());
+    }
+    if !n4 && !scratch.map_files_keys().contains(&key) {
+        return Err("k1 fresh premise broken: overlay key needs per-range proof".into());
+    }
+    // GREEN: the private witness proves the fresh mapping and the row joins.
+    let (out, used) = k1_witness_round(
+        &pins,
+        object,
+        object2,
+        key,
+        key2,
+        pid,
+        target.maps(),
+        session,
+        generation,
+        true,
+    )?;
+    if n4 {
+        k2_assert_edge(&out, pid, key, "fresh witnessed (N4)")?;
+        if used != 0 {
+            return Err(format!("k1 fresh N4 ran {used} witness queries, want 0"));
+        }
+    } else {
+        k2_assert_edge(&out, pid, key, "fresh witnessed")?;
+        if used != 1 {
+            return Err(format!("k1 fresh witnessed ran {used} queries, want 1"));
+        }
+    }
+    // RED: the same install shape without the witness keeps the loss.
+    let (red, red_used) = k1_witness_round(
+        &pins,
+        object,
+        object2,
+        key,
+        key2,
+        pid,
+        target.maps(),
+        session,
+        generation,
+        false,
+    )?;
+    if red_used != 0 {
+        return Err(format!(
+            "k1 fresh RED ran {red_used} witness queries, want 0"
+        ));
+    }
+    if n4 {
+        k2_assert_edge(&red, pid, key, "fresh RED (N4)")?;
+    } else {
+        k2_assert_loss(&red, pid, "fresh RED")?;
+    }
+    // Only the excluded anchor: the install fails (every anchor watched)
+    // and the userspace path keeps the loss with no witness query.
+    {
+        use crate::discovery::kernel_identity::{
+            AnchorPass, ExaminedCustody, KernelAnchorExclusions,
+        };
+        let (index, _) = KnownKeyIndex::build(
+            [(key, Some(object))],
+            &BTreeMap::from([(key, object)]),
+            [],
+            &pins,
+        );
+        let watched_target = pins
+            .retain_inventory_target(object)
+            .map_err(|error| format!("k1 only-excluded retain watched: {error}"))?;
+        let exclusions = KernelAnchorExclusions::from_targets([&watched_target]);
+        let owner = ReservationOwner::for_examined(
+            SegmentPolicy::try_snapshot(0, 0)
+                .map_err(|error| format!("k1 only-excluded census: {error}"))?,
+            0,
+        );
+        let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+        custody
+            .reconcile(
+                SegmentPolicy::try_snapshot(1, 1)
+                    .map_err(|error| format!("k1 only-excluded confirm census: {error}"))?,
+            )
+            .map_err(|error| format!("k1 only-excluded reconcile: {error}"))?;
+        let pass = AnchorPass::prepare_excluding(&pins, [(key, object)], custody, &exclusions);
+        if !pass.only_capture_excluded() {
+            return Err(format!(
+                "k1 only-excluded premise broken: {:?}",
+                pass.fallback
+            ));
+        }
+        *generation += 1;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        if session.install_anchors(pass, *generation, deadline).is_ok() {
+            return Err(
+                "k1 only-excluded premise broken: install succeeded with no anchors".into(),
+            );
+        }
+        let userspace = d4_overlay_attribute_pid(pid, target.maps(), &index);
+        if n4 {
+            k2_assert_edge(&userspace, pid, key, "fresh only-excluded (N4)")?;
+        } else if stable == Some(false) {
+            k2_assert_mismatch(&userspace, "fresh only-excluded (unstable)")?;
+        } else {
+            if held.identity != t_truth.map_files_identity() {
+                return Err(format!(
+                    "k1 fresh premise broken: expected agreeing userspace identity: {:?} vs {:?}",
+                    held.identity,
+                    t_truth.map_files_identity()
+                ));
+            }
+            k2_assert_loss(&userspace, pid, "fresh only-excluded")?;
+        }
+    }
+    eprintln!(
+        "K1_SWEEP_WITNESS mode={mode:?} row=fresh-upper lane={lane:?} verdict={} target-{}",
+        if n4 { "N4-edge" } else { "join" },
+        truth_verdict(&t_truth)
+    );
+    Ok(())
+}
+
+/// One stale-lower sweep row through the production witness: the target
+/// maps before the copy-up and keeps running the lower file while the
+/// observer holds the fresh upper file, so the private session proves
+/// another file and the row keeps the named loss (lane B), or the stale
+/// key never matches (lane A).
+#[allow(clippy::too_many_lines)]
+fn k1_sweep_witness_stale_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: &mut u64,
+) -> Result<(), String> {
+    eprintln!("K1_SWEEP_WITNESS start mode={mode:?} row=stale-lower lane={lane:?}");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE1u8; 8192])
+        .map_err(|error| format!("k1 stale lower write: {error}"))?;
+    std::fs::write(fixture.lower_path("lib2.so"), vec![0xE3u8; 8192])
+        .map_err(|error| format!("k1 stale lib2 write: {error}"))?;
+    let xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    let merged2 = fixture.merged_path("lib2.so");
+    let stale = SwapChild::spawn(&merged);
+    let t_line = find_line(&stale.maps(), target_range(&stale), *b"r-xp")?;
+    let stale_key = ObjectKey::of(&t_line);
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    let held_file =
+        std::fs::File::open(&merged).map_err(|error| format!("k1 stale held open: {error}"))?;
+    let held = crate::discovery::identity::self_mapped_file(&held_file)
+        .map_err(|error| format!("k1 stale held identity: {error}"))?;
+    if held.fs_magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC) {
+        return Err(format!("k1 stale held file is not on overlayfs: {held:?}"));
+    }
+    let anchor = SwapChild::spawn(&merged);
+    let anchor2 = SwapChild::spawn(&merged2);
+    let a_line = find_line(&anchor.maps(), anchor_range(&anchor), *b"r-xp")?;
+    let key = ObjectKey::of(&a_line);
+    match lane {
+        OverlayLane::B if key != stale_key => {
+            return Err("k1 stale lane-B premise broken: anchor key moved across copy-up".into());
+        }
+        OverlayLane::A if key == stale_key => {
+            return Err("k1 stale lane-A premise broken: anchor key equals the stale key".into());
+        }
+        _ => {}
+    }
+    let line2 = find_line(&anchor2.maps(), target_range(&anchor2), *b"r-xp")?;
+    let key2 = ObjectKey::of(&line2);
+    if key2 == key {
+        return Err("k1 stale premise broken: unwatched key collides with the held key".into());
+    }
+    let (mut pins, object) = overlay_pin(&merged, key)?;
+    {
+        use sha2::{Digest, Sha256};
+        let bytes =
+            std::fs::read(&merged2).map_err(|error| format!("k1 stale lib2 read: {error}"))?;
+        let digest = p11scope_manifest::identity::hex(&Sha256::digest(&bytes));
+        let skipped = pins.absorb(crate::discovery::identity::test_fixture::real_scan_pin(
+            &merged2,
+            Some(key2),
+            0,
+            &digest,
+        ));
+        if !skipped.is_empty() {
+            return Err(format!("k1 stale lib2 pin skipped: {skipped:?}"));
+        }
+    }
+    let object2 = pins
+        .pinned()
+        .find(|summary| summary.key == key2)
+        .map(|summary| summary.id)
+        .ok_or_else(|| "k1 stale premise broken: unwatched pin missing".to_string())?;
+    if object2 == object {
+        return Err("k1 stale premise broken: pins share one object".into());
+    }
+    let pid = stale.pid as u32;
+    let t_range = target_range(&stale);
+    let stable = if mode == XinoMode::Off {
+        Some(map_files_stable(pid, t_range)?)
+    } else {
+        None
+    };
+    let t_truth = record_truth(
+        pid,
+        t_range,
+        &held_file,
+        &fixture.lower_path("lib.so"),
+        xino.clone(),
+        stable,
+    )?;
+    let a_truth = record_truth(
+        anchor.pid as u32,
+        anchor_range(&anchor),
+        &held_file,
+        &fixture.upper_path("lib.so"),
+        xino,
+        None,
+    )?;
+    if held.identity != a_truth.map_files_identity() {
+        return Err(format!(
+            "k1 stale held file is not the current upper file: held {:?} vs upper {:?}",
+            held.identity,
+            a_truth.map_files_identity()
+        ));
+    }
+    let branch = takes_identity_key_branch(&t_truth, &a_truth);
+    if lane == OverlayLane::B && branch {
+        return Err("unexpected backing rendering on lane B".into());
+    }
+    if lane == OverlayLane::B
+        && stable != Some(false)
+        && held.identity != t_truth.map_files_identity()
+    {
+        return Err(format!(
+            "k1 stale premise broken: expected agreeing userspace identity: {:?} vs {:?}",
+            held.identity,
+            t_truth.map_files_identity()
+        ));
+    }
+    let (out, used) = k1_witness_round(
+        &pins,
+        object,
+        object2,
+        key,
+        key2,
+        pid,
+        stale.maps(),
+        session,
+        generation,
+        true,
+    )?;
+    match lane {
+        OverlayLane::B => {
+            k2_assert_loss(&out, pid, "stale witnessed")?;
+            if used != 1 {
+                return Err(format!("k1 stale witnessed ran {used} queries, want 1"));
+            }
+        }
+        OverlayLane::A => {
+            k2_assert_no_candidate(&out, "stale witnessed")?;
+            if used != 0 {
+                return Err(format!(
+                    "k1 stale lane-A ran {used} witness queries, want 0"
+                ));
+            }
+        }
+    }
+    eprintln!(
+        "K1_SWEEP_WITNESS mode={mode:?} row=stale-lower lane={lane:?} verdict=refuse target-{}",
+        truth_verdict(&t_truth)
+    );
+    Ok(())
+}
+
 /// One stale-lower sweep row over a fresh fixture: the target maps before
 /// the copy-up and keeps running the lower file while the observer holds
 /// the fresh upper file under the fresh key.

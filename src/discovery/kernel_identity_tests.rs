@@ -4059,6 +4059,50 @@ fn k2_ladder_failed_run_overlay_yields_loss_without_reads() {
     );
 }
 
+/// K1-R2 #6: an unvisited overlay request inside a successful kernel run
+/// refuses without userspace reads (the `unproven_answer` partial, not
+/// a full fallback). Replacing that partial with `None` would read the
+/// overlay range here.
+#[test]
+fn k1_r2_unvisited_overlay_refuses_without_reads() {
+    let observation = segment_cell_with_deadline(
+        &[(6101, vec![0]), (6102, vec![0])],
+        16,
+        vec![FixtureTarget::Bytes(segment_target(&[6101], 0))],
+        None,
+        None,
+        Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+    );
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [6101],
+        "unvisited overlay joined or visited overlay lost: {:?}",
+        observation.out.member_losses
+    );
+    assert!(
+        observation.events.lock().unwrap().fallback.is_empty(),
+        "an unvisited overlay run performed userspace range-proof reads: {:?}",
+        observation.events.lock().unwrap().fallback
+    );
+    let labels: Vec<&str> = observation
+        .out
+        .losses
+        .keys()
+        .map(|loss| loss.label())
+        .collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        observation.out.member_losses
+    );
+}
+
 #[test]
 fn d3c_forced_kernel_obeys_resource_and_run_caps() {
     // Forced shape (no cost gate) with no iterator headroom: the run is
@@ -6295,4 +6339,1063 @@ fn custody_worst_candidate_costs_one_rank_per_offer() {
         "the maintained worst changed the replacement order"
     );
     assert_eq!(owner.examined_for_test(), (8, 8));
+}
+
+/// Finding #1 RED: a partial Kernel answer (overlay ranges only) inside a
+/// successful run must not drop userspace proofs for non-overlay ranges.
+/// Scripted partial mimics `unproven_answer` for a mixed overlay+plain
+/// request (missing anchor / demoted / unvisited / zombie member).
+mod partial_kernel_mixed {
+    use super::super::{PassBinding, ProofDecision, RunFailure, ValidatedTargetSegment};
+    use crate::discovery::caller_registry::ExeIdentity;
+    use crate::discovery::confirm_shards::{AcceptedBatch, SegmentProof};
+    use crate::discovery::identity::FileIdentity;
+    use crate::discovery::identity::{MappedFile, PinnedObjectId};
+    use crate::discovery::scan::CaptureWorkBudget;
+    use crate::discovery::sweep_attribution::{
+        ConfirmIo, Confirmation, IoResources, KnownKeyIndex, MappedIdentities, ObjectChecks,
+        RangeProof, ReservationOwner, SegmentPolicy,
+    };
+    use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+
+    const OVERLAY_INO: u64 = 7_101;
+    const PLAIN_INO: u64 = 7_102;
+    const OVERLAY_RANGE: (u64, u64) = (0x1000_0000, 0x1000_1000);
+    const PLAIN_RANGE: (u64, u64) = (0x2000_0000, 0x2000_1000);
+    const PID: u32 = 7100;
+
+    fn key(inode: u64) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+        }
+    }
+
+    fn vm_file(inode: u64) -> FileIdentity {
+        FileIdentity {
+            dev: 37,
+            ino: inode,
+        }
+    }
+
+    fn entry(range: (u64, u64), inode: u64, path: &str) -> MapEntry {
+        MapEntry {
+            start: range.0,
+            end: range.1,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+
+    struct MixedChecks {
+        overlay: PinnedObjectId,
+        plain: PinnedObjectId,
+    }
+
+    impl ObjectChecks for MixedChecks {
+        fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+            Ok(None)
+        }
+        fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn mapped_identity(&self, object: PinnedObjectId) -> Result<MappedFile, String> {
+            if object == self.overlay {
+                Ok(MappedFile {
+                    identity: vm_file(OVERLAY_INO),
+                    fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+                })
+            } else {
+                Ok(MappedFile {
+                    identity: vm_file(PLAIN_INO),
+                    fs_magic: Some(0x01021994),
+                })
+            }
+        }
+    }
+
+    struct PartialKernelHook {
+        binding: PassBinding,
+    }
+
+    impl PartialKernelHook {
+        fn new() -> Self {
+            Self {
+                binding: PassBinding {
+                    session: Arc::new(()),
+                    generation: 1,
+                    arena_base: 0,
+                    arena_len: 64,
+                },
+            }
+        }
+    }
+
+    impl SegmentProof for PartialKernelHook {
+        fn prove<'r>(
+            &'r mut self,
+            batch: &AcceptedBatch<'_>,
+            _budget: &mut CaptureWorkBudget,
+            _resources: &IoResources,
+        ) -> ProofDecision<'r> {
+            let mut answers = Vec::new();
+            for request in batch.requests() {
+                let mut map = MappedIdentities::new();
+                if let Some(first) = request.ranges().first() {
+                    map.insert(*first, RangeProof::OverlayRefused);
+                }
+                answers.push(Some(map));
+            }
+            ProofDecision::Kernel(ValidatedTargetSegment {
+                binding: &self.binding,
+                batch: batch.token().clone(),
+                answers,
+            })
+        }
+    }
+
+    struct ExceptOverlayHook;
+
+    impl SegmentProof for ExceptOverlayHook {
+        fn prove<'r>(
+            &'r mut self,
+            batch: &AcceptedBatch<'_>,
+            _budget: &mut CaptureWorkBudget,
+            _resources: &IoResources,
+        ) -> ProofDecision<'r> {
+            let mut refused = Vec::new();
+            for request in batch.requests() {
+                let mut map = MappedIdentities::new();
+                if let Some(first) = request.ranges().first() {
+                    map.insert(*first, RangeProof::OverlayRefused);
+                }
+                refused.push(map);
+            }
+            ProofDecision::UserspaceExceptOverlay {
+                reason: RunFailure::StreamInvalid,
+                refused,
+            }
+        }
+    }
+
+    struct MixedIo {
+        reads: Arc<Mutex<Vec<(u32, u64, u64)>>>,
+    }
+
+    impl ConfirmIo for MixedIo {
+        type Pin = std::fs::File;
+        fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+            self.reads.lock().unwrap().push((pid, start, end));
+            if (start, end) == OVERLAY_RANGE {
+                Ok(vm_file(OVERLAY_INO))
+            } else {
+                Ok(vm_file(PLAIN_INO))
+            }
+        }
+        fn open(&mut self, _pid: u32) -> Result<Self::Pin, String> {
+            std::fs::File::open("/dev/null").map_err(|e| e.to_string())
+        }
+        fn start_time(&self, _pin: &Self::Pin) -> Option<u64> {
+            Some(4242)
+        }
+        fn still_the_same(&self, _pin: &Self::Pin) -> bool {
+            true
+        }
+        fn exe(&self, _pid: u32) -> Option<ExeIdentity> {
+            Some(ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                path: Some("/usr/bin/caller".into()),
+            })
+        }
+        fn maps(
+            &mut self,
+            _pid: u32,
+            _budget: &mut CaptureWorkBudget,
+        ) -> Result<Vec<MapEntry>, String> {
+            Ok(vec![
+                entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
+                entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
+            ])
+        }
+        fn gone(&self, _pid: u32) -> bool {
+            false
+        }
+    }
+
+    impl crate::discovery::confirm_shards::ShardableIo for MixedIo {
+        type Maps = std::io::Cursor<Vec<u8>>;
+        fn open_maps(&mut self, _pid: u32) -> std::io::Result<Self::Maps> {
+            let text = format!(
+                "{:x}-{:x} r-xp 00000000 08:01 {} /opt/overlay.so\n{:x}-{:x} r-xp 00000000 08:01 {} /opt/plain.so\n",
+                OVERLAY_RANGE.0,
+                OVERLAY_RANGE.1,
+                OVERLAY_INO,
+                PLAIN_RANGE.0,
+                PLAIN_RANGE.1,
+                PLAIN_INO,
+            );
+            Ok(std::io::Cursor::new(text.into_bytes()))
+        }
+        fn maps_now(&self) -> Option<u64> {
+            Some(1_000_000)
+        }
+    }
+
+    fn mixed_index() -> KnownKeyIndex {
+        let overlay = PinnedObjectId(1);
+        let plain = PinnedObjectId(2);
+        let checks = MixedChecks { overlay, plain };
+        KnownKeyIndex::build(
+            [
+                (key(OVERLAY_INO), Some(overlay)),
+                (key(PLAIN_INO), Some(plain)),
+            ],
+            &BTreeMap::from([(key(OVERLAY_INO), overlay), (key(PLAIN_INO), plain)]),
+            [],
+            &checks,
+        )
+        .0
+    }
+
+    fn mixed_sweep() -> Vec<(u32, Vec<MapEntry>)> {
+        vec![(
+            PID,
+            vec![
+                entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
+                entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
+            ],
+        )]
+    }
+
+    #[test]
+    fn partial_kernel_scalar_reads_plain_skips_overlay() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut io = MixedIo {
+            reads: reads.clone(),
+        };
+        let pin = std::fs::File::open("/dev/null").unwrap();
+        let prepared = crate::discovery::sweep_attribution::PreparedConfirmation {
+            pin: crate::discovery::sweep_attribution::ReservedPin { pin, _lease: None },
+            before: ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                path: Some("/usr/bin/caller".into()),
+            },
+            entries: vec![
+                entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
+                entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
+            ],
+            ranges: vec![OVERLAY_RANGE, PLAIN_RANGE],
+            member: None,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, 1);
+        let owner = ReservationOwner::new(policy);
+        let resources = owner.batch();
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = PartialKernelHook::new();
+        let out = crate::discovery::confirm_shards::prove_and_finish_prepared(
+            &mut io,
+            PID,
+            prepared,
+            &mut hook,
+            &resources,
+            &mut budget,
+        );
+        let Confirmation::Confirmed(read) = out else {
+            panic!("scalar partial kernel lost: {out:?}");
+        };
+        assert!(
+            read.mapped.contains_key(&PLAIN_RANGE),
+            "plain range missing from scalar partial-kernel map: {:?}",
+            read.mapped
+        );
+        assert_eq!(
+            read.mapped.get(&OVERLAY_RANGE),
+            Some(&RangeProof::OverlayRefused)
+        );
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)],
+            "scalar partial kernel must read plain only, never overlay"
+        );
+    }
+
+    #[test]
+    fn partial_kernel_sharded_reads_plain_skips_overlay() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+        };
+        let sweep = mixed_sweep();
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = PartialKernelHook::new();
+        let out = crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mixed_index(),
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", out.member_losses);
+        let labels: Vec<&str> = out.losses.keys().map(|l| l.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)],
+            "sharded partial kernel must read plain only, never overlay"
+        );
+    }
+
+    #[test]
+    fn except_overlay_scalar_reads_plain_skips_overlay() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let mut io = MixedIo {
+            reads: reads.clone(),
+        };
+        let pin = std::fs::File::open("/dev/null").unwrap();
+        let prepared = crate::discovery::sweep_attribution::PreparedConfirmation {
+            pin: crate::discovery::sweep_attribution::ReservedPin { pin, _lease: None },
+            before: ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                path: Some("/usr/bin/caller".into()),
+            },
+            entries: vec![
+                entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
+                entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
+            ],
+            ranges: vec![OVERLAY_RANGE, PLAIN_RANGE],
+            member: None,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, 1);
+        let owner = ReservationOwner::new(policy);
+        let resources = owner.batch();
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = ExceptOverlayHook;
+        let out = crate::discovery::confirm_shards::prove_and_finish_prepared(
+            &mut io,
+            PID,
+            prepared,
+            &mut hook,
+            &resources,
+            &mut budget,
+        );
+        let Confirmation::Confirmed(read) = out else {
+            panic!("scalar except-overlay lost: {out:?}");
+        };
+        assert!(read.mapped.contains_key(&PLAIN_RANGE), "{:?}", read.mapped);
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)]
+        );
+    }
+
+    #[test]
+    fn except_overlay_sharded_reads_plain_skips_overlay() {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+        };
+        let sweep = mixed_sweep();
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = ExceptOverlayHook;
+        let out = crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mixed_index(),
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let labels: Vec<&str> = out.losses.keys().map(|l| l.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)]
+        );
+    }
+}
+
+/// K1-R2 watched-overlay twin: a sweep overlay refusal with no sweep
+/// route (live capture attach-set exclusion, modelled as
+/// AnchorNotInstalled) proves via the private witness session under
+/// the D-P1 per-pass budget. SameFile joins (no userspace read for
+/// the overlay range); OtherFile, budget exhaustion and run failures
+/// keep the named loss with no query (attempt-cap) or no join.
+mod sweep_witness_mixed {
+    use crate::discovery::caller_registry::ExeIdentity;
+    use crate::discovery::confirm_shards::{
+        AcceptedBatch, SegmentProof, attribute_unselected_with_policy,
+        attribute_unselected_with_segment_proof,
+        attribute_unselected_with_segment_proof_with_witness,
+    };
+    use crate::discovery::identity::FileIdentity;
+    use crate::discovery::identity::{MappedFile, PinnedObjectId, PinnedObjects};
+    use crate::discovery::overlay_witness::{
+        OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS, SweepWitness, WitnessFailure, WitnessVerdict,
+    };
+    use crate::discovery::scan::CaptureWorkBudget;
+    use crate::discovery::sweep_attribution::{
+        ConfirmIo, KnownKeyIndex, MappedIdentities, ObjectChecks, RangeProof, ReservationOwner,
+        SegmentPolicy,
+    };
+    use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{Arc, Mutex};
+
+    const OVERLAY_INO: u64 = 7_101;
+    const PLAIN_INO: u64 = 7_102;
+    const OVERLAY_RANGE: (u64, u64) = (0x1000_0000, 0x1000_1000);
+    const PLAIN_RANGE: (u64, u64) = (0x2000_0000, 0x2000_1000);
+    const PID: u32 = 7200;
+
+    fn key(inode: u64) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+        }
+    }
+
+    fn vm_file(inode: u64) -> FileIdentity {
+        FileIdentity {
+            dev: 37,
+            ino: inode,
+        }
+    }
+
+    fn entry(range: (u64, u64), inode: u64, path: &str) -> MapEntry {
+        MapEntry {
+            start: range.0,
+            end: range.1,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+
+    struct MixedChecks {
+        overlay: PinnedObjectId,
+        plain: PinnedObjectId,
+    }
+
+    impl ObjectChecks for MixedChecks {
+        fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+            Ok(None)
+        }
+        fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn mapped_identity(&self, object: PinnedObjectId) -> Result<MappedFile, String> {
+            if object == self.overlay {
+                Ok(MappedFile {
+                    identity: vm_file(OVERLAY_INO),
+                    fs_magic: Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+                })
+            } else {
+                Ok(MappedFile {
+                    identity: vm_file(PLAIN_INO),
+                    fs_magic: Some(0x01021994),
+                })
+            }
+        }
+    }
+
+    struct ReasonHook {
+        reason: super::RunFailure,
+    }
+
+    impl SegmentProof for ReasonHook {
+        fn prove<'r>(
+            &'r mut self,
+            batch: &AcceptedBatch<'_>,
+            _budget: &mut CaptureWorkBudget,
+            _resources: &crate::discovery::sweep_attribution::IoResources,
+        ) -> super::ProofDecision<'r> {
+            let mut refused = Vec::new();
+            for request in batch.requests() {
+                let mut map = MappedIdentities::new();
+                if let Some(first) = request.ranges().first() {
+                    map.insert(*first, RangeProof::OverlayRefused);
+                }
+                refused.push(map);
+            }
+            super::ProofDecision::UserspaceExceptOverlay {
+                reason: self.reason,
+                refused,
+            }
+        }
+    }
+
+    type WitnessCalls = Arc<Mutex<Vec<(u32, ObjectKey, (u64, u64))>>>;
+    type IoReads = Arc<Mutex<Vec<(u32, u64, u64)>>>;
+
+    struct ScriptedSweepWitness {
+        verdict: WitnessVerdict,
+        calls: WitnessCalls,
+        used: u32,
+        limit: u32,
+    }
+
+    impl ScriptedSweepWitness {
+        fn new(verdict: WitnessVerdict) -> (Self, WitnessCalls) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    verdict,
+                    calls: calls.clone(),
+                    used: 0,
+                    limit: OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS,
+                },
+                calls,
+            )
+        }
+
+        fn exhausted() -> (Self, WitnessCalls) {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    verdict: WitnessVerdict::SameFile,
+                    calls: calls.clone(),
+                    used: OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS,
+                    limit: OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS,
+                },
+                calls,
+            )
+        }
+    }
+
+    impl SweepWitness for ScriptedSweepWitness {
+        fn prove(
+            &mut self,
+            pid: u32,
+            _file: &std::fs::File,
+            _held: &MappedFile,
+            key: ObjectKey,
+            range: (u64, u64),
+            _budget: &mut CaptureWorkBudget,
+        ) -> WitnessVerdict {
+            if self.used >= self.limit {
+                return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+            }
+            self.used += 1;
+            self.calls.lock().unwrap().push((pid, key, range));
+            self.verdict
+        }
+    }
+
+    struct MixedIo {
+        reads: Arc<Mutex<Vec<(u32, u64, u64)>>>,
+        plain_only: bool,
+    }
+
+    impl ConfirmIo for MixedIo {
+        type Pin = std::fs::File;
+        fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+            self.reads.lock().unwrap().push((pid, start, end));
+            if (start, end) == OVERLAY_RANGE {
+                Ok(vm_file(OVERLAY_INO))
+            } else {
+                Ok(vm_file(PLAIN_INO))
+            }
+        }
+        fn open(&mut self, _pid: u32) -> Result<Self::Pin, String> {
+            std::fs::File::open("/dev/null").map_err(|error| error.to_string())
+        }
+        fn start_time(&self, _pin: &Self::Pin) -> Option<u64> {
+            Some(4242)
+        }
+        fn still_the_same(&self, _pin: &Self::Pin) -> bool {
+            true
+        }
+        fn exe(&self, _pid: u32) -> Option<ExeIdentity> {
+            Some(ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+                path: Some("/usr/bin/caller".into()),
+            })
+        }
+        fn maps(
+            &mut self,
+            _pid: u32,
+            _budget: &mut CaptureWorkBudget,
+        ) -> Result<Vec<MapEntry>, String> {
+            if self.plain_only {
+                return Ok(vec![entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so")]);
+            }
+            Ok(vec![
+                entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
+                entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
+            ])
+        }
+        fn gone(&self, _pid: u32) -> bool {
+            false
+        }
+    }
+
+    impl crate::discovery::confirm_shards::ShardableIo for MixedIo {
+        type Maps = std::io::Cursor<Vec<u8>>;
+        fn open_maps(&mut self, _pid: u32) -> std::io::Result<Self::Maps> {
+            let text = if self.plain_only {
+                format!(
+                    "{:x}-{:x} r-xp 00000000 08:01 {} /opt/plain.so\n",
+                    PLAIN_RANGE.0, PLAIN_RANGE.1, PLAIN_INO,
+                )
+            } else {
+                format!(
+                    "{:x}-{:x} r-xp 00000000 08:01 {} /opt/overlay.so\n{:x}-{:x} r-xp 00000000 08:01 {} /opt/plain.so\n",
+                    OVERLAY_RANGE.0,
+                    OVERLAY_RANGE.1,
+                    OVERLAY_INO,
+                    PLAIN_RANGE.0,
+                    PLAIN_RANGE.1,
+                    PLAIN_INO,
+                )
+            };
+            Ok(std::io::Cursor::new(text.into_bytes()))
+        }
+        fn maps_now(&self) -> Option<u64> {
+            Some(1_000_000)
+        }
+    }
+
+    fn world() -> (PinnedObjects, KnownKeyIndex, Vec<(u32, Vec<MapEntry>)>) {
+        let pins = crate::discovery::identity::test_fixture::pin_set(
+            &[
+                (key(OVERLAY_INO), "overlay-digest", 1),
+                (key(PLAIN_INO), "plain-digest", 1),
+            ],
+            false,
+        );
+        let mut overlay_id = None;
+        let mut plain_id = None;
+        for summary in pins.pinned() {
+            if summary.key == key(OVERLAY_INO) {
+                overlay_id = Some(summary.id);
+            } else if summary.key == key(PLAIN_INO) {
+                plain_id = Some(summary.id);
+            }
+        }
+        let (overlay_id, plain_id) = (overlay_id.unwrap(), plain_id.unwrap());
+        let checks = MixedChecks {
+            overlay: overlay_id,
+            plain: plain_id,
+        };
+        let index = KnownKeyIndex::build(
+            [
+                (key(OVERLAY_INO), Some(overlay_id)),
+                (key(PLAIN_INO), Some(plain_id)),
+            ],
+            &BTreeMap::from([(key(OVERLAY_INO), overlay_id), (key(PLAIN_INO), plain_id)]),
+            [],
+            &checks,
+        )
+        .0;
+        assert!(index.is_overlay_key(key(OVERLAY_INO)));
+        assert!(!index.is_overlay_key(key(PLAIN_INO)));
+        let sweep = vec![(
+            PID,
+            vec![
+                entry(OVERLAY_RANGE, OVERLAY_INO, "/opt/overlay.so"),
+                entry(PLAIN_RANGE, PLAIN_INO, "/opt/plain.so"),
+            ],
+        )];
+        (pins, index, sweep)
+    }
+
+    fn run_without_witness(
+        sweep: &[(u32, Vec<MapEntry>)],
+        index: &KnownKeyIndex,
+        reason: super::RunFailure,
+        reads: &IoReads,
+    ) -> crate::discovery::sweep_attribution::SweepAttribution {
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+            plain_only: false,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = ReasonHook { reason };
+        attribute_unselected_with_segment_proof(
+            sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        )
+    }
+
+    fn run_with_witness(
+        sweep: &[(u32, Vec<MapEntry>)],
+        index: &KnownKeyIndex,
+        pins: &PinnedObjects,
+        reason: super::RunFailure,
+        reads: &IoReads,
+        witness: &mut dyn SweepWitness,
+    ) -> crate::discovery::sweep_attribution::SweepAttribution {
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+            plain_only: false,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = ReasonHook { reason };
+        attribute_unselected_with_segment_proof_with_witness(
+            sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+            pins,
+            witness,
+        )
+    }
+
+    #[test]
+    fn watched_overlay_witness_samefile_joins_without_overlay_read() {
+        let (pins, index, sweep) = world();
+        // Before the witness route: the watched overlay refusal keeps the
+        // named loss while the plain key joins (finding #1 behaviour).
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let before = run_without_witness(
+            &sweep,
+            &index,
+            super::RunFailure::AnchorNotInstalled,
+            &reads,
+        );
+        assert_eq!(before.members.len(), 1, "{:?}", before.member_losses);
+        let keys: Vec<_> = before.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", before.member_losses);
+        // With the witness route: SameFile joins the overlay too, still
+        // with no userspace read of the overlay range.
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let after = run_with_witness(
+            &sweep,
+            &index,
+            &pins,
+            super::RunFailure::AnchorNotInstalled,
+            &reads,
+            &mut witness,
+        );
+        assert_eq!(after.members.len(), 1, "{:?}", after.member_losses);
+        let mut keys: Vec<_> = after.members[0].objects.iter().map(|o| o.key).collect();
+        keys.sort();
+        let mut expected = vec![key(OVERLAY_INO), key(PLAIN_INO)];
+        expected.sort();
+        assert_eq!(keys, expected, "{:?}", after.member_losses);
+        assert!(after.losses.is_empty(), "{:?}", after.member_losses);
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)],
+            "the witness joins without reading the overlay range"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(PID, key(OVERLAY_INO), OVERLAY_RANGE)],
+            "one witness query for the refused overlay key"
+        );
+    }
+
+    #[test]
+    fn watched_overlay_witness_otherfile_keeps_loss_without_read_or_join() {
+        let (pins, index, sweep) = world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::OtherFile);
+        let out = run_with_witness(
+            &sweep,
+            &index,
+            &pins,
+            super::RunFailure::AnchorNotInstalled,
+            &reads,
+            &mut witness,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", out.member_losses);
+        let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)]
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn watched_overlay_witness_budget_exhaustion_keeps_loss() {
+        let (pins, index, sweep) = world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::exhausted();
+        let out = run_with_witness(
+            &sweep,
+            &index,
+            &pins,
+            super::RunFailure::AnchorNotInstalled,
+            &reads,
+            &mut witness,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)]
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "an exhausted budget runs no query"
+        );
+    }
+
+    #[test]
+    fn attempt_cap_overlay_takes_no_witness_query() {
+        let (pins, index, sweep) = world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let out = run_with_witness(
+            &sweep,
+            &index,
+            &pins,
+            super::RunFailure::TargetLimit,
+            &reads,
+            &mut witness,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            out.member_losses
+        );
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)]
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "attempt-cap keeps the loss with no witness query"
+        );
+    }
+
+    fn run_with_hook(
+        sweep: &[(u32, Vec<MapEntry>)],
+        index: &KnownKeyIndex,
+        pins: &PinnedObjects,
+        reads: &IoReads,
+        hook: &mut impl SegmentProof,
+        witness: &mut dyn SweepWitness,
+        plain_only: bool,
+    ) -> crate::discovery::sweep_attribution::SweepAttribution {
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+            plain_only,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        attribute_unselected_with_segment_proof_with_witness(
+            sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            hook,
+            pins,
+            witness,
+        )
+    }
+
+    fn run_policy(
+        sweep: &[(u32, Vec<MapEntry>)],
+        index: &KnownKeyIndex,
+        reads: &IoReads,
+    ) -> crate::discovery::sweep_attribution::SweepAttribution {
+        let make_io = || MixedIo {
+            reads: reads.clone(),
+            plain_only: false,
+        };
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        attribute_unselected_with_policy(
+            sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            index,
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+        )
+    }
+
+    #[test]
+    fn capture_excluded_failed_install_userspace_path_keeps_loss() {
+        // Control: today's failed-install path (pure userspace sweep)
+        // reads the overlay range and then refuses it, while the plain
+        // key joins.
+        let (_pins, index, sweep) = world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let out = run_policy(&sweep, &index, &reads);
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", out.member_losses);
+        let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+        assert_eq!(
+            labels,
+            ["overlay_kernel_unavailable"],
+            "{:?}",
+            out.member_losses
+        );
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .contains(&(PID, OVERLAY_RANGE.0, OVERLAY_RANGE.1)),
+            "the userspace path reads the overlay range and then refuses: {:?}",
+            reads.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_excluded_failed_install_refused_hook_joins() {
+        // The production refused hook marks exactly the overlay ranges,
+        // so the witness joins them without userspace reads while the
+        // plain key proves from userspace as before.
+        let (pins, index, sweep) = world();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let mut hook = super::AnchorRefusedHook::new(&index);
+        let out = run_with_hook(
+            &sweep,
+            &index,
+            &pins,
+            &reads,
+            &mut hook,
+            &mut witness,
+            false,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let mut keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        keys.sort();
+        let mut expected = vec![key(OVERLAY_INO), key(PLAIN_INO)];
+        expected.sort();
+        assert_eq!(keys, expected, "{:?}", out.member_losses);
+        assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)],
+            "the witness joins without reading the overlay range"
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[(PID, key(OVERLAY_INO), OVERLAY_RANGE)],
+            "one witness query for the refused overlay key"
+        );
+    }
+
+    #[test]
+    fn capture_excluded_failed_install_plain_only_answers_userspace() {
+        // A batch with no overlay key answers plain userspace: the
+        // plain key joins with no witness query.
+        let (pins, index, sweep) = world();
+        let plain_sweep: Vec<(u32, Vec<MapEntry>)> = sweep
+            .iter()
+            .map(|(pid, entries)| (*pid, entries[1..].to_vec()))
+            .collect();
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let (mut witness, calls) = ScriptedSweepWitness::new(WitnessVerdict::SameFile);
+        let mut hook = super::AnchorRefusedHook::new(&index);
+        let out = run_with_hook(
+            &plain_sweep,
+            &index,
+            &pins,
+            &reads,
+            &mut hook,
+            &mut witness,
+            true,
+        );
+        assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+        let keys: Vec<_> = out.members[0].objects.iter().map(|o| o.key).collect();
+        assert_eq!(keys, [key(PLAIN_INO)], "{:?}", out.member_losses);
+        assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+        assert_eq!(
+            reads.lock().unwrap().as_slice(),
+            &[(PID, PLAIN_RANGE.0, PLAIN_RANGE.1)]
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a batch with no overlay key takes no witness query"
+        );
+    }
 }

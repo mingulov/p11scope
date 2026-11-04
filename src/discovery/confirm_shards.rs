@@ -6,6 +6,8 @@
 //! journal without I/O or capture mutation. Accepted journals commit before
 //! any proof; rejected records and speculative tails drop before fresh reads.
 
+use crate::discovery::identity::PinnedObjects;
+use crate::discovery::overlay_witness::SweepWitness;
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, ConfirmMark, MapsReadBudget, MapsReadBuffers, MapsReadLimits,
@@ -13,9 +15,9 @@ use crate::discovery::scan::{
 use crate::discovery::sweep_attribution::{
     AttributionLoss, ConfirmIo, Confirmation, FD_RESOURCE_REASON, FdLease, IoResources,
     KnownKeyIndex, MappedIdentities, MemberProbe, PreparationKind, PreparedConfirmation,
-    ReservationOwner, ReservedPin, SegmentPolicy, SweepAttribution, attribute_one, budget_refusal,
-    confirm_with_resources, finish_confirmation, idle_needs_promotion, lost_with, preparation_kind,
-    prepare_confirmation, proof_ranges, read_ranges_reserved,
+    RangeProof, ReservationOwner, ReservedPin, SegmentPolicy, SweepAttribution, attribute_one,
+    budget_refusal, confirm_with_resources, finish_confirmation, idle_needs_promotion, lost_with,
+    preparation_kind, prepare_confirmation, proof_ranges, read_ranges_reserved,
 };
 use crate::discovery::sweep_shards::{Transcript, record_read, replay_one};
 use p11scope_manifest::maps::{MapEntry, ObjectKey};
@@ -94,6 +96,84 @@ pub(crate) trait SegmentProof {
     ) -> crate::discovery::kernel_identity::ProofDecision<'r>;
 }
 
+/// Prove overlay-refused ranges via the private witness session (K1-R2,
+/// live capture watched providers): one query per (pid, key), first
+/// refused range; SameFile replaces all that key's refused ranges with
+/// [`RangeProof::Witnessed`] (join), anything else keeps refused (named
+/// loss, never a userspace join). Ranges under no entry, non-overlay
+/// keys, keys without a pinned file, and budget exhaustion all keep
+/// refused (fail-closed).
+#[allow(clippy::too_many_arguments)]
+fn witness_overlay_refused(
+    pid: u32,
+    mapped: &mut MappedIdentities,
+    entries: &[MapEntry],
+    index: &KnownKeyIndex,
+    pins: &PinnedObjects,
+    witness: &mut dyn SweepWitness,
+    budget: &mut CaptureWorkBudget,
+) {
+    use crate::discovery::identity::MappedFile;
+    use crate::discovery::overlay_witness::WitnessVerdict;
+    use p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC;
+
+    let by_range: BTreeMap<(u64, u64), ObjectKey> = entries
+        .iter()
+        .map(|entry| ((entry.start, entry.end), ObjectKey::of(entry)))
+        .collect();
+    let mut by_key: BTreeMap<ObjectKey, Vec<(u64, u64)>> = BTreeMap::new();
+    for (range, proof) in mapped.iter() {
+        if *proof != RangeProof::OverlayRefused {
+            continue;
+        }
+        let Some(key) = by_range.get(range) else {
+            continue;
+        };
+        if !index.is_overlay_key(*key) {
+            continue;
+        }
+        by_key.entry(*key).or_default().push(*range);
+    }
+    for (key, ranges) in by_key {
+        let Some((object, expected)) = index.match_pin(key) else {
+            continue;
+        };
+        let Some(file) = pins.file_for(object) else {
+            continue;
+        };
+        // No new read: identity from the index, magic synthesized overlay
+        // (key_is_identity is false for overlay either way).
+        let held = MappedFile {
+            identity: expected,
+            fs_magic: Some(OVERLAYFS_SUPER_MAGIC),
+        };
+        let Some(first) = ranges.first().copied() else {
+            continue;
+        };
+        if witness.prove(pid, file, &held, key, first, budget) == WitnessVerdict::SameFile {
+            for range in ranges {
+                mapped.insert(range, RangeProof::Witnessed);
+            }
+        }
+    }
+}
+
+/// Whether a hook decision with overlay refusals takes a witness query:
+/// a partial kernel answer (any refused range; the helper no-ops when
+/// there is none) or an unavailable run with no sweep route
+/// ([`RunFailure::AnchorNotInstalled`]). Attempt-cap, deadline, stream
+/// and other run failures keep the named loss with no query.
+fn witness_qualifies(decision: &crate::discovery::kernel_identity::ProofDecision<'_>) -> bool {
+    use crate::discovery::kernel_identity::{ProofDecision, RunFailure};
+    match decision {
+        ProofDecision::Kernel(_) => true,
+        ProofDecision::UserspaceExceptOverlay { reason, .. } => {
+            *reason == RunFailure::AnchorNotInstalled
+        }
+        ProofDecision::Userspace(_) => false,
+    }
+}
+
 /// The standalone adapter uses the same prepared ownership and batch minting
 /// seam as the later central segment hook; no scalar request constructor is
 /// exposed to the kernel owner. The hook is dynamic so the production
@@ -101,10 +181,26 @@ pub(crate) trait SegmentProof {
 pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
+    prepared: PreparedConfirmation<Io::Pin>,
+    hook: &mut (dyn SegmentProof + '_),
+    resources: &IoResources,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    prove_and_finish_prepared_with_witness(io, pid, prepared, hook, resources, budget, None)
+}
+
+/// Scalar confirm with an optional sweep witness for overlay refusals
+/// with no sweep route (live capture watched providers). `None` keeps
+/// today's named loss; `Some` proves each refused overlay key through
+/// the private session under the D-P1 budget.
+pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
     mut prepared: PreparedConfirmation<Io::Pin>,
     hook: &mut (dyn SegmentProof + '_),
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
+    witness: Option<(&KnownKeyIndex, &PinnedObjects, &mut dyn SweepWitness)>,
 ) -> Confirmation {
     let batch = AcceptedBatch {
         requests: vec![AcceptedRequest {
@@ -118,13 +214,18 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
         token: Arc::new(()),
     };
     let decision = hook.prove(&batch, budget, resources);
-    let answers = decision.answer(&batch, 0).cloned();
+    let mut answers = decision.answer(&batch, 0).cloned();
     drop(batch);
     if let Some(reason) = budget.check_deadline_now() {
         return Confirmation::Lost(AttributionLoss::Budget, reason.into());
     }
-    // A kernel answer needs no userspace reads; otherwise the member
-    // returns to the stash for the fallback proofs, like the scalar
+    if witness_qualifies(&decision)
+        && let (Some((index, pins, runner)), Some(map)) = (witness, answers.as_mut())
+    {
+        witness_overlay_refused(pid, map, &prepared.entries, index, pins, runner, budget);
+    }
+    // A complete kernel answer needs no userspace reads; otherwise the
+    // member returns to the stash for the fallback proofs, like the scalar
     // confirm path, and is taken back for the finish. A partial overlay
     // refusal answers only its refused ranges; every other range still
     // needs its userspace proof.
@@ -133,7 +234,10 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
             if matches!(
                 decision,
                 crate::discovery::kernel_identity::ProofDecision::Kernel(_)
-            ) =>
+            ) && prepared
+                .ranges
+                .iter()
+                .all(|range| mapped.contains_key(range)) =>
         {
             mapped
         }
@@ -1093,6 +1197,46 @@ where
         threads,
         make_io,
         Some(hook),
+        None,
+    )
+}
+
+/// Kernel sweep with an optional private witness for overlay refusals
+/// with no sweep route (live capture watched providers). `None` keeps
+/// today's named loss; `Some` proves each refused overlay key through
+/// the private session under the D-P1 per-pass budget.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attribute_unselected_with_segment_proof_with_witness<Io, F>(
+    sweep: &[(u32, Vec<MapEntry>)],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+    budget: &mut CaptureWorkBudget,
+    policy: SegmentPolicy,
+    owner: &ReservationOwner,
+    threads: usize,
+    make_io: &F,
+    hook: &mut impl SegmentProof,
+    pins: &PinnedObjects,
+    witness: &mut dyn SweepWitness,
+) -> SweepAttribution
+where
+    Io: ShardableIo,
+    Io::Pin: Send,
+    F: Fn() -> Io + Sync,
+{
+    attribute_unselected_with_optional_proof(
+        sweep,
+        unavailable,
+        selected,
+        index,
+        budget,
+        policy,
+        owner,
+        threads,
+        make_io,
+        Some(hook),
+        Some((pins, witness)),
     )
 }
 
@@ -1124,6 +1268,7 @@ where
         threads,
         make_io,
         None,
+        None,
     )
 }
 
@@ -1139,6 +1284,7 @@ fn attribute_unselected_with_optional_proof<Io, F>(
     threads: usize,
     make_io: &F,
     mut hook: Option<&mut dyn SegmentProof>,
+    mut witness: Option<(&PinnedObjects, &mut dyn SweepWitness)>,
 ) -> SweepAttribution
 where
     Io: ShardableIo,
@@ -1262,17 +1408,63 @@ where
                         reason.into(),
                     ));
                 } else if let Some(mapped) = answer {
+                    // A partial Kernel answer (overlay ranges only) still
+                    // needs userspace proofs for the missing ranges;
+                    // `prove_part` reads exactly those.
+                    let complete = match &prepared[position].1.state {
+                        PreparedState::Idle { ranges, .. } => {
+                            ranges.iter().all(|range| mapped.contains_key(range))
+                        }
+                        PreparedState::Confirm { plan, .. } => {
+                            plan.ranges.iter().all(|range| mapped.contains_key(range))
+                        }
+                        _ => true,
+                    };
                     prepared[position].1.mapped = mapped;
-                    prepared[position].1.kernel_proved = matches!(
-                        decision,
-                        crate::discovery::kernel_identity::ProofDecision::Kernel(_)
-                    );
+                    prepared[position].1.kernel_proved = complete
+                        && matches!(
+                            decision,
+                            crate::discovery::kernel_identity::ProofDecision::Kernel(_)
+                        );
                 }
             }
             Some(decision)
         } else {
             None
         };
+        // K1-R2: watched overlay keys with no sweep route prove via the
+        // private witness session (no attach-set exclusions) under the
+        // D-P1 per-pass budget. Attempt-cap and other run failures keep
+        // the named loss with no query.
+        if let Some(decision) = decision.as_ref()
+            && witness_qualifies(decision)
+            && let Some((pins, runner)) = witness.as_mut()
+        {
+            let pins = *pins;
+            for (at, prepared) in prepared.iter_mut() {
+                if !prepared
+                    .mapped
+                    .values()
+                    .any(|proof| *proof == RangeProof::OverlayRefused)
+                {
+                    continue;
+                }
+                let (pid, sweep_entries) = &sweep[*at];
+                let entries: &[MapEntry] = match &prepared.state {
+                    PreparedState::Confirm { plan, .. } => &plan.entries,
+                    _ => sweep_entries,
+                };
+                witness_overlay_refused(
+                    *pid,
+                    &mut prepared.mapped,
+                    entries,
+                    index,
+                    pins,
+                    &mut **runner,
+                    budget,
+                );
+            }
+        }
         let proven = match prove_segment(prepared, sweep, &batch, threads.min(policy.workers)) {
             Ok(proven) => proven,
             Err(()) => {
@@ -1348,9 +1540,14 @@ where
             let confirmation = match hook.as_deref_mut() {
                 Some(hook) => {
                     match prepare_confirmation(&mut io, *pid, &prove, budget, Some(&immediate)) {
-                        Ok(prepared) => prove_and_finish_prepared(
-                            &mut io, *pid, prepared, hook, &immediate, budget,
-                        ),
+                        Ok(prepared) => {
+                            let w = witness.as_mut().map(|(pins, runner)| {
+                                (index, *pins, &mut **runner as &mut dyn SweepWitness)
+                            });
+                            prove_and_finish_prepared_with_witness(
+                                &mut io, *pid, prepared, hook, &immediate, budget, w,
+                            )
+                        }
                         Err(confirmation) => confirmation,
                     }
                 }

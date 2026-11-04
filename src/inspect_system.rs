@@ -4432,17 +4432,44 @@ fn attribute_pass_with_kernel(
                 bound,
                 &bound.aggregate,
                 |sweep, unavailable, selected, index, budget| {
-                    crate::discovery::confirm_shards::attribute_unselected_with_policy(
-                        sweep,
-                        unavailable,
-                        selected,
-                        index,
-                        budget,
-                        segment_policy,
-                        reservations,
-                        shards,
-                        &|| OsConfirmIo::with_pools(pools),
-                    )
+                    if capture_excluded {
+                        // Every anchor is capture-watched: no sweep kernel
+                        // run exists, but the refused overlay keys still
+                        // prove through the private witness session (the
+                        // refused hook manufactures no kernel proofs;
+                        // non-overlay ranges read from userspace exactly
+                        // as below).
+                        let mut hook =
+                            crate::discovery::kernel_identity::AnchorRefusedHook::new(index);
+                        let mut witness =
+                            crate::discovery::overlay_witness::KernelSweepWitness::new();
+                        crate::discovery::confirm_shards::attribute_unselected_with_segment_proof_with_witness(
+                            sweep,
+                            unavailable,
+                            selected,
+                            index,
+                            budget,
+                            segment_policy,
+                            reservations,
+                            shards,
+                            &|| OsConfirmIo::with_pools(pools),
+                            &mut hook,
+                            &bound.aggregate,
+                            &mut witness,
+                        )
+                    } else {
+                        crate::discovery::confirm_shards::attribute_unselected_with_policy(
+                            sweep,
+                            unavailable,
+                            selected,
+                            index,
+                            budget,
+                            segment_policy,
+                            reservations,
+                            shards,
+                            &|| OsConfirmIo::with_pools(pools),
+                        )
+                    }
                 },
             )
         }
@@ -4485,18 +4512,25 @@ where
         inner: probe.segment_proof(),
         first_fallback: std::cell::Cell::new(None),
     };
-    let mut attribution = crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
-        &collection.sweep,
-        &collection.sweep_unavailable,
-        &selected,
-        &index,
-        &mut collection.budget,
-        policy,
-        owner,
-        threads,
-        make_io,
-        &mut observing,
-    );
+    // K1-R2: watched overlay keys with no sweep route (live capture
+    // attach-set exclusions) prove via the private witness session
+    // under the D-P1 per-pass budget; exhaustion keeps the named loss.
+    let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
+    let mut attribution =
+        crate::discovery::confirm_shards::attribute_unselected_with_segment_proof_with_witness(
+            &collection.sweep,
+            &collection.sweep_unavailable,
+            &selected,
+            &index,
+            &mut collection.budget,
+            policy,
+            owner,
+            threads,
+            make_io,
+            &mut observing,
+            &bound.aggregate,
+            &mut witness,
+        );
     let changed = retain_unchanged(&mut attribution, &bound.aggregate);
     let observed = observing.observed();
     (

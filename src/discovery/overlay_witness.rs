@@ -40,6 +40,63 @@ use std::time::{Duration, Instant};
 /// the witness).
 pub(crate) const OVERLAY_WITNESS_QUERIES_PER_SCAN: u32 = 8;
 
+/// Witness queries per sweep pass for watched overlay keys with no sweep
+/// kernel route (live capture: attach-set exclusions refuse their sweep
+/// anchors). D-P1 budget: one private-session query per watched
+/// (pid, key), same 8-query bound as a deep scan; exhaustion keeps the
+/// named `overlay_kernel_unavailable` loss, never a userspace join.
+/// Attempt-cap, cgroup and oversized paths take no witness query.
+pub(crate) const OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS: u32 = 8;
+
+/// The sweep's kernel witness for overlay keys with no sweep route.
+/// Production runs the private session below; tests script verdicts.
+pub(crate) trait SweepWitness {
+    fn prove(
+        &mut self,
+        pid: u32,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessVerdict;
+}
+
+/// Production sweep witness: the private session with no attach-set
+/// exclusions, under the per-pass D-P1 budget.
+pub(crate) struct KernelSweepWitness {
+    used: u32,
+}
+
+impl KernelSweepWitness {
+    pub(crate) fn new() -> Self {
+        Self { used: 0 }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> u32 {
+        self.used
+    }
+}
+
+impl SweepWitness for KernelSweepWitness {
+    fn prove(
+        &mut self,
+        pid: u32,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessVerdict {
+        if self.used >= OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS {
+            return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+        }
+        self.used += 1;
+        prove_original_file(pid, file, held, key, range, budget)
+    }
+}
+
 /// The lone anchor of a single-candidate pass always takes slot zero:
 /// candidates are numbered positionally
 /// (`kernel_identity.rs`, examined push) and a lone anchor has nothing
@@ -531,6 +588,43 @@ mod tests {
         assert_eq!(
             queries_before, queries_after,
             "a scoped-collection early-out is not a query"
+        );
+    }
+
+    #[test]
+    fn sweep_budget_size_is_pinned() {
+        assert_eq!(OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS, 8);
+    }
+
+    #[test]
+    fn sweep_witness_budget_exhaustion_skips_the_run() {
+        let held = overlay_held();
+        let mut budget = CaptureWorkBudget::default();
+        let file = File::open("/dev/null").unwrap();
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7_101,
+        };
+        let mut witness = KernelSweepWitness::new();
+        witness.used = OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS;
+        let (queries_before, _) = witness_stats_for_test();
+        let verdict = witness.prove(
+            std::process::id(),
+            &file,
+            &held,
+            key,
+            (0x1000_0000, 0x1000_1000),
+            &mut budget,
+        );
+        assert_eq!(
+            verdict,
+            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted)
+        );
+        assert_eq!(witness.used(), OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS);
+        let (queries_after, _) = witness_stats_for_test();
+        assert_eq!(
+            queries_before, queries_after,
+            "an exhausted sweep budget runs no query"
         );
     }
 }

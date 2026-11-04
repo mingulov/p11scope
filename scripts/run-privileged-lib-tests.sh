@@ -341,6 +341,11 @@ discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_la
 # it fails by design and never qualifies.
 discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity
+# K1 sweep-side witness cell (own loop overlay per mode, capture watching
+# the held provider): fresh-upper joins via the production witness,
+# stale-lower keeps the named loss, the no-witness RED run keeps the loss,
+# and the only-excluded-anchor install failure pins the gap.
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains

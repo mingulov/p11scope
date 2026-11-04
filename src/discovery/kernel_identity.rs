@@ -673,8 +673,10 @@ impl From<RunFailure> for KernelFallbackReason {
 }
 
 /// Capture-level fallback disclosure input: a pass counts once if any
-/// requested proof fell back, distinct affected PIDs/keys once per pass,
-/// summed across the capture, with the first finite reason preserved.
+/// requested proof fell back or was refused, distinct affected PIDs/keys
+/// once per pass, summed across the capture, with the first finite reason
+/// preserved. Overlay keys with no kernel route count here as refused
+/// (never a userspace fallback edge).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct KernelFallbackTotals {
     pub(crate) passes: u64,
@@ -793,6 +795,47 @@ fn overlay_refused_ranges(
         })
         .map(|range| (*range, super::sweep_attribution::RangeProof::OverlayRefused))
         .collect()
+}
+
+/// Sweep hook for a pass whose anchors never installed because every
+/// anchor is capture-watched (all providers watched, no unwatched
+/// anchor): no sweep kernel run exists, so every request answers
+/// `UserspaceExceptOverlay` with `AnchorNotInstalled`, refusing exactly
+/// its overlay ranges (no manufactured kernel proofs). The driver reads
+/// the remaining ranges from userspace — identical to the userspace path
+/// for non-overlay keys — and the private witness may prove the refused
+/// overlay keys. Batches with no overlay key answer plain `Userspace`.
+pub(crate) struct AnchorRefusedHook<'i> {
+    index: &'i KnownKeyIndex,
+}
+
+impl<'i> AnchorRefusedHook<'i> {
+    pub(crate) fn new(index: &'i KnownKeyIndex) -> Self {
+        Self { index }
+    }
+}
+
+impl SegmentProof for AnchorRefusedHook<'_> {
+    fn prove<'r>(
+        &'r mut self,
+        batch: &AcceptedBatch<'_>,
+        _budget: &mut CaptureWorkBudget,
+        _resources: &IoResources,
+    ) -> ProofDecision<'r> {
+        let refused: Vec<MappedIdentities> = batch
+            .requests()
+            .iter()
+            .map(|request| overlay_refused_ranges(request, self.index.overlay_keys()))
+            .collect();
+        if refused.iter().all(MappedIdentities::is_empty) {
+            ProofDecision::Userspace(RunFailure::AnchorNotInstalled)
+        } else {
+            ProofDecision::UserspaceExceptOverlay {
+                reason: RunFailure::AnchorNotInstalled,
+                refused,
+            }
+        }
+    }
 }
 
 /// Session-level failure that persists through subsequent passes: an invalid

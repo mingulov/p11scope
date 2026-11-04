@@ -8227,6 +8227,18 @@ fn k2_prove_match_overlay_refuses_userspace_joins_kernel() {
     assert_eq!(loss, AttributionLoss::MapFilesUnavailable);
 }
 
+/// K1-R2: the private witness session proves a watched overlay caller in
+/// the kernel (no attach-set exclusions); its verdict joins like a
+/// sweep kernel proof, never like userspace identity.
+#[test]
+fn k1_r2_prove_match_witnessed_joins_overlay() {
+    let expected = FileIdentity { dev: 42, ino: 7 };
+    let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
+    let range = (entry.start, entry.end);
+    let mapped = MappedIdentities::from([(range, RangeProof::Witnessed)]);
+    prove_match(expected, None, &[&entry], &mapped, true).expect("witnessed overlay joins");
+}
+
 /// K2 RED (R1b): an unproven filesystem (`statfs` unreadable) refuses
 /// like overlayfs — fail closed, matching the deep-scan witness rule.
 #[test]

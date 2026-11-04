@@ -370,6 +370,12 @@ impl KnownKeyIndex {
         self.by_key.get(&key).map(|(_, identity)| *identity)
     }
 
+    /// The pinned object and expected identity behind a match key, for the
+    /// sweep witness (which borrows the held file, never a path reopen).
+    pub(crate) fn match_pin(&self, key: ObjectKey) -> Option<(PinnedObjectId, FileIdentity)> {
+        self.by_key.get(&key).copied()
+    }
+
     fn examined_identities(&self, key: ObjectKey) -> Option<&BTreeSet<FileIdentity>> {
         self.examined.get(&key)
     }
@@ -402,6 +408,11 @@ pub(crate) enum RangeProof {
     /// Distinct from [`RangeProof::Unavailable`] (a read was attempted and
     /// failed), which keeps its own loss even for overlay keys.
     OverlayRefused,
+    /// The K1 private witness session proved this overlay range is the
+    /// held file in the kernel (no attach-set exclusions): joins like a
+    /// sweep kernel proof. Only the sweep witness mints this, under its
+    /// per-pass budget; budget exhaustion keeps [`RangeProof::OverlayRefused`].
+    Witnessed,
 }
 
 impl From<Result<FileIdentity, String>> for RangeProof {
@@ -709,6 +720,9 @@ fn prove_match(
                     ),
                 ));
             }
+            // The private witness session proved this range is the held
+            // file in the kernel: joins like a sweep kernel proof.
+            Some(RangeProof::Witnessed) => {}
             None => {
                 return Err((
                     AttributionLoss::MapFilesUnavailable,

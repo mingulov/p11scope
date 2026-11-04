@@ -1264,8 +1264,31 @@ The old bounds are measurements, not a product startup SLA.
   fallback anywhere in the sweep ladder. A below-threshold batch still
   runs the kernel for overlay keys, and an unavailable kernel run
   yields the named `overlay_kernel_unavailable` maps-attribution loss
-  — never an edge. The pure-userspace sweep reads the ranges and then
-  refuses the join; the kernel ladder refuses without reading them.
+  — never an edge. An overlay key in a batch forces the kernel run
+  for the whole batch: non-overlay requests there take kernel proofs
+  instead of the below-threshold userspace path (identical only in
+  batches with no overlay key) and spend the pass's 3-attempt budget.
+  In live capture, a watched overlay provider (attach-set exclusion,
+  for example a provider inside a container) proves through the K1
+  private witness session with no exclusions, one query per watched
+  (pid, key) under the D-P1 per-pass budget (8 queries); SameFile
+  joins, anything else (OtherFile, failure, budget exhaustion) keeps
+  the named loss, never a userspace join. A pass whose anchors never
+  installed because every anchor is watched takes the same witness
+  route with no sweep kernel run. The remaining sweep paths keep the
+  named loss with no witness query: cgroup-scoped collection (the
+  userspace-only path), a segment after the pass's third kernel run
+  (`TargetLimit`) or another run failure (sticky, deadline, stream,
+  headroom), an oversized single caller (which reads its ranges and
+  then refuses), file-descriptor pressure (every pid takes the
+  immediate path, which reads and then refuses, including its idle
+  promotions), a failed kernel expectation or anchor install that is
+  not capture-excluded, and the explicit userspace identity backend
+  (which never reaches the witness). The pure-userspace sweep reads
+  the ranges and then refuses the join; the kernel ladder refuses
+  without reading them, except the oversized, cgroup, immediate and
+  failed-install paths which read and then refuse (still never an
+  edge).
   One verdict covers the file: the witness proves the first
   witness-requiring caller range,
   and a same-file verdict joins every range of the group. A process
@@ -1298,7 +1321,9 @@ The old bounds are measurements, not a product startup SLA.
   proved another file, the witness query budget was exhausted, the
   witness was unavailable, the anchor binding failed). A swept overlay
   caller whose kernel run is unavailable surfaces as an
-  `overlay_kernel_unavailable` maps-attribution loss.
+  `overlay_kernel_unavailable` maps-attribution loss (live capture
+  watched providers first try the private witness session, 8 queries
+  per pass; exhaustion keeps the same loss).
 - Workaround: restart processes that loaded a provider before the file
   changed inside the container (for example by chmod, touch or an
   in-place write) to get exact attribution for their later calls.
@@ -1306,8 +1331,9 @@ The old bounds are measurements, not a product startup SLA.
   layer layouts avoid only the xino-off collision.
 - Status: the copy-up stale join shipped fixed in v0.6.0 (kernel proof
   or the named gap), and the sweep refuses its userspace fallback for
-  overlay keys (kernel proof or the named loss). The xino-off collision and the pre-6.8 lane-A
-  splits above remain disclosed limits.
+  overlay keys (kernel proof, witness, or the named loss). The
+  xino-off collision and the pre-6.8 lane-A splits above remain
+  disclosed limits.
 
 ### Pre-admission use voids the watch (R-C51-1)
 

@@ -65,6 +65,19 @@ fn joined_calls(scene: &RealScene) -> u64 {
     scene.h0.0.borrow().capture.router().counters().joined
 }
 
+/// The calls the caller's own S1 edges joined (`api_returns`), read
+/// from the published registry rather than the router's counter.
+fn caller_edge_calls(scene: &RealScene, caller: CallerId) -> u64 {
+    scene
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter(|record| record.caller == caller)
+        .filter_map(|record| record.api_returns)
+        .sum()
+}
+
 fn has_loss_subject(scene: &RealScene) -> bool {
     semantic_gap_subjects(scene).iter().any(|(subject, _)| {
         subject == "semantic admission refused" || subject == "semantic calls unrouted"
@@ -72,8 +85,9 @@ fn has_loss_subject(scene: &RealScene) -> bool {
 }
 
 /// A receipt-less pass defers admission; the next pass retries it and
-/// every call the caller made is joined. The deferral is a named
-/// non-loss note, never a loss gap.
+/// the caller's later calls join. The deferral is a named non-loss
+/// note, never a loss gap. (Calls made *while* deferred are covered by
+/// `deferred_admission_calls_before_the_retry_join`.)
 #[test]
 fn deferred_admission_retry_joins_every_call() {
     let mut scene = workload_scene();
@@ -90,6 +104,11 @@ fn deferred_admission_retry_joins_every_call() {
     let batch = scene.tick();
     scene.publish(batch);
     assert_eq!(joined_calls(&scene), 2, "every call joins after the retry");
+    assert_eq!(
+        caller_edge_calls(&scene, caller),
+        2,
+        "the caller's S1 edge counts both calls"
+    );
     assert_eq!(
         scene
             .scene
@@ -160,9 +179,48 @@ fn deferred_admission_calls_before_the_retry_join() {
     let batch = scene.tick();
     scene.publish(batch);
     assert_eq!(joined_calls(&scene), 2, "queued calls join after the retry");
+    assert_eq!(
+        caller_edge_calls(&scene, caller),
+        2,
+        "the caller's S1 edge counts both calls made while deferred"
+    );
     assert!(
         !has_loss_subject(&scene),
         "{:?}",
         semantic_gap_subjects(&scene)
     );
+}
+
+/// Only a missing receipt defers: every other unavailable site keeps
+/// the `semantic admission refused` loss gap at the coordinator.
+#[test]
+fn non_receipt_unavailable_sites_stay_refused_at_the_coordinator() {
+    use crate::inventory_semantics::{AdmissionPreparationError, AdmissionUnavailableSite as Site};
+    for (site, deferred) in [
+        (Site::RefreshFailed, false),
+        (Site::CollectedQInvalid, false),
+        (Site::NoReceipt, true),
+    ] {
+        let mut scene = workload_scene();
+        let caller = admit_mapped(&mut scene, std::process::id());
+        scene.scene.coordinator.semantic_admission_prepare_failed(
+            caller,
+            AdmissionPreparationError::unavailable(site),
+        );
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        let subject = if deferred {
+            "semantic admission deferred"
+        } else {
+            "semantic admission refused"
+        };
+        assert_eq!(
+            semantic_gap_subjects(&scene),
+            vec![(
+                subject.to_string(),
+                format!("semantic_unavailable:{}", site.label())
+            )],
+            "site {}",
+            site.label()
+        );
+    }
 }

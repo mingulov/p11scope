@@ -2237,7 +2237,10 @@ pub(crate) struct ObjectExports<'a> {
     /// same object can agree — except an interposed `C_GetFunctionList`
     /// bootstrap (see [`export_agreement`]), which the linker resolved by
     /// name; a forwarded entry is never compared against a dependency's
-    /// symbols it was not read from.
+    /// symbols it was not read from. The bootstrap exception is checked
+    /// before scoring: bind refuses a forward the target object does not
+    /// define at the forwarded offset, so this witness never scores an
+    /// unverified forward.
     pub(crate) object: ObjectKey,
     pub(crate) symbols: &'a [(String, u64)],
     /// A 3.x interface getter name appears among the object's dynamic
@@ -2314,6 +2317,11 @@ impl ExportAgreement {
 /// layout is a real function list — the forwarded bootstrap keeps its
 /// ABI-definitional name. A lone forward, or any other forwarded name,
 /// still contradicts: only the bootstrap interposes by construction.
+/// The arm trusts reconciled input: both bind paths refuse a forwarded
+/// bootstrap the pinned target's own `.dynsym` does not define at the
+/// forwarded offset (see `forwarded_bootstrap_verified`), so a forward
+/// reaching this score was resolved by name. A wrong-offset, stale, or
+/// hostile forward never agrees — it arrives as an unpinned contradiction.
 pub(crate) fn export_agreement(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,

@@ -1259,11 +1259,15 @@ The old bounds are measurements, not a product startup SLA.
   `(dev, ino)` fallback. The row's original edge reads `ended`, its
   later calls are not counted, and no new-module edge is emitted; a
   process that maps the upper copy is still attributed exactly. The
-  sweep's observed-call path still falls back to userspace `(dev, ino)`
-  identity when its kernel run is unavailable, including for overlay
-  keys (the K2 sweep-side rule is not in this packet); only the
-  deep-scan row carries the witness guarantee. One verdict covers the
-  file: the witness proves the first witness-requiring caller range,
+  sweep carries the same no-fallback rule: an overlay key (overlayfs
+  or an unproven filesystem) never takes the userspace `(dev, ino)`
+  fallback anywhere in the sweep ladder. A below-threshold batch still
+  runs the kernel for overlay keys, and an unavailable kernel run
+  yields the named `overlay_kernel_unavailable` maps-attribution loss
+  — never an edge. The pure-userspace sweep reads the ranges and then
+  refuses the join; the kernel ladder refuses without reading them.
+  One verdict covers the file: the witness proves the first
+  witness-requiring caller range,
   and a same-file verdict joins every range of the group. A process
   that maps one provider both before and after a copy-up (mappings on
   both sides of the boundary) would join its stale ranges with the
@@ -1292,14 +1296,17 @@ The old bounds are measurements, not a product startup SLA.
   A stale copy-up mapping surfaces as an `original_file_unproven` gap
   under the provider path, with one of four fixed causes (the witness
   proved another file, the witness query budget was exhausted, the
-  witness was unavailable, the anchor binding failed).
+  witness was unavailable, the anchor binding failed). A swept overlay
+  caller whose kernel run is unavailable surfaces as an
+  `overlay_kernel_unavailable` maps-attribution loss.
 - Workaround: restart processes that loaded a provider before the file
   changed inside the container (for example by chmod, touch or an
   in-place write) to get exact attribution for their later calls.
   `--identity-backend kernel` does not help here. Same-filesystem
   layer layouts avoid only the xino-off collision.
 - Status: the copy-up stale join shipped fixed in v0.6.0 (kernel proof
-  or the named gap). The xino-off collision and the pre-6.8 lane-A
+  or the named gap), and the sweep refuses its userspace fallback for
+  overlay keys (kernel proof or the named loss). The xino-off collision and the pre-6.8 lane-A
   splits above remain disclosed limits.
 
 ### Pre-admission use voids the watch (R-C51-1)

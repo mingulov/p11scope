@@ -319,6 +319,7 @@ fn mount_overlay(opts: &str, mountpoint: &std::path::Path) -> Result<(), String>
 /// map_files stat and statfs magic, the held fd's fstat, the stat-based
 /// xino verdict, and whether map_files shows the backing file (the N4
 /// identity-key branch input).
+#[derive(Clone)]
 struct OverlayTruth {
     maps_line: String,
     map_files_dev: u64,
@@ -653,6 +654,10 @@ enum OverlayExpect {
     Parity(bool),
     DivergenceC72(bool, bool),
     DivergenceC73,
+    /// The sweep-side no-fallback shape: the kernel leg edges on a real
+    /// kernel proof while the userspace leg yields the exact named loss
+    /// (no userspace-identity edge for overlay keys).
+    DivergenceK2,
     Negative,
     DataOnly,
     IdentityKeyNoProof,
@@ -713,6 +718,20 @@ fn assert_overlay_outcome(
         {
             return Err(format!(
                 "overlay {side}: expected named mismatch, members {:?} losses {:?} probed {}",
+                out.members.iter().map(|m| m.pid).collect::<Vec<_>>(),
+                out.losses,
+                out.probed
+            ));
+        }
+        Ok(())
+    }
+    fn k2_loss(out: &SweepAttribution, side: &str) -> Result<(), String> {
+        if !out.members.is_empty()
+            || out.losses != BTreeMap::from([(AttributionLoss::OverlayKernelUnavailable, 1)])
+            || out.probed != 1
+        {
+            return Err(format!(
+                "overlay {side}: expected no-fallback loss, members {:?} losses {:?} probed {}",
                 out.members.iter().map(|m| m.pid).collect::<Vec<_>>(),
                 out.losses,
                 out.probed
@@ -821,15 +840,30 @@ fn assert_overlay_outcome(
                 );
             }
             // Userspace follows recorded truth on xino-off ×
-            // post-copy-up (non-persistent st_ino); otherwise it edges
-            // against the stale anchor while the kernel says other.
+            // post-copy-up (non-persistent st_ino); otherwise it refuses
+            // with the named no-fallback loss while the kernel says other.
             let want_edge = target.xino_off_copy_up_stable.unwrap_or(true);
             if want_edge {
-                edge(pid, row_key, userspace, "userspace")?;
+                k2_loss(userspace, "userspace")?;
             } else {
                 mismatch(userspace, "userspace")?;
             }
             mismatch(kernel, "kernel")?;
+            kernel_proof()?;
+            Ok(())
+        }
+        OverlayExpect::DivergenceK2 => {
+            if backing {
+                return Err(
+                    "overlay K2 needs overlay rendering; backing rendering is the identity-key branch"
+                        .into(),
+                );
+            }
+            if !keys_equal {
+                return Err("overlay K2 needs equal maps keys".into());
+            }
+            k2_loss(userspace, "userspace")?;
+            edge(pid, row_key, kernel, "kernel")?;
             kernel_proof()?;
             Ok(())
         }
@@ -1384,6 +1418,98 @@ fn overlay_xino_off_collision_rejects_join() {
     );
 }
 
+/// The K2 evaluator shape: a same-file overlay pair takes a kernel edge
+/// with the userspace named loss — and the evaluator rejects a userspace
+/// edge, a kernel mismatch, differing keys, or backing rendering for it.
+#[test]
+fn overlay_k2_divergence_needs_kernel_edge_and_userspace_loss() {
+    let pid = 4242u32;
+    let target = OverlayTruth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 00:2a 12 /merged/lib.so".into(),
+        map_files_dev: 42,
+        map_files_ino: 12,
+        statfs_magic: p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC,
+        held_fstat: (42, 12),
+        xino_effective: true,
+        xino_auto: "Y".into(),
+        map_files_backing: false,
+        xino_off_copy_up_stable: None,
+    };
+    let anchor = target.clone();
+    let evidence = synthetic_quad_evidence();
+    assert_overlay_outcome(
+        pid,
+        &target,
+        &anchor,
+        &synthetic_k2_loss(),
+        &synthetic_edged(pid, target.maps_key()),
+        &evidence,
+        OverlayExpect::DivergenceK2,
+    )
+    .expect("same-file overlay pair takes kernel edge with userspace loss");
+    let edged = synthetic_edged(pid, target.maps_key());
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &target,
+            &anchor,
+            &edged,
+            &edged,
+            &evidence,
+            OverlayExpect::DivergenceK2,
+        )
+        .is_err(),
+        "K2 must not accept a userspace edge"
+    );
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &target,
+            &anchor,
+            &synthetic_k2_loss(),
+            &synthetic_mismatch(),
+            &evidence,
+            OverlayExpect::DivergenceK2,
+        )
+        .is_err(),
+        "K2 must not accept a kernel mismatch"
+    );
+    let other = OverlayTruth {
+        maps_line: "7f2b4c000000-7f2b4c001000 r-xp 00000000 00:2a 13 /merged/other.so".into(),
+        ..target.clone()
+    };
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &target,
+            &other,
+            &synthetic_k2_loss(),
+            &edged,
+            &evidence,
+            OverlayExpect::DivergenceK2,
+        )
+        .is_err(),
+        "K2 needs equal maps keys"
+    );
+    let backing = OverlayTruth {
+        map_files_backing: true,
+        ..target.clone()
+    };
+    assert!(
+        assert_overlay_outcome(
+            pid,
+            &target,
+            &backing,
+            &synthetic_k2_loss(),
+            &edged,
+            &evidence,
+            OverlayExpect::DivergenceK2,
+        )
+        .is_err(),
+        "backing rendering is the identity-key branch, not K2"
+    );
+}
+
 /// The N4 identity-key branch: backing rendering on ext4 layers makes
 /// the key its own identity, so userspace decides alone and the kernel
 /// leg classifies "no kernel proof (identity key)" — never parity.
@@ -1797,6 +1923,14 @@ fn synthetic_mismatch() -> SweepAttribution {
     }
 }
 
+fn synthetic_k2_loss() -> SweepAttribution {
+    SweepAttribution {
+        probed: 1,
+        losses: BTreeMap::from([(AttributionLoss::OverlayKernelUnavailable, 1)]),
+        ..SweepAttribution::default()
+    }
+}
+
 fn synthetic_none() -> SweepAttribution {
     SweepAttribution::default()
 }
@@ -1909,9 +2043,10 @@ fn privileged_d4_overlay_xino_backend_parity() {
 
 /// Task 6 copy-up reproducer (lanes B only): the upper mapper after
 /// copy-up must NOT re-edge to the stale lower anchor on the userspace
-/// leg. RED while D-C7-3 stands (the stable overlay inode joins them);
-/// the lower control proves the test sees real edges. Lane A fails
-/// outright (keys differ there, so absence would pass vacuously).
+/// leg. The sweep-side no-fallback rule refuses with the named loss where
+/// D-C7-3's stable overlay inode used to join; the lower control proves
+/// the fixture still edges on the kernel leg. Lane A fails outright (keys
+/// differ there, so absence would pass vacuously).
 #[test]
 #[ignore = "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only)"]
 fn overlay_copy_up_userspace_edge_absent() {
@@ -1922,12 +2057,20 @@ fn overlay_copy_up_userspace_edge_absent() {
             "OVERLAY-COPY-UP lane: lanes B only (lane-A keys differ, absence would pass vacuously)"
         );
     }
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session =
+        crate::discovery::kernel_identity::IdentitySession::probe_and_load(&btf, probe_dir.path())
+            .expect("strict-loaded kernel session; no refused/fallback positive");
     let work = tempfile::tempdir().unwrap();
     let fixture = OverlayFixture::mount(work.path(), XinoMode::On).expect("overlay mount");
     std::fs::write(fixture.lower_path("lib.so"), vec![0xF6u8; 8192]).unwrap();
     let xino = fixture.xino_verdict("lib.so").expect("xino on effective");
     let merged = fixture.merged_path("lib.so");
-    // Lower control first: pre-copy-up, the userspace leg edges.
+    // Lower control first: pre-copy-up, the userspace leg refuses with the
+    // named no-fallback loss while the kernel leg edges on a real proof.
     let control = SwapChild::spawn(&merged);
     let c_snap = control.maps();
     let c_range = (control.address, control.address + 4096);
@@ -1935,12 +2078,30 @@ fn overlay_copy_up_userspace_edge_absent() {
     let key = ObjectKey::of(&c_line);
     let (pins, object) = overlay_pin(&merged, key).expect("pin");
     let index = overlay_index(key, object, &pins);
-    let userspace = d4_overlay_attribute_pid(control.pid as u32, c_snap, &index);
-    let members: Vec<u32> = userspace.members.iter().map(|member| member.pid).collect();
+    let userspace = d4_overlay_attribute_pid(control.pid as u32, c_snap.clone(), &index);
+    assert!(
+        userspace.members.is_empty(),
+        "lower control joined by userspace: {userspace:?}"
+    );
+    assert_eq!(
+        userspace.losses,
+        BTreeMap::from([(AttributionLoss::OverlayKernelUnavailable, 1)]),
+        "lower control refuses named: {userspace:?}"
+    );
+    let (kernel, _) = d4_overlay_kernel_attribution_for_pid(
+        control.pid as u32,
+        c_snap,
+        &pins,
+        object,
+        key,
+        &mut session,
+        1,
+    );
+    let members: Vec<u32> = kernel.members.iter().map(|member| member.pid).collect();
     assert_eq!(
         members,
         [control.pid as u32],
-        "lower control edges: {userspace:?}"
+        "lower control edges on the kernel leg: {kernel:?}"
     );
     // Copy up, then map the upper file through the same merged path.
     trigger_copy_up(
@@ -1973,7 +2134,12 @@ fn overlay_copy_up_userspace_edge_absent() {
     let members: Vec<u32> = userspace.members.iter().map(|member| member.pid).collect();
     assert!(
         members.is_empty(),
-        "D-C7-3 stands: upper mapper re-edged to the stale anchor: {userspace:?}"
+        "upper mapper re-edged to the stale anchor: {userspace:?}"
+    );
+    assert_eq!(
+        userspace.losses,
+        BTreeMap::from([(AttributionLoss::OverlayKernelUnavailable, 1)]),
+        "upper mapper refuses named: {userspace:?}"
     );
 }
 
@@ -2020,7 +2186,10 @@ impl OverlayRows<'_> {
         Ok(())
     }
 
-    /// Lower mapper through the merge: parity edge on both lanes.
+    /// Lower mapper through the merge: the kernel leg edges on a real
+    /// proof while the userspace leg yields the named no-fallback loss
+    /// (no userspace-identity edge for overlay keys), on both lanes.
+    /// (The N4 backing branch on lane A keeps its own expectation.)
     fn row_lower(&mut self, work: &std::path::Path) -> Result<(), String> {
         eprintln!("D4_OVERLAY start mode={:?} row=lower", self.mode);
         let fixture = OverlayFixture::mount(work, self.mode)?;
@@ -2102,13 +2271,13 @@ impl OverlayRows<'_> {
                 &userspace,
                 &kernel,
                 &evidence,
-                OverlayExpect::Parity(true),
+                OverlayExpect::DivergenceK2,
             )?;
         }
         let verdict = if branch {
             "N4-identity-key-no-proof"
         } else {
-            "parity-edge"
+            "k2-divergence"
         };
         eprintln!(
             "D4_OVERLAY mode={:?} row=lower lane={:?} verdict={} target-{}",
@@ -2122,7 +2291,8 @@ impl OverlayRows<'_> {
 
     /// Upper mapper after copy-up, anchor opened before: parity none on
     /// lane A (keys differ), D-C7-3 on lane B (stable overlay inode, a
-    /// userspace edge the kernel correctly refuses).
+    /// userspace no-fallback loss where the kernel correctly reports
+    /// another file).
     fn row_upper(&mut self, work: &std::path::Path) -> Result<(), String> {
         eprintln!("D4_OVERLAY start mode={:?} row=upper", self.mode);
         let fixture = OverlayFixture::mount(work, self.mode)?;
@@ -3226,6 +3396,385 @@ fn k1_same_key_twice_row(work: &std::path::Path, mode: XinoMode) -> Result<(), S
     }
     eprintln!(
         "K1_DEEP_SCAN mode={mode:?} row=same-key-twice verdict=join passes=2 attempts={attempts_total}"
+    );
+    Ok(())
+}
+
+/// The K2 named loss label, asserted as a string so the RED run compiles
+/// before the production label exists.
+const K2_LOSS_LABEL: &str = "overlay_kernel_unavailable";
+
+/// The exact K2 shape: no userspace-identity edge, one confirmation, the
+/// named loss on this pid and nothing else.
+fn k2_assert_loss(out: &SweepAttribution, pid: u32, what: &str) -> Result<(), String> {
+    if !out.members.is_empty() {
+        return Err(format!(
+            "k2 {what}: userspace identity joined: {:?}",
+            out.members
+        ));
+    }
+    if out.probed != 1 {
+        return Err(format!("k2 {what}: probed {} not 1", out.probed));
+    }
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    if labels != [K2_LOSS_LABEL] {
+        return Err(format!(
+            "k2 {what}: losses {labels:?} member {:?}",
+            out.member_losses
+        ));
+    }
+    if !out.member_losses.contains_key(&pid) {
+        return Err(format!(
+            "k2 {what}: the loss names no pid {pid}: {:?}",
+            out.member_losses
+        ));
+    }
+    Ok(())
+}
+
+/// The exact named-mismatch shape (unstable xino-off rendering): no edge,
+/// one confirmation, `identity_mismatch` and nothing else.
+fn k2_assert_mismatch(out: &SweepAttribution, what: &str) -> Result<(), String> {
+    if !out.members.is_empty()
+        || out.losses != BTreeMap::from([(AttributionLoss::IdentityMismatch, 1)])
+        || out.probed != 1
+    {
+        return Err(format!(
+            "k2 {what}: expected named mismatch, members {:?} losses {:?} probed {}",
+            out.members.iter().map(|m| m.pid).collect::<Vec<_>>(),
+            out.losses,
+            out.probed
+        ));
+    }
+    Ok(())
+}
+
+/// The exact edge shape: this pid attributed to the row key, no losses.
+fn k2_assert_edge(
+    out: &SweepAttribution,
+    pid: u32,
+    key: ObjectKey,
+    what: &str,
+) -> Result<(), String> {
+    let members: Vec<u32> = out.members.iter().map(|member| member.pid).collect();
+    if members != [pid] {
+        return Err(format!(
+            "k2 {what}: expected edge for {pid}, members {members:?} losses {:?} probed {}",
+            out.losses, out.probed
+        ));
+    }
+    if !out.losses.is_empty() {
+        return Err(format!("k2 {what}: edge with losses {:?}", out.losses));
+    }
+    if out.probed != 1 {
+        return Err(format!("k2 {what}: edge with probed {}", out.probed));
+    }
+    let keys: Vec<ObjectKey> = out.members[0].objects.iter().map(|o| o.key).collect();
+    if keys != [key] {
+        return Err(format!("k2 {what}: edge for {keys:?}, row key is {key:?}"));
+    }
+    Ok(())
+}
+
+/// The exact no-candidate shape: the key never appears, so nothing
+/// confirms and nothing is lost.
+fn k2_assert_no_candidate(out: &SweepAttribution, what: &str) -> Result<(), String> {
+    if !out.members.is_empty() || out.probed != 0 || !out.losses.is_empty() {
+        return Err(format!(
+            "k2 {what}: expected no candidate, members {:?} losses {:?} probed {}",
+            out.members.iter().map(|m| m.pid).collect::<Vec<_>>(),
+            out.losses,
+            out.probed
+        ));
+    }
+    Ok(())
+}
+
+/// K2 sweep-side no-fallback (privileged): over real loop-overlay
+/// fixtures, the sweep never joins on userspace identity for the overlay
+/// key. Stale-lower row: the userspace leg yields the exact named loss
+/// (lane B) or finds no candidate (lane A, where the stale key already
+/// differs); the kernel leg reports the stale mapping as another file
+/// (lane B) or does not run (lane A). Fresh-upper row: the kernel leg
+/// edges exactly on both lanes; the userspace leg yields the exact named
+/// loss wherever the key renders overlay (lane B always; lane A only off
+/// the N4 backing branch, where the key is its file's identity and both
+/// legs edge without proof). A userspace-identity edge for an overlay key
+/// anywhere, or a refused fresh kernel edge, fails the cell.
+#[test]
+#[ignore = "root: loop overlay mounts drive the sweep-side overlay no-fallback"]
+fn privileged_k2_sweep_overlay_no_fallback() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    let btf = aya::Btf::from_sys_fs().expect("readable host BTF");
+    let probe_dir = tempfile::tempdir().unwrap();
+    let mut session =
+        crate::discovery::kernel_identity::IdentitySession::probe_and_load(&btf, probe_dir.path())
+            .expect("strict-loaded kernel session; no refused/fallback positive");
+    let mut generation = 0u64;
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        k2_sweep_stale_row(work.path(), mode, lane, &mut session, &mut generation)
+            .unwrap_or_else(|error| panic!("mode {mode:?} stale: {error}"));
+        k2_sweep_fresh_row(work.path(), mode, lane, &mut session, &mut generation)
+            .unwrap_or_else(|error| panic!("mode {mode:?} fresh: {error}"));
+    }
+    eprintln!("K2_SWEEP lane={lane:?} modes=on,off,same-fs verdict=no-fallback");
+}
+
+/// One stale-lower sweep row over a fresh fixture: the target maps before
+/// the copy-up and keeps running the lower file while the observer holds
+/// the fresh upper file under the fresh key.
+#[allow(clippy::too_many_lines)]
+fn k2_sweep_stale_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: &mut u64,
+) -> Result<(), String> {
+    eprintln!("K2_SWEEP start mode={mode:?} row=stale-lower lane={lane:?}");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE1u8; 8192])
+        .map_err(|error| format!("k2 stale lower write: {error}"))?;
+    let xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    let stale = SwapChild::spawn(&merged);
+    let t_line = find_line(&stale.maps(), target_range(&stale), *b"r-xp")?;
+    let stale_key = ObjectKey::of(&t_line);
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    let held_file =
+        std::fs::File::open(&merged).map_err(|error| format!("k2 stale held open: {error}"))?;
+    let held = crate::discovery::identity::self_mapped_file(&held_file)
+        .map_err(|error| format!("k2 stale held identity: {error}"))?;
+    if held.fs_magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC) {
+        return Err(format!("k2 stale held file is not on overlayfs: {held:?}"));
+    }
+    let anchor = SwapChild::spawn(&merged);
+    let a_line = find_line(&anchor.maps(), anchor_range(&anchor), *b"r-xp")?;
+    // The index models the pinned fresh file under the fresh key.
+    let key = ObjectKey::of(&a_line);
+    match lane {
+        OverlayLane::B if key != stale_key => {
+            return Err("k2 stale lane-B premise broken: anchor key moved across copy-up".into());
+        }
+        OverlayLane::A if key == stale_key => {
+            return Err("k2 stale lane-A premise broken: anchor key equals the stale key".into());
+        }
+        _ => {}
+    }
+    let (pins, object) = overlay_pin(&merged, key)?;
+    let index = overlay_index(key, object, &pins);
+    let pid = stale.pid as u32;
+    let t_range = target_range(&stale);
+    let stable = if mode == XinoMode::Off {
+        Some(map_files_stable(pid, t_range)?)
+    } else {
+        None
+    };
+    let t_truth = record_truth(
+        pid,
+        t_range,
+        &held_file,
+        &fixture.lower_path("lib.so"),
+        xino.clone(),
+        stable,
+    )?;
+    let a_truth = record_truth(
+        anchor.pid as u32,
+        anchor_range(&anchor),
+        &held_file,
+        &fixture.upper_path("lib.so"),
+        xino,
+        None,
+    )?;
+    if held.identity != a_truth.map_files_identity() {
+        return Err(format!(
+            "k2 stale held file is not the current upper file: held {:?} vs upper {:?}",
+            held.identity,
+            a_truth.map_files_identity()
+        ));
+    }
+    let branch = takes_identity_key_branch(&t_truth, &a_truth);
+    let userspace = d4_overlay_attribute_pid(pid, stale.maps(), &index);
+    match lane {
+        OverlayLane::B => {
+            if branch {
+                return Err("unexpected backing rendering on lane B".into());
+            }
+            // Non-vacuous: the named loss is asserted only where userspace
+            // identity agrees (else the honest outcome is a mismatch).
+            if stable != Some(false) && held.identity != t_truth.map_files_identity() {
+                return Err(format!(
+                    "k2 stale premise broken: expected agreeing userspace identity: {:?} vs {:?}",
+                    held.identity,
+                    t_truth.map_files_identity()
+                ));
+            }
+            if stable == Some(false) {
+                k2_assert_mismatch(&userspace, "stale userspace (unstable)")?;
+            } else {
+                k2_assert_loss(&userspace, pid, "stale userspace")?;
+            }
+            *generation += 1;
+            let (kernel, _) = d4_overlay_kernel_attribution_for_pid(
+                pid,
+                stale.maps(),
+                &pins,
+                object,
+                key,
+                session,
+                *generation,
+            );
+            k2_assert_mismatch(&kernel, "stale kernel")?;
+        }
+        OverlayLane::A => {
+            k2_assert_no_candidate(&userspace, "stale userspace")?;
+            *generation += 1;
+            let (kernel, _) = d4_overlay_kernel_no_run_for_pid(
+                pid,
+                stale.maps(),
+                &pins,
+                object,
+                key,
+                session,
+                *generation,
+                branch,
+            );
+            k2_assert_no_candidate(&kernel, "stale kernel")?;
+        }
+    }
+    eprintln!(
+        "K2_SWEEP mode={mode:?} row=stale-lower lane={lane:?} verdict=refuse target-{}",
+        truth_verdict(&t_truth)
+    );
+    Ok(())
+}
+
+/// One fresh-upper sweep row over a fresh fixture: the target maps the
+/// current upper file after the copy-up; the observer holds the same file.
+#[allow(clippy::too_many_lines)]
+fn k2_sweep_fresh_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+    session: &mut crate::discovery::kernel_identity::IdentitySession,
+    generation: &mut u64,
+) -> Result<(), String> {
+    eprintln!("K2_SWEEP start mode={mode:?} row=fresh-upper lane={lane:?}");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE2u8; 8192])
+        .map_err(|error| format!("k2 fresh lower write: {error}"))?;
+    let xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    let anchor = SwapChild::spawn(&merged);
+    let target = SwapChild::spawn(&merged);
+    let a_line = find_line(&anchor.maps(), anchor_range(&anchor), *b"r-xp")?;
+    let t_line = find_line(&target.maps(), target_range(&target), *b"r-xp")?;
+    let key = ObjectKey::of(&a_line);
+    if ObjectKey::of(&t_line) != key {
+        return Err("k2 fresh premise broken: target key differs from the anchor key".into());
+    }
+    let held_file =
+        std::fs::File::open(&merged).map_err(|error| format!("k2 fresh held open: {error}"))?;
+    let held = crate::discovery::identity::self_mapped_file(&held_file)
+        .map_err(|error| format!("k2 fresh held identity: {error}"))?;
+    if held.fs_magic != Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC) {
+        return Err(format!("k2 fresh held file is not on overlayfs: {held:?}"));
+    }
+    let (pins, object) = overlay_pin(&merged, key)?;
+    let index = overlay_index(key, object, &pins);
+    let pid = target.pid as u32;
+    let t_range = target_range(&target);
+    let stable = if mode == XinoMode::Off {
+        Some(map_files_stable(pid, t_range)?)
+    } else {
+        None
+    };
+    let backing = fixture.upper_path("lib.so");
+    let a_truth = record_truth(
+        anchor.pid as u32,
+        anchor_range(&anchor),
+        &held_file,
+        &backing,
+        xino.clone(),
+        None,
+    )?;
+    let t_truth = record_truth(pid, t_range, &held_file, &backing, xino, stable)?;
+    if held.identity != a_truth.map_files_identity() {
+        return Err(format!(
+            "k2 fresh held file is not the current upper file: held {:?} vs upper {:?}",
+            held.identity,
+            a_truth.map_files_identity()
+        ));
+    }
+    let branch = takes_identity_key_branch(&t_truth, &a_truth);
+    // N4: backing rendering on lane A makes the key its file's identity,
+    // so both legs edge without proof (K2 does not apply to the ext4 key).
+    let n4 = lane == OverlayLane::A && branch;
+    if lane == OverlayLane::B && branch {
+        return Err("unexpected backing rendering on lane B".into());
+    }
+    let userspace = d4_overlay_attribute_pid(pid, target.maps(), &index);
+    if n4 {
+        if index.map_files_keys().contains(&key) {
+            return Err("k2 fresh N4 premise broken: identity key needs no per-range proof".into());
+        }
+        k2_assert_edge(&userspace, pid, key, "fresh userspace (N4)")?;
+        *generation += 1;
+        let (kernel, _) = d4_overlay_kernel_identity_key_for_pid(
+            pid,
+            target.maps(),
+            &pins,
+            object,
+            key,
+            session,
+            *generation,
+        );
+        k2_assert_edge(&kernel, pid, key, "fresh kernel (N4)")?;
+    } else {
+        if !index.map_files_keys().contains(&key) {
+            return Err("k2 fresh premise broken: overlay key needs per-range proof".into());
+        }
+        if stable != Some(false) && held.identity != t_truth.map_files_identity() {
+            return Err(format!(
+                "k2 fresh premise broken: expected agreeing userspace identity: {:?} vs {:?}",
+                held.identity,
+                t_truth.map_files_identity()
+            ));
+        }
+        if stable == Some(false) {
+            k2_assert_mismatch(&userspace, "fresh userspace (unstable)")?;
+        } else {
+            k2_assert_loss(&userspace, pid, "fresh userspace")?;
+        }
+        *generation += 1;
+        let (kernel, _) = d4_overlay_kernel_attribution_for_pid(
+            pid,
+            target.maps(),
+            &pins,
+            object,
+            key,
+            session,
+            *generation,
+        );
+        k2_assert_edge(&kernel, pid, key, "fresh kernel")?;
+    }
+    eprintln!(
+        "K2_SWEEP mode={mode:?} row=fresh-upper lane={lane:?} verdict={} target-{}",
+        if n4 { "N4-edge" } else { "join" },
+        truth_verdict(&t_truth)
     );
     Ok(())
 }

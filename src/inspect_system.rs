@@ -3456,7 +3456,7 @@ fn map_live_load_error(error: crate::attach::identity_iter::LoadError) -> Identi
 /// construction: atomic 0700 creation (never adopt a pre-existing
 /// path), an owned-uid check, and cleanup restricted to the created
 /// directory's identity (device + inode).
-struct ProbeDir {
+pub(crate) struct ProbeDir {
     path: std::path::PathBuf,
     uid: u32,
     dev: libc::dev_t,
@@ -3468,7 +3468,13 @@ struct ProbeDir {
 }
 
 impl ProbeDir {
-    fn create() -> Result<Self, IdentityUnavailable> {
+    /// A fresh unpredictable 0700 probe dir under the temp dir, named
+    /// `{prefix}-…`. The prefix is one plain segment: anything that could
+    /// escape the temp dir fails closed instead of joining.
+    pub(crate) fn create(prefix: &str) -> Result<Self, IdentityUnavailable> {
+        if prefix.is_empty() || prefix.contains('/') || prefix.contains('\0') {
+            return Err(IdentityUnavailable::ProbeFailed);
+        }
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Unpredictable as well as unique: a local squatter cannot
@@ -3482,10 +3488,14 @@ impl ProbeDir {
             hasher.finish()
         };
         let path = std::env::temp_dir().join(format!(
-            "p11scope-identity-probe-{}-{id}-{random:016x}",
+            "{prefix}-{}-{id}-{random:016x}",
             std::process::id()
         ));
         Self::create_at(&path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     fn create_at(path: &std::path::Path) -> Result<Self, IdentityUnavailable> {
@@ -3624,7 +3634,7 @@ fn live_create_session()
     crate::attach::identity_iter::ensure_kernel_identity_btf()
         .map_err(IdentityUnavailable::from_kernel_deny)?;
     let parsed = aya::Btf::from_sys_fs().map_err(|_| IdentityUnavailable::NoBtf)?;
-    let dir = ProbeDir::create()?;
+    let dir = ProbeDir::create("p11scope-identity-probe")?;
     match crate::discovery::kernel_identity::IdentitySession::probe_and_load(&parsed, &dir.path) {
         Ok(session) => Ok(session),
         Err("identity functional probe failed") => Err(IdentityUnavailable::ProbeFailed),
@@ -3932,10 +3942,18 @@ impl<P: crate::discovery::confirm_shards::SegmentProof>
         resources: &IoResources,
     ) -> crate::discovery::kernel_identity::ProofDecision<'r> {
         let decision = self.inner.prove(batch, budget, resources);
-        if let crate::discovery::kernel_identity::ProofDecision::Userspace(reason) = &decision
+        let fallback = match &decision {
+            crate::discovery::kernel_identity::ProofDecision::Userspace(reason)
+            | crate::discovery::kernel_identity::ProofDecision::UserspaceExceptOverlay {
+                reason,
+                ..
+            } => Some(crate::discovery::kernel_identity::KernelFallbackReason::from(*reason)),
+            crate::discovery::kernel_identity::ProofDecision::Kernel(_) => None,
+        };
+        if let Some(reason) = fallback
             && self.first_fallback.get().is_none()
         {
-            self.first_fallback.set(Some((*reason).into()));
+            self.first_fallback.set(Some(reason));
         }
         decision
     }
@@ -4956,9 +4974,20 @@ mod tests {
     /// Fresh probe dirs are unique per call.
     #[test]
     fn probe_dir_names_are_unique() {
-        let first = ProbeDir::create().expect("first probe dir");
-        let second = ProbeDir::create().expect("second probe dir");
+        let first = ProbeDir::create("p11scope-identity-probe").expect("first probe dir");
+        let second = ProbeDir::create("p11scope-identity-probe").expect("second probe dir");
         assert_ne!(first.path, second.path, "probe dir names collided");
+        assert!(
+            first.path().file_name().is_some_and(|name| name
+                .to_string_lossy()
+                .starts_with("p11scope-identity-probe-")),
+            "probe dir name lost its prefix: {}",
+            first.path().display()
+        );
+        assert!(
+            ProbeDir::create("../escape").is_err() && ProbeDir::create("").is_err(),
+            "a hostile prefix must fail closed"
+        );
     }
 
     /// D3d: sanitization — raw deny/probe detail never reaches labels;
@@ -6148,7 +6177,7 @@ mod tests {
             fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
                 Ok(MappedFile {
                     identity: PROVIDER_FILE,
-                    fs_magic: None,
+                    fs_magic: Some(0x01021994),
                 })
             }
         }
@@ -8106,7 +8135,7 @@ mod d3a_adapter_tests {
         fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
             Ok(MappedFile {
                 identity: FileIdentity { dev: 37, ino: 7001 },
-                fs_magic: None,
+                fs_magic: Some(0x01021994),
             })
         }
     }

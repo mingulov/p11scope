@@ -633,7 +633,10 @@ non-null values needs a new allowlist row.
   key is another file —, `map_files_unavailable` — the proof could not
   be read for lack of privilege —, `mapping_changed` — a range read
   inside the confirmation's pin was no longer one mapping when its
-  `map_files` entry was read, an unmap or remap during the read) and name a matched caller that also
+  `map_files` entry was read, an unmap or remap during the read —,
+  `overlay_kernel_unavailable` — the key needs the kernel proof
+  (overlayfs or an unproven filesystem) and its run was unavailable, so
+  no userspace fallback) and name a matched caller that also
   maps shared objects no deep scan examined. A shared object counts as
   examined only where a complete deep scan's own maps read opened it
   and found no provider, and the other process's executable ranges are

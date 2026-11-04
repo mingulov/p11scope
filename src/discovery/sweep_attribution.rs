@@ -99,10 +99,14 @@ pub(crate) enum AttributionLoss {
     /// `map_files` entry was read (unmapped or remapped during the
     /// confirmation): the proof is impossible this pass, not unprivileged.
     MappingChanged,
+    /// The key needs the kernel proof (overlayfs or an unproven
+    /// filesystem) and its kernel run was unavailable: no userspace
+    /// `(dev, ino)` fallback, never an edge.
+    OverlayKernelUnavailable,
 }
 
 impl AttributionLoss {
-    pub(crate) const ALL: [AttributionLoss; 11] = [
+    pub(crate) const ALL: [AttributionLoss; 12] = [
         Self::GenerationChanged,
         Self::ExecChanged,
         Self::ConfirmUnreadable,
@@ -114,6 +118,7 @@ impl AttributionLoss {
         Self::IdentityMismatch,
         Self::MapFilesUnavailable,
         Self::MappingChanged,
+        Self::OverlayKernelUnavailable,
     ];
 
     /// Stable category label (`scan.attribution_losses` keys).
@@ -130,6 +135,7 @@ impl AttributionLoss {
             Self::IdentityMismatch => "identity_mismatch",
             Self::MapFilesUnavailable => "map_files_unavailable",
             Self::MappingChanged => "mapping_changed",
+            Self::OverlayKernelUnavailable => "overlay_kernel_unavailable",
         }
     }
 }
@@ -201,6 +207,11 @@ pub(crate) struct KnownKeyIndex {
     /// allowlisted filesystem: any range under them is that file, so they
     /// skip the per-range `map_files` stat (DR-C1b-3).
     identity_keys: BTreeSet<ObjectKey>,
+    /// Match keys whose held file sits on overlayfs or an unproven
+    /// filesystem ([`MappedFile::is_overlay_or_unproven`], from the same
+    /// `statfs` the index already reads — no new read): the sweep never
+    /// falls back to userspace identity for them. Never an identity key.
+    overlay_keys: BTreeSet<ObjectKey>,
     /// Optional per-pass anchor equivalence classes. Only validated anchor
     /// aliases may be installed by a future proof adapter.
     match_slots: BTreeMap<ObjectKey, BTreeSet<Slot>>,
@@ -258,6 +269,9 @@ impl KnownKeyIndex {
                 Ok(mapped) => {
                     if mapped.key_is_identity(*key) {
                         index.identity_keys.insert(*key);
+                    }
+                    if mapped.is_overlay_or_unproven() {
+                        index.overlay_keys.insert(*key);
                     }
                     index.by_key.insert(*key, (object, mapped.identity));
                 }
@@ -340,6 +354,18 @@ impl KnownKeyIndex {
         self.identity_keys.contains(&key)
     }
 
+    /// Whether `key` needs the kernel proof: overlayfs or an unproven
+    /// filesystem, so userspace identity never proves it.
+    pub(crate) fn is_overlay_key(&self, key: ObjectKey) -> bool {
+        self.overlay_keys.contains(&key)
+    }
+
+    /// The match keys that need the kernel proof, for the ladder's
+    /// no-fallback refusal.
+    pub(crate) fn overlay_keys(&self) -> &BTreeSet<ObjectKey> {
+        &self.overlay_keys
+    }
+
     fn match_identity(&self, key: ObjectKey) -> Option<FileIdentity> {
         self.by_key.get(&key).map(|(_, identity)| *identity)
     }
@@ -371,6 +397,11 @@ pub(crate) enum RangeProof {
     KernelNone,
     NotMapped,
     Unavailable(String),
+    /// The kernel run was unavailable for an overlay key, so the ladder
+    /// refused the userspace proof without reading it: never an edge.
+    /// Distinct from [`RangeProof::Unavailable`] (a read was attempted and
+    /// failed), which keeps its own loss even for overlay keys.
+    OverlayRefused,
 }
 
 impl From<Result<FileIdentity, String>> for RangeProof {
@@ -598,16 +629,32 @@ fn classify_snapshot<'a>(index: &KnownKeyIndex, entries: &'a [MapEntry]) -> Clas
 }
 
 /// Whether every range of a matched group (its caller ranges: see
-/// [`is_caller_range`]) is the held object's file.
+/// [`is_caller_range`]) is the held object's file. `overlay` marks a key
+/// that needs the kernel proof: agreeing userspace identity still refuses
+/// with the named loss (a stale overlay mapping keeps the fresh upper
+/// `(dev, ino)`), and so does a ladder refusal marker.
 fn prove_match(
     expected: FileIdentity,
     slots: Option<&BTreeSet<Slot>>,
     group: &[&MapEntry],
     mapped: &MappedIdentities,
+    overlay: bool,
 ) -> Result<(), (AttributionLoss, String)> {
     for entry in group {
         match mapped.get(&(entry.start, entry.end)) {
-            Some(RangeProof::MapFiles(identity)) if *identity == expected => {}
+            Some(RangeProof::MapFiles(identity)) if *identity == expected => {
+                if overlay {
+                    return Err((
+                        AttributionLoss::OverlayKernelUnavailable,
+                        format!(
+                            "the range {:x}-{:x} matches the pinned object by userspace \
+                             identity, but the key needs the kernel proof (overlayfs or an \
+                             unproven filesystem): no userspace fallback",
+                            entry.start, entry.end
+                        ),
+                    ));
+                }
+            }
             Some(RangeProof::Kernel(slot)) if slots.is_some_and(|slots| slots.contains(slot)) => {}
             Some(RangeProof::MapFiles(identity)) => {
                 return Err((
@@ -648,6 +695,16 @@ fn prove_match(
                     AttributionLoss::MapFilesUnavailable,
                     format!(
                         "the map_files identity of {:x}-{:x} could not be read: {error}",
+                        entry.start, entry.end
+                    ),
+                ));
+            }
+            Some(RangeProof::OverlayRefused) => {
+                return Err((
+                    AttributionLoss::OverlayKernelUnavailable,
+                    format!(
+                        "the range {:x}-{:x} needs the kernel proof (overlayfs or an \
+                         unproven filesystem) and its run was unavailable",
                         entry.start, entry.end
                     ),
                 ));
@@ -825,9 +882,13 @@ pub(crate) fn attribute_one(
     for (key, object, group) in &confirmed.matches {
         let proven = match index.match_identity(*key) {
             Some(_) if index.key_is_identity(*key) => Ok(()),
-            Some(expected) => {
-                prove_match(expected, index.match_slots.get(key), group, &read.mapped)
-            }
+            Some(expected) => prove_match(
+                expected,
+                index.match_slots.get(key),
+                group,
+                &read.mapped,
+                index.is_overlay_key(*key),
+            ),
             None => Err((
                 AttributionLoss::KeyRejected,
                 "the key lost its proof".into(),

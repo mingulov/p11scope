@@ -101,9 +101,12 @@ struct Checks {
     changed: BTreeSet<PinnedObjectId>,
     checked: RefCell<Vec<PinnedObjectId>>,
     identities: BTreeMap<PinnedObjectId, Result<FileIdentity, String>>,
-    /// The filesystem magic of an object's self-mapping (default: none
-    /// read, so every key keeps the per-range proof).
-    fs_magic: BTreeMap<PinnedObjectId, u64>,
+    /// The filesystem magic of an object's self-mapping: absent means an
+    /// ordinary non-allowlisted filesystem (tmpfs), so existing keys keep
+    /// their per-range proof and userspace fallback; `None` entries script
+    /// an unproven filesystem, which refuses the userspace fallback like
+    /// overlayfs.
+    fs_magic: BTreeMap<PinnedObjectId, Option<u64>>,
 }
 
 impl ObjectChecks for Checks {
@@ -124,7 +127,11 @@ impl ObjectChecks for Checks {
             .unwrap_or(Ok(vm_file(PROVIDER)))?;
         Ok(MappedFile {
             identity,
-            fs_magic: self.fs_magic.get(&object).copied(),
+            fs_magic: self
+                .fs_magic
+                .get(&object)
+                .copied()
+                .unwrap_or(Some(0x01021994)),
         })
     }
 }
@@ -860,6 +867,7 @@ fn loss_labels_are_stable_and_distinct() {
     assert_eq!(labels.len(), AttributionLoss::ALL.len());
     assert!(labels.contains("deleted_mapping"));
     assert!(labels.contains("inode_not_unique"));
+    assert!(labels.contains("overlay_kernel_unavailable"));
 }
 
 // ---- Review fix (Critical 1): a maps key is not one file ----
@@ -1250,7 +1258,7 @@ fn an_identity_key_skips_the_range_proof_only_on_an_allowlisted_filesystem() {
     let sweep = vec![(10_001, provider_caller())];
     let checks_on = |magic| Checks {
         identities: BTreeMap::from([(OBJECT, Ok(key_device_identity(PROVIDER)))]),
-        fs_magic: BTreeMap::from([(OBJECT, magic)]),
+        fs_magic: BTreeMap::from([(OBJECT, Some(magic))]),
         ..Checks::default()
     };
 
@@ -1284,7 +1292,7 @@ fn an_identity_key_skips_the_range_proof_only_on_an_allowlisted_filesystem() {
     // On ext4 but the identity is not the key (btrfs-style anon device):
     // still proves.
     let other = Checks {
-        fs_magic: BTreeMap::from([(OBJECT, EXT4_MAGIC)]),
+        fs_magic: BTreeMap::from([(OBJECT, Some(EXT4_MAGIC))]),
         ..Checks::default()
     };
     let index = provider_index(&other);
@@ -1967,7 +1975,7 @@ fn index_binding(key: ObjectKey, identity: FileIdentity, magic: Option<u64>) -> 
     let checks = Checks {
         identities: BTreeMap::from([(OBJECT, Ok(identity))]),
         fs_magic: magic
-            .map(|magic| BTreeMap::from([(OBJECT, magic)]))
+            .map(|magic| BTreeMap::from([(OBJECT, Some(magic))]))
             .unwrap_or_default(),
         ..Checks::default()
     };
@@ -8153,12 +8161,162 @@ fn k1_sweep_userspace_identity_equality_joins() {
     let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
     let mapped =
         MappedIdentities::from([((entry.start, entry.end), RangeProof::MapFiles(expected))]);
-    prove_match(expected, None, &[&entry], &mapped).expect("equal userspace identity joins");
+    prove_match(expected, None, &[&entry], &mapped, false).expect("equal userspace identity joins");
     let other = FileIdentity { dev: 42, ino: 9 };
     let mapped = MappedIdentities::from([((entry.start, entry.end), RangeProof::MapFiles(other))]);
-    let (loss, _) =
-        prove_match(expected, None, &[&entry], &mapped).expect_err("unequal identity refuses");
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, false)
+        .expect_err("unequal identity refuses");
     assert_eq!(loss, AttributionLoss::IdentityMismatch);
+}
+
+/// K2 RED (R1a): an overlay key whose kernel run is unavailable (here: the
+/// pure-userspace sweep, which never runs the kernel) yields the named
+/// loss, never a userspace-identity edge — even when the identities agree.
+#[test]
+fn k2_sweep_overlay_userspace_equality_refuses() {
+    let checks = Checks {
+        fs_magic: BTreeMap::from([(
+            OBJECT,
+            Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+        )]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = [(1001u32, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(out.probed, 1, "the confirm still runs; the prove refuses");
+    assert!(
+        out.members.is_empty(),
+        "overlay userspace equality joined: {:?}",
+        out.members
+    );
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        out.member_losses
+    );
+}
+
+/// K2: the prove step refuses agreeing userspace identity and ladder
+/// refusal markers for overlay keys with the named loss, keeps the
+/// read-failure loss for genuinely unreadable proofs, and still joins on
+/// the kernel proof.
+#[test]
+fn k2_prove_match_overlay_refuses_userspace_joins_kernel() {
+    let expected = FileIdentity { dev: 42, ino: 7 };
+    let entry = mapping(0x7f00_0000, b"r-xp", 7, "/opt/prov.so");
+    let range = (entry.start, entry.end);
+    let mapped = MappedIdentities::from([(range, RangeProof::MapFiles(expected))]);
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, true)
+        .expect_err("overlay userspace equality refuses");
+    assert_eq!(loss, AttributionLoss::OverlayKernelUnavailable);
+    let mapped = MappedIdentities::from([(range, RangeProof::OverlayRefused)]);
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, true)
+        .expect_err("overlay refusal marker refuses");
+    assert_eq!(loss, AttributionLoss::OverlayKernelUnavailable);
+    let slots = BTreeSet::from([Slot(0)]);
+    let mapped = MappedIdentities::from([(range, RangeProof::Kernel(Slot(0)))]);
+    prove_match(expected, Some(&slots), &[&entry], &mapped, true)
+        .expect("overlay kernel proof joins");
+    let mapped = MappedIdentities::from([(range, RangeProof::Unavailable("denied".into()))]);
+    let (loss, _) = prove_match(expected, None, &[&entry], &mapped, true)
+        .expect_err("overlay read failure refuses");
+    assert_eq!(loss, AttributionLoss::MapFilesUnavailable);
+}
+
+/// K2 RED (R1b): an unproven filesystem (`statfs` unreadable) refuses
+/// like overlayfs — fail closed, matching the deep-scan witness rule.
+#[test]
+fn k2_sweep_unproven_fs_magic_refuses() {
+    let checks = Checks {
+        fs_magic: BTreeMap::from([(OBJECT, None)]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = [(1001u32, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(out.probed, 1, "the confirm still runs; the prove refuses");
+    assert!(
+        out.members.is_empty(),
+        "unproven userspace equality joined: {:?}",
+        out.members
+    );
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        out.member_losses
+    );
+}
+
+/// K2 control: a non-overlay key keeps today's userspace fallback edge.
+#[test]
+fn k2_sweep_non_overlay_userspace_equality_still_joins() {
+    let checks = Checks {
+        fs_magic: BTreeMap::from([(OBJECT, Some(EXT4_MAGIC))]),
+        ..Checks::default()
+    };
+    let index = provider_index(&checks);
+    let sweep = [(1001u32, provider_caller())];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    let pids: Vec<u32> = out.members.iter().map(|member| member.pid).collect();
+    assert_eq!(pids, [1001]);
+    assert!(out.losses.is_empty(), "{:?}", out.member_losses);
+}
+
+/// K2 RED (R1a): refusal is per key, not per process — one caller mapping
+/// an overlay provider and a plain provider keeps the plain edge while the
+/// overlay key yields the named loss.
+#[test]
+fn k2_sweep_mixed_overlay_and_plain_keys_split() {
+    const PLAIN_OBJECT: PinnedObjectId = PinnedObjectId(9);
+    const OVERLAY_INO: u64 = 7_101;
+    const PLAIN_INO: u64 = 7_102;
+    let mut entries = object(0x1000_0000, OVERLAY_INO, "/opt/overlay.so");
+    entries.extend(object(0x2000_0000, PLAIN_INO, "/opt/plain.so"));
+    let checks = Checks {
+        identities: BTreeMap::from([
+            (OBJECT, Ok(vm_file(OVERLAY_INO))),
+            (PLAIN_OBJECT, Ok(vm_file(PLAIN_INO))),
+        ]),
+        fs_magic: BTreeMap::from([
+            (
+                OBJECT,
+                Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+            ),
+            (PLAIN_OBJECT, Some(EXT4_MAGIC)),
+        ]),
+        ..Checks::default()
+    };
+    let index = KnownKeyIndex::build(
+        [
+            (key(OVERLAY_INO), Some(OBJECT)),
+            (key(PLAIN_INO), Some(PLAIN_OBJECT)),
+        ],
+        &BTreeMap::from([(key(OVERLAY_INO), OBJECT), (key(PLAIN_INO), PLAIN_OBJECT)]),
+        [],
+        &checks,
+    )
+    .0;
+    let sweep = [(1001u32, entries)];
+    let mut probe = Probe::over(&sweep);
+    let out = run(&sweep, &BTreeSet::new(), &index, &mut probe);
+    assert_eq!(out.members.len(), 1, "{:?}", out.member_losses);
+    let keys: Vec<ObjectKey> = out.members[0].objects.iter().map(|o| o.key).collect();
+    assert_eq!(keys, [key(PLAIN_INO)], "{:?}", out.member_losses);
+    let labels: Vec<&str> = out.losses.keys().map(|loss| loss.label()).collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        out.member_losses
+    );
 }
 
 /// K2 (witness): every userspace proof entry point refuses with the

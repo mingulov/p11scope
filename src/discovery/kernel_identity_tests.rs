@@ -1220,7 +1220,7 @@ impl ConfirmIo for AdapterIo {
     }
 }
 
-struct AdapterChecks(FileIdentity);
+struct AdapterChecks(FileIdentity, Option<u64>);
 impl super::super::sweep_attribution::ObjectChecks for AdapterChecks {
     fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
         Ok(None)
@@ -1234,7 +1234,7 @@ impl super::super::sweep_attribution::ObjectChecks for AdapterChecks {
     ) -> Result<super::super::identity::MappedFile, String> {
         Ok(super::super::identity::MappedFile {
             identity: self.0,
-            fs_magic: None,
+            fs_magic: self.1,
         })
     }
 }
@@ -1330,7 +1330,7 @@ fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
         [(examined.key, Some(id))],
         &BTreeMap::from([(examined.key, id)]),
         [],
-        &AdapterChecks(examined.identity),
+        &AdapterChecks(examined.identity, Some(0x01021994)),
     );
     assert!(refused.is_empty());
     let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
@@ -1791,7 +1791,7 @@ fn d3c_successive_pass_same_slot_different_file_clears_old_kernel_authority() {
             [(old.key, Some(id))],
             &BTreeMap::from([(old.key, id)]),
             [new, missing],
-            &AdapterChecks(old.identity),
+            &AdapterChecks(old.identity, Some(0x01021994)),
         );
         assert!(refused.is_empty());
         let mut session = fixture_session();
@@ -2105,7 +2105,7 @@ fn segment_cell(
     headroom: usize,
     steps: Vec<FixtureTarget>,
 ) -> SegmentObservation {
-    segment_cell_with_deadline(pids, headroom, steps, None, None)
+    segment_cell_with_deadline(pids, headroom, steps, None, None, Some(0x01021994))
 }
 
 struct ExpireAfterPositive<'h, H> {
@@ -2144,6 +2144,7 @@ fn segment_cell_with_deadline(
     steps: Vec<FixtureTarget>,
     expire_on: Option<usize>,
     threshold: Option<usize>,
+    magic: Option<u64>,
 ) -> SegmentObservation {
     let dir = tempfile::tempdir().unwrap();
     let (file, provider) = opened(dir.path(), "provider.so");
@@ -2219,7 +2220,7 @@ fn segment_cell_with_deadline(
         [(provider.key, Some(id))],
         &BTreeMap::from([(provider.key, id)]),
         [examined, missing],
-        &AdapterChecks(provider.identity),
+        &AdapterChecks(provider.identity, magic),
     );
     assert!(refused.is_empty());
     let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
@@ -2462,6 +2463,7 @@ fn d3c_segments_postproof_capture_deadline_discards_current_positive() {
         ],
         Some(2),
         None,
+        Some(0x01021994),
     );
     assert_eq!(
         observation.runs.lock().unwrap().scopes,
@@ -2583,17 +2585,26 @@ fn d3c_fallback_counts_distinct_passes_pids_keys() {
 fn d3c_proof_selection_threshold_and_labels() {
     assert_eq!(AUTO_KERNEL_PROOF_PID_THRESHOLD, 2_400);
     assert!(matches!(
-        select_proof_run(2_400, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD)),
+        select_proof_run(2_400, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD), false),
         SegmentSelection::Kernel
     ));
     assert!(matches!(
-        select_proof_run(2_399, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD)),
+        select_proof_run(2_399, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD), false),
         SegmentSelection::Userspace(KernelFallbackReason::BelowThreshold)
     ));
     // Forced kernel bypasses the cost threshold only; resources and run caps
     // are still enforced where the run is attempted.
     assert!(matches!(
-        select_proof_run(1, None),
+        select_proof_run(1, None, false),
+        SegmentSelection::Kernel
+    ));
+    // K2: overlay presence forces the kernel run however small the batch.
+    assert!(matches!(
+        select_proof_run(1, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD), true),
+        SegmentSelection::Kernel
+    ));
+    assert!(matches!(
+        select_proof_run(2_399, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD), true),
         SegmentSelection::Kernel
     ));
     for (reason, label, detail) in [
@@ -2779,7 +2790,7 @@ fn d3c_index(
         [(world.provider.key, Some(world.provider_id))],
         &BTreeMap::from([(world.provider.key, world.provider_id)]),
         [world.examined],
-        &AdapterChecks(world.provider.identity),
+        &AdapterChecks(world.provider.identity, Some(0x01021994)),
     )
 }
 
@@ -3911,6 +3922,7 @@ fn d3c_auto_below_threshold_skips_run_with_actual_fallback() {
         ],
         None,
         Some(2),
+        Some(0x01021994),
     );
     assert_eq!(observation.attempts, 0);
     assert_eq!(observation.failed_target, None);
@@ -3945,6 +3957,105 @@ fn d3c_auto_below_threshold_skips_run_with_actual_fallback() {
             keys: 1,
             first_reason: Some(KernelFallbackReason::BelowThreshold),
         }
+    );
+}
+
+/// K2 RED (R1a): an overlay key below the cost threshold still takes the
+/// kernel run — the threshold arm never diverts it to userspace identity.
+#[test]
+fn k2_ladder_below_threshold_overlay_attempts_kernel() {
+    let observation = segment_cell_with_deadline(
+        &[(6101, vec![0]), (6102, vec![0]), (6103, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[6101], 0)),
+            FixtureTarget::Bytes(segment_target(&[6102], 0)),
+            FixtureTarget::Bytes(segment_target(&[6103], 0)),
+        ],
+        None,
+        Some(2),
+        Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+    );
+    assert!(
+        observation.attempts > 0,
+        "a sub-threshold overlay segment took userspace without a kernel attempt"
+    );
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [6101, 6102, 6103]
+    );
+    assert!(
+        observation.events.lock().unwrap().fallback.is_empty(),
+        "an overlay segment performed userspace range-proof reads"
+    );
+}
+
+/// K2 RED (R1b): an unproven filesystem below the cost threshold takes
+/// the kernel run like an overlay key — fail closed.
+#[test]
+fn k2_ladder_below_threshold_unproven_attempts_kernel() {
+    let observation = segment_cell_with_deadline(
+        &[(6101, vec![0]), (6102, vec![0]), (6103, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[6101], 0)),
+            FixtureTarget::Bytes(segment_target(&[6102], 0)),
+            FixtureTarget::Bytes(segment_target(&[6103], 0)),
+        ],
+        None,
+        Some(2),
+        None,
+    );
+    assert!(
+        observation.attempts > 0,
+        "a sub-threshold unproven segment took userspace without a kernel attempt"
+    );
+    assert!(
+        observation.events.lock().unwrap().fallback.is_empty(),
+        "an unproven segment performed userspace range-proof reads"
+    );
+}
+
+/// K2 RED (R1a): an overlay key whose kernel run fails yields the named
+/// loss, never a userspace-identity edge — and the ladder performs no
+/// userspace range-proof reads for its ranges.
+#[test]
+fn k2_ladder_failed_run_overlay_yields_loss_without_reads() {
+    let mut bad = segment_target(&[5702], 0);
+    bad[0] = 0;
+    let observation = segment_cell_with_deadline(
+        &[(5702, vec![0])],
+        6,
+        vec![FixtureTarget::Bytes(bad)],
+        None,
+        None,
+        Some(p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC),
+    );
+    assert!(
+        observation.out.members.is_empty(),
+        "a failed overlay run joined by userspace fallback: {:?}",
+        observation.out.members
+    );
+    assert!(
+        observation.events.lock().unwrap().fallback.is_empty(),
+        "a failed overlay run performed userspace range-proof reads"
+    );
+    let labels: Vec<&str> = observation
+        .out
+        .losses
+        .keys()
+        .map(|loss| loss.label())
+        .collect();
+    assert_eq!(
+        labels,
+        ["overlay_kernel_unavailable"],
+        "losses: {:?}",
+        observation.out.member_losses
     );
 }
 
@@ -4420,7 +4531,7 @@ fn member_cell(spec: MemberCellSpec) -> MemberObservation {
         [(provider.key, Some(id))],
         &BTreeMap::from([(provider.key, id)]),
         [examined],
-        &AdapterChecks(provider.identity),
+        &AdapterChecks(provider.identity, Some(0x01021994)),
     );
     assert!(refused.is_empty());
     let mut probe = KernelMemberProbe::new(
@@ -5436,6 +5547,7 @@ fn unvisited_and_below_threshold_classified_separately() {
         ],
         None,
         Some(2),
+        Some(0x01021994),
     );
     assert_eq!(below.attempts, 0);
     assert!(

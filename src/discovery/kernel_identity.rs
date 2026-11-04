@@ -766,6 +766,35 @@ fn request_keys(request: &AcceptedRequest<'_>) -> BTreeSet<ObjectKey> {
         .collect()
 }
 
+/// The userspace-refusal map for one request whose kernel run is
+/// unavailable: every range under an overlay key — or under no examined
+/// entry, fail closed — carries
+/// [`super::sweep_attribution::RangeProof::OverlayRefused`] instead of a
+/// userspace read. Empty when the request touches no overlay key.
+fn overlay_refused_ranges(
+    request: &AcceptedRequest<'_>,
+    overlay_keys: &BTreeSet<ObjectKey>,
+) -> MappedIdentities {
+    if overlay_keys.is_empty() {
+        return MappedIdentities::new();
+    }
+    let by_range: BTreeMap<(u64, u64), ObjectKey> = request
+        .entries()
+        .iter()
+        .map(|entry| ((entry.start, entry.end), ObjectKey::of(entry)))
+        .collect();
+    request
+        .ranges()
+        .iter()
+        .filter(|range| {
+            by_range
+                .get(*range)
+                .is_none_or(|key| overlay_keys.contains(key))
+        })
+        .map(|range| (*range, super::sweep_attribution::RangeProof::OverlayRefused))
+        .collect()
+}
+
 /// Session-level failure that persists through subsequent passes: an invalid
 /// target stream, or three consecutive attempted overdue runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -793,10 +822,16 @@ pub(crate) enum SegmentSelection {
 /// counts the segment's charged requests, never the whole sweep. `None` is
 /// forced kernel, which bypasses this cost threshold only: resource, guard,
 /// attempt-cap and run-failure policy still apply where the run is attempted.
+/// `overlay_present` forces the kernel run however small the batch: an
+/// overlay key never takes the userspace-identity fallback.
 pub(crate) fn select_proof_run(
     proof_pids: usize,
     auto_threshold: Option<usize>,
+    overlay_present: bool,
 ) -> SegmentSelection {
+    if overlay_present {
+        return SegmentSelection::Kernel;
+    }
     match auto_threshold {
         Some(threshold) if proof_pids < threshold => {
             SegmentSelection::Userspace(KernelFallbackReason::BelowThreshold)
@@ -826,6 +861,16 @@ pub(crate) struct ValidatedTargetSegment<'r> {
 pub(crate) enum ProofDecision<'r> {
     Kernel(ValidatedTargetSegment<'r>),
     Userspace(RunFailure),
+    /// The kernel run is unavailable for a batch touching overlay keys:
+    /// `refused` holds one per-request map whose overlay ranges carry
+    /// [`super::sweep_attribution::RangeProof::OverlayRefused`] (no
+    /// userspace reads for them); the caller proves the remaining ranges
+    /// from userspace. The ledger already notes `reason`, like
+    /// [`ProofDecision::Userspace`].
+    UserspaceExceptOverlay {
+        reason: RunFailure,
+        refused: Vec<MappedIdentities>,
+    },
 }
 
 impl ProofDecision<'_> {
@@ -840,6 +885,7 @@ impl ProofDecision<'_> {
             {
                 segment.answers.get(position).and_then(Option::as_ref)
             }
+            Self::UserspaceExceptOverlay { refused, .. } => refused.get(position),
             _ => None,
         }
     }
@@ -869,6 +915,10 @@ struct KernelPassProof<'g, 's, 'p> {
     deadline: std::time::Instant,
     eligible_keys: BTreeSet<ObjectKey>,
     auto_threshold: Option<usize>,
+    /// The pass's match keys that need the kernel proof (overlayfs or an
+    /// unproven filesystem): no userspace-identity fallback for their
+    /// ranges anywhere in this ladder.
+    overlay_keys: BTreeSet<ObjectKey>,
 }
 
 struct TargetWorkDeadline {
@@ -949,7 +999,24 @@ impl KernelPassProof<'_, '_, '_> {
             .session
             .fallback
             .note_batch(batch, reason.into());
-        ProofDecision::Userspace(reason)
+        let refused: Vec<MappedIdentities> = batch
+            .requests()
+            .iter()
+            .map(|request| overlay_refused_ranges(request, &self.overlay_keys))
+            .collect();
+        if refused.iter().all(MappedIdentities::is_empty) {
+            ProofDecision::Userspace(reason)
+        } else {
+            ProofDecision::UserspaceExceptOverlay { reason, refused }
+        }
+    }
+
+    /// The fallback answer for one request the kernel run did not prove:
+    /// `None` (userspace fallback as today) unless the request touches an
+    /// overlay key, whose ranges refuse without userspace reads.
+    fn unproven_answer(&self, request: &AcceptedRequest<'_>) -> Option<MappedIdentities> {
+        let refused = overlay_refused_ranges(request, &self.overlay_keys);
+        (!refused.is_empty()).then_some(refused)
     }
 
     /// Session bookkeeping for one attempted target run's terminal outcome.
@@ -1013,8 +1080,12 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         if attempts >= MAX_TARGET_ATTEMPTS_PER_PASS {
             return self.userspace(batch, RunFailure::TargetLimit);
         }
+        let overlay_present = batch
+            .requests()
+            .iter()
+            .any(|request| !overlay_refused_ranges(request, &self.overlay_keys).is_empty());
         if matches!(
-            select_proof_run(batch.requests().len(), self.auto_threshold),
+            select_proof_run(batch.requests().len(), self.auto_threshold, overlay_present),
             SegmentSelection::Userspace(_)
         ) {
             return self.userspace(batch, RunFailure::BelowThreshold);
@@ -1308,7 +1379,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     request_keys(request),
                     KernelFallbackReason::ZombieBatch,
                 );
-                answers.push(None);
+                answers.push(self.unproven_answer(request));
                 continue;
             }
             let demoted = run.demoted_pids.contains(&request.pid());
@@ -1329,7 +1400,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     request_keys(request),
                     reason,
                 );
-                answers.push(None);
+                answers.push(self.unproven_answer(request));
                 continue;
             };
             let mut mapped = MappedIdentities::new();
@@ -1397,6 +1468,7 @@ impl<'g, 's, 'p, Io: ConfirmIo> KernelMemberProbe<'g, 's, 'p, Io> {
                 deadline,
                 eligible_keys: BTreeSet::new(),
                 auto_threshold: None,
+                overlay_keys: BTreeSet::new(),
             },
             io,
             resources,
@@ -1423,6 +1495,10 @@ impl<'g, 's, 'p, Io: ConfirmIo> KernelMemberProbe<'g, 's, 'p, Io> {
             .expect("installed guard owns its pass");
         index.clear_kernel_slots();
         self.proof.eligible_keys.clear();
+        // The overlay refusal follows the pass's match keys whether or not
+        // they hold validated slots: an overlay key without a kernel proof
+        // still never takes the userspace fallback.
+        self.proof.overlay_keys = index.overlay_keys().clone();
         // The held object's role is part of the expectation. An examined
         // file under a colliding key must never become its admitted provider.
         for (&(key, id), slots) in &pass.expected_matches {

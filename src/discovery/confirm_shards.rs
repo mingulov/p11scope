@@ -125,13 +125,38 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     }
     // A kernel answer needs no userspace reads; otherwise the member
     // returns to the stash for the fallback proofs, like the scalar
-    // confirm path, and is taken back for the finish.
+    // confirm path, and is taken back for the finish. A partial overlay
+    // refusal answers only its refused ranges; every other range still
+    // needs its userspace proof.
     let mapped = match answers {
-        Some(mapped) => mapped,
-        None => {
-            io.return_member(pid, prepared.member.take());
-            let mapped = read_ranges_reserved(io, pid, &prepared.ranges, Some(resources));
-            prepared.member = io.take_member();
+        Some(mapped)
+            if matches!(
+                decision,
+                crate::discovery::kernel_identity::ProofDecision::Kernel(_)
+            ) =>
+        {
+            mapped
+        }
+        answers => {
+            let mut mapped = answers.unwrap_or_default();
+            let missing: Vec<(u64, u64)> = prepared
+                .ranges
+                .iter()
+                .copied()
+                .filter(|range| !mapped.contains_key(range))
+                .collect();
+            // Plain userspace (and a token-mismatched kernel answer) keeps
+            // its member roundtrip even with no ranges; a partial refusal
+            // with nothing missing skips the reads entirely.
+            if !matches!(
+                decision,
+                crate::discovery::kernel_identity::ProofDecision::UserspaceExceptOverlay { .. }
+            ) || !missing.is_empty()
+            {
+                io.return_member(pid, prepared.member.take());
+                mapped.extend(read_ranges_reserved(io, pid, &missing, Some(resources)));
+                prepared.member = io.take_member();
+            }
             mapped
         }
     };
@@ -900,12 +925,33 @@ fn prove_part<Io: ShardableIo>(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut prepared.state {
                 _ if prepared.kernel_proved => {}
                 PreparedState::Idle { io, ranges } => {
-                    prepared.mapped =
-                        read_ranges_reserved(io, sweep[position].0, ranges, Some(resources))
+                    // A partial overlay refusal already answers its refused
+                    // ranges; only the missing ranges need userspace reads.
+                    let missing: Vec<(u64, u64)> = ranges
+                        .iter()
+                        .copied()
+                        .filter(|range| !prepared.mapped.contains_key(range))
+                        .collect();
+                    prepared.mapped.extend(read_ranges_reserved(
+                        io,
+                        sweep[position].0,
+                        &missing,
+                        Some(resources),
+                    ));
                 }
                 PreparedState::Confirm { io, plan } => {
-                    prepared.mapped =
-                        read_ranges_reserved(io, sweep[position].0, &plan.ranges, Some(resources))
+                    let missing: Vec<(u64, u64)> = plan
+                        .ranges
+                        .iter()
+                        .copied()
+                        .filter(|range| !prepared.mapped.contains_key(range))
+                        .collect();
+                    prepared.mapped.extend(read_ranges_reserved(
+                        io,
+                        sweep[position].0,
+                        &missing,
+                        Some(resources),
+                    ));
                 }
                 _ => {}
             }));
@@ -1217,7 +1263,10 @@ where
                     ));
                 } else if let Some(mapped) = answer {
                     prepared[position].1.mapped = mapped;
-                    prepared[position].1.kernel_proved = true;
+                    prepared[position].1.kernel_proved = matches!(
+                        decision,
+                        crate::discovery::kernel_identity::ProofDecision::Kernel(_)
+                    );
                 }
             }
             Some(decision)
@@ -1562,7 +1611,7 @@ mod kernel_promotion_tests {
         fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
             Ok(MappedFile {
                 identity: vm_file(PROVIDER),
-                fs_magic: None,
+                fs_magic: Some(0x01021994),
             })
         }
     }
@@ -1715,9 +1764,13 @@ mod kernel_promotion_tests {
                 pids: Vec::new(),
                 confirms: Vec::new(),
                 pidfds: Vec::new(),
-                userspace: matches!(decision, ProofDecision::Userspace(_)),
+                userspace: matches!(
+                    decision,
+                    ProofDecision::Userspace(_) | ProofDecision::UserspaceExceptOverlay { .. }
+                ),
                 reason: match decision {
-                    ProofDecision::Userspace(reason) => Some(reason),
+                    ProofDecision::Userspace(reason)
+                    | ProofDecision::UserspaceExceptOverlay { reason, .. } => Some(reason),
                     ProofDecision::Kernel(_) => None,
                 },
             };

@@ -651,6 +651,16 @@ impl MappedFile {
         })
     }
 
+    /// Whether userspace identity cannot prove this file: it sits on
+    /// overlayfs, where a stale lower mapping keeps the fresh upper
+    /// `(dev, ino)` across a copy-up, or its filesystem is unproven
+    /// (`statfs` unreadable — fail closed). Such keys need the kernel
+    /// proof; the sweep never falls back to userspace identity for them.
+    pub(crate) fn is_overlay_or_unproven(&self) -> bool {
+        self.fs_magic
+            .is_none_or(|magic| magic == p11scope_manifest::identity::OVERLAYFS_SUPER_MAGIC)
+    }
+
     /// Whether the maps key `key` is this file's identity, so a range
     /// rendered under it in any process is this file: the identity equals
     /// `(makedev(key.device), key.inode)` AND the filesystem is on

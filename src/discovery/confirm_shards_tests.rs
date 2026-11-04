@@ -109,7 +109,7 @@ impl ObjectChecks for Checks {
     fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
         Ok(MappedFile {
             identity: vm_file(PROVIDER),
-            fs_magic: None,
+            fs_magic: Some(0x01021994),
         })
     }
 }
@@ -538,7 +538,7 @@ fn privileged_sharded_confirmation_equals_the_serial_production_probe() {
         fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
             Ok(MappedFile {
                 identity: self.0,
-                fs_magic: None,
+                fs_magic: Some(0x01021994),
             })
         }
     }

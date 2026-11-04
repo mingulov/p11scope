@@ -3,16 +3,17 @@
 """Validate a cell-script results.jsonl file.
 
 Each line must be one JSON object with exactly the keys cell, pass,
-qualification and detail. A row is qualified unless its qualification is
-nonqualifying or expected-failure. Every qualified row must pass. The set
-of expected-failure cells must equal the declared list; an expected
-failure that passes is a failure (the fix must be recorded by removing
-it from the list). Nonqualifying smoke may pass or fail without failing
-the job; when --allow-nonqualifying is given, only the listed cells may
-be nonqualifying, so a qualified cell cannot hide a failure behind smoke.
+qualification and detail. Qualification is a closed set: qualified,
+command-contract, owned-provider-counts, verdict-consistency,
+semantic-names and failed are qualified and every qualified row must
+pass; nonqualifying smoke may pass or fail but every nonqualifying row
+must be allow-listed and the allow-list must equal the nonqualifying
+set; expected-failure must equal its declared list and an expected
+failure that passes is a failure. Every --require cell must appear, so
+a dropped row fails.
 
 Usage:
-  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...]
+  python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
 """
 
 import json
@@ -25,9 +26,15 @@ def fail(message):
     return 1
 
 
+QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
+             "verdict-consistency", "semantic-names", "failed"}
+VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
+
+
 def main(argv):
     expected = []
     allowed_smoke = []
+    required = []
     positional = []
     iterator = iter(argv)
     for token in iterator:
@@ -41,12 +48,17 @@ def main(argv):
                 allowed_smoke.append(next(iterator))
             except StopIteration:
                 return fail("--allow-nonqualifying needs a cell name")
+        elif token == "--require":
+            try:
+                required.append(next(iterator))
+            except StopIteration:
+                return fail("--require needs a cell name")
         elif token.startswith("-"):
             return fail(f"unknown option: {token}")
         else:
             positional.append(token)
     if len(positional) != 1:
-        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...]")
+        return fail("usage: check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]")
     path = Path(positional[0])
     try:
         text = path.read_text(encoding="utf-8")
@@ -88,6 +100,9 @@ def main(argv):
         if not isinstance(qualification, str) or not qualification:
             problems.append(f"line {number}: qualification must be a nonempty string for {cell}")
             continue
+        if qualification not in VALID_QUALIFICATIONS:
+            problems.append(f"line {number}: unknown qualification {qualification!r} for {cell}")
+            continue
         if not isinstance(detail, str):
             problems.append(f"line {number}: detail must be a string for {cell}")
             continue
@@ -107,7 +122,7 @@ def main(argv):
         elif qualification == "nonqualifying":
             status = "PASS" if passed else "SMOKE"
             print(f"{status} {cell} {detail}")
-            if allowed_smoke and cell not in set(allowed_smoke):
+            if cell not in set(allowed_smoke):
                 problems.append(f"nonqualifying cell not in allow list: {cell}")
         else:
             status = "PASS" if passed else "FAIL"
@@ -122,6 +137,8 @@ def main(argv):
         problems.append("duplicate --expected-failure names")
     if len(set(allowed_smoke)) != len(allowed_smoke):
         problems.append("duplicate --allow-nonqualifying names")
+    if len(set(required)) != len(required):
+        problems.append("duplicate --require names")
     if actual != wanted:
         missing = sorted(set(wanted) - set(actual))
         extra = sorted(set(actual) - set(wanted))
@@ -129,6 +146,13 @@ def main(argv):
             problems.append("missing expected failures: " + ", ".join(missing))
         if extra:
             problems.append("undeclared expected failures: " + ", ".join(extra))
+    actual_smoke = {row["cell"] for row in rows if row["qualification"] == "nonqualifying"}
+    missing_smoke = sorted(set(allowed_smoke) - actual_smoke)
+    if missing_smoke:
+        problems.append("missing nonqualifying: " + ", ".join(missing_smoke))
+    missing_required = sorted(set(required) - seen)
+    if missing_required:
+        problems.append("missing required cells: " + ", ".join(missing_required))
     if problems:
         for problem in problems:
             print(f"check-cell-results: {problem}", file=sys.stderr)

@@ -62,13 +62,42 @@ class CheckCellResultsTests(unittest.TestCase):
         self.assertIn("failed qualified cell a", result.stderr)
 
     def test_nonqualifying_smoke_allowed(self):
-        result = run_checker([row("a", True), row("smoke", False, "nonqualifying", "smoke")])
+        result = run_checker([row("a", True), row("smoke", False, "nonqualifying", "smoke")],
+                             "--allow-nonqualifying", "smoke")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("SMOKE smoke", result.stdout)
 
     def test_nonqualifying_pass_allowed(self):
-        result = run_checker([row("smoke", True, "nonqualifying", "smoke passed")])
+        result = run_checker([row("smoke", True, "nonqualifying", "smoke passed")],
+                             "--allow-nonqualifying", "smoke")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_nonqualifying_without_allow_list_fails(self):
+        result = run_checker([row("smoke", False, "nonqualifying", "smoke")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nonqualifying cell not in allow list: smoke", result.stderr)
+
+    def test_unknown_qualification_fails(self):
+        result = run_checker([row("a", True, "skipped", "x")])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown qualification", result.stderr)
+
+    def test_require_cells_must_be_present(self):
+        result = run_checker([row("a", True)], "--require", "a", "--require", "b")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing required cells: b", result.stderr)
+        result = run_checker([row("a", True), row("b", True)], "--require", "a", "--require", "b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_require_duplicate_names_fail(self):
+        result = run_checker([row("a", True)], "--require", "a", "--require", "a")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate --require names", result.stderr)
+
+    def test_allow_nonqualifying_must_match_exactly(self):
+        result = run_checker([row("a", True)], "--allow-nonqualifying", "smoke")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing nonqualifying", result.stderr)
 
     def test_expected_failures_must_match_declared_list(self):
         rows = [row("a", True), row("known", False, "expected-failure", "bug 1")]
@@ -147,6 +176,7 @@ class RunCellScriptContractTests(unittest.TestCase):
         self.assertIn("scripts/ci/check-cell-results.py", self.text)
         self.assertIn("--expected-failure", self.text)
         self.assertIn("--allow-nonqualifying", self.text)
+        self.assertIn("--require", self.text)
 
     def test_exit_77_always_fails(self):
         self.assertIn("77", self.text)

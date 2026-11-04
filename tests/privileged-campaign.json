@@ -230,7 +230,7 @@
     }
   },
   "second_flavor": {
-    "note": "Journal-flavor privileged build. Today P11SCOPE_JOURNAL=1; once WU-2b makes journal+birth marker the default (ruling CP-1), the second flavor becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0.",
+    "note": "Journal-flavor privileged build. Today P11SCOPE_JOURNAL=1; once WU-2b makes journal+birth marker the default (ruling CP-1), the second flavor becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0. Pending until WU-2a lands here; on port to dev drop pending (the cells exist there) and regenerate the floor.",
     "build_env": {
       "P11SCOPE_JOURNAL": "1"
     },
@@ -239,13 +239,15 @@
       "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
       "inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag",
       "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
+      "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
       "attach::tests::sealed_session_drain_linkage_is_behavioral"
     ],
     "pending": [
       "inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery",
       "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
       "inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag",
-      "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching"
+      "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
+      "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed"
     ]
   },
   "journal_proof": {

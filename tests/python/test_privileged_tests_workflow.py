@@ -95,6 +95,16 @@ def check_floor_and_branches(want, full_lines, campaign):
     return checked, notes
 
 
+def journal_proof_test_names(source):
+    """Fully-qualified #[test] names under root_proof_tests, the source of truth.
+
+    source is the text of src/semantics_objects/journal/root_proof_tests.rs,
+    the module the workflow's proof step runs by filter.
+    """
+    names = re.findall(r"^#\[test\]\nfn (\w+)", source, re.M)
+    return [f"semantics_objects::journal::root_proof_tests::{name}" for name in names]
+
+
 class PrivilegedTestsWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.ci = CI_YML.read_text(encoding="utf-8")
@@ -306,8 +316,27 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("functional doctor row", self.yml)
         self.assertIn("cli-out/cells/doctor.out", self.yml)
 
+    def test_default_shards_do_not_depend_on_journal_build(self):
+        self.assertNotIn("flavor: [default, journal]", self.yml)
+        self.assertIn("privileged-build-journal:", self.yml)
+        shard_needs = re.search(r"privileged-shard:\s*\n\s*needs:\s*([^\n]+)", self.yml)
+        self.assertIsNotNone(shard_needs, "privileged-shard has no needs")
+        self.assertEqual(shard_needs.group(1).strip(), "privileged-build")
+        second_needs = re.search(r"privileged-second-flavor:\s*\n\s*needs:\s*([^\n]+)", self.yml)
+        self.assertIsNotNone(second_needs, "privileged-second-flavor has no needs")
+        self.assertEqual(second_needs.group(1).strip(), "privileged-build-journal")
+
+    def test_proof_build_is_cached(self):
+        self.assertIn("target/proof/debug/.fingerprint", self.yml)
+
+    def test_summary_downloads_only_default_and_shards(self):
+        summary = self.yml.split("privileged-summary:", 1)[1]
+        block = summary.split("privileged-second-flavor:", 1)[0]
+        self.assertIn("pattern: privileged-shard-*", block)
+        self.assertIn("name: privileged-inputs-default", block)
+
     def test_second_flavor_build_and_cells(self):
-        self.assertIn("flavor: [default, journal]", self.yml)
+        self.assertIn("privileged-build-journal:", self.yml)
         self.assertIn("P11SCOPE_JOURNAL", self.yml)
         self.assertIn("privileged-second-flavor", self.yml)
         self.assertIn("privileged-inputs-journal", self.yml)
@@ -315,9 +344,11 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("journal exact-list mismatch", self.yml)
         campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
         second = campaign["second_flavor"]
-        self.assertEqual(len(second["cells"]), 5)
+        self.assertEqual(len(second["cells"]), 6)
         self.assertIn("attach::tests::sealed_session_drain_linkage_is_behavioral", second["cells"])
         self.assertIn("inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery",
+                      second["cells"])
+        self.assertIn("inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
                       second["cells"])
 
     def test_journal_proof_build_and_tests(self):
@@ -326,11 +357,59 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("test result: ok. 2 passed", self.yml)
         campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
         self.assertEqual(len(campaign["journal_proof"]["cells"]), 2)
+        # The floor names are pinned to the #[test] fns under the module the
+        # workflow runs: a rename must update the floor, not rot it.
+        source = (ROOT / "src" / "semantics_objects" / "journal"
+                  / "root_proof_tests.rs").read_text(encoding="utf-8")
+        self.assertEqual(campaign["journal_proof"]["cells"],
+                         journal_proof_test_names(source))
+
+    def test_build_jobs_refuse_flavor_environment(self):
+        # Every image-building prove step refuses a leaked flavor/size
+        # override; the journal job exempts only its intended =1.
+        jobs = {}
+        for match in re.finditer(
+                r"^  (privileged-build-journal|privileged-build|release-build):\s*$",
+                self.yml, re.M):
+            jobs[match.group(1)] = match.start()
+        self.assertEqual(set(jobs),
+                         {"privileged-build", "privileged-build-journal", "release-build"})
+        starts = sorted(jobs.items(), key=lambda kv: kv[1])
+        bodies = {}
+        for index, (name, start) in enumerate(starts):
+            end = starts[index + 1][1] if index + 1 < len(starts) else len(self.yml)
+            bodies[name] = self.yml[start:end]
+        refused = {
+            "privileged-build": {"P11SCOPE_SMALL_", "P11SCOPE_JOURNAL=",
+                                 "P11SCOPE_JOURNAL_PROOF=", "P11SCOPE_BIRTH_MARKER=",
+                                 "RUSTFLAGS=", "CARGO_ENCODED_RUSTFLAGS="},
+            "release-build": {"P11SCOPE_SMALL_", "P11SCOPE_JOURNAL=",
+                              "P11SCOPE_JOURNAL_PROOF=", "P11SCOPE_BIRTH_MARKER=",
+                              "RUSTFLAGS=", "CARGO_ENCODED_RUSTFLAGS="},
+            "privileged-build-journal": {"P11SCOPE_SMALL_", "P11SCOPE_JOURNAL_PROOF=",
+                                         "P11SCOPE_BIRTH_MARKER=",
+                                         "RUSTFLAGS=", "CARGO_ENCODED_RUSTFLAGS="},
+        }
+        for name, body in sorted(bodies.items()):
+            prove = re.search(r"grep -E '\^\(.*?\)'", body)
+            self.assertIsNotNone(prove, f"{name} has no prove-step refusal")
+            for token in sorted(refused[name]):
+                self.assertIn(token, prove.group(0), f"{name} refusal misses {token}")
+        journal = bodies["privileged-build-journal"]
+        self.assertIn('test "${P11SCOPE_JOURNAL:-}" = 1', journal)
+        journal_pattern = re.search(r"grep -E '\^\(.*?\)'", journal).group(0)
+        rest = journal_pattern.replace("P11SCOPE_JOURNAL_PROOF=", "")
+        self.assertNotIn("P11SCOPE_JOURNAL=", rest,
+                         "journal prove must exempt its intended P11SCOPE_JOURNAL=1")
 
     def test_cell_script_template_proof(self):
         self.assertIn("scripts/ci/run-cell-script.sh public-cli-host", self.yml)
         self.assertIn("scripts/ci/check-cell-results.py", self.yml)
         self.assertIn("--allow-nonqualifying run-short", self.yml)
+        self.assertIn("--require doctor", self.yml)
+        self.assertIn("--require profile-pid", self.yml)
+        self.assertIn("--require trace-pid", self.yml)
+        self.assertIn("--require fifo-refused", self.yml)
         self.assertIn("WP-3", self.yml)
         self.assertIn("WP-7", self.yml)
 

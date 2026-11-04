@@ -740,8 +740,10 @@ static PW_INLINE int pw_walk_one(struct pw_iter_task_vma *ctx)
         u32 *slotp;
         if (!vma)
             return 0;
-        if (PW_READ(file, vma->vm_file))
+        if (PW_READ(file, vma->vm_file)) {
+            pw_fault(s);
             return 0;
+        }
         if (!file)
             return 0;
         if (PW_READ(inode, file->f_inode) || !inode) {

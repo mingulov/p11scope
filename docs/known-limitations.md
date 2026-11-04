@@ -395,9 +395,10 @@ stay possible where attribution is conservative: provider unmaps by
 multi-threaded non-member processes, by remote and kthread contexts, member
 migrations within the subtree, and microsecond-scale latch/torn/pending
 events at close. Measured idle rate: 0 spurious windows in 186 runs on a
-busy desktop and Fedora (all `[]`), with the key honestly absent in 2 runs
-(~1%, unknown rather than a false claim). The finalize walk delays the ready
-line only with `--prearm-module`: about 0.1 s on a 300k-VMA desktop, 0.71 s
+busy desktop and Fedora (184 `[]`, 2 honestly absent;
+~1% unknown rather than a false claim). The finalize walk delays the ready
+line only with `--prearm-module`: about 0.2 s extrapolated on a 300k-VMA
+desktop (the pre-measurement estimate was 0.1 s), 0.71 s
 measured at 1M VMAs in a guest. Limits: at most 64 watched files, the
 observer must run in the initial pid namespace, LTO kernels are refused, and
 the walk fails closed past its 10 s deadline.

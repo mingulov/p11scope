@@ -14253,7 +14253,6 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/lane13-evidence/port-forward.c", // tests/python/test_lane13_evidence.py
     "tests/fixtures/live-discovery-driver.c",       // tests/discovery_scan.rs
     "tests/fixtures/live-discovery-provider.c", // tests/python/test_live_freeze_prepared_dependencies.py
-    "tests/fixtures/prearm-witness/harness.c", // tests/artifact_contracts.rs (prearm_witness_native_harness_*)
     "tests/fixtures/root-affiliation/birth_hook_tests.c", // tests/python/test_root_affiliation.py
     "tests/fixtures/root-affiliation/helper_tests.c", // tests/python/test_root_affiliation.py
     "tests/fixtures/root-fence-runtime.c",     // orphan fixture (no consumer); exempt by location

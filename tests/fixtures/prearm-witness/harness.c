@@ -335,6 +335,14 @@ static void test_unmap_unwatched_and_bad_slot(void)
     assert(p11_pw_unmap(ctx2) == 0);
     assert(state.faults == 1 && state.latch_slots == 0);
     check_busy_zero("unmap bad slot");
+    /* Slot 64 is the first out-of-range value (valid 0..63). */
+    reset_all();
+    cfg.active = 1;
+    watched_slot = 64;
+    u64 ctx3[3] = { (u64)(unsigned long)&vma, 0, 0 };
+    assert(p11_pw_unmap(ctx3) == 0);
+    assert(state.faults == 1 && state.latch_slots == 0);
+    check_busy_zero("unmap slot 64");
 }
 
 static void test_unmap_self_skip(void)
@@ -671,6 +679,38 @@ static struct pw_iter_task_vma walk_ctx(void *task, void *vma)
     return ctx;
 }
 
+static void test_walk_read_faults(void)
+{
+    /* PID scope: 7 reads through the lookup (vm_mm, map_count, vm_file,
+     * f_inode, i_sb, s_dev, i_ino). Every failure faults; a vm_file
+     * failure never silently misses. */
+    for (int fail = 0; fail < 7; fail++) {
+        reset_all();
+        cfg.active = 1;
+        cfg.scope_kind = PW_SCOPE_PID;
+        cfg.target_tgid = 100;
+        read_fail_at = fail;
+        struct pw_iter_task_vma c = walk_ctx(&task_member, &vma);
+        assert(p11_pw_walk(&c) == 0);
+        assert(state.faults == 1);
+        if (fail == 2)
+            assert(state.found_slots == 0);
+        check_busy_zero("walk fault");
+    }
+    /* Cgroup member: vm_file is read 7 (vm_mm + 5 member reads +
+     * map_count). Same fault, no silent miss. */
+    reset_all();
+    cfg.active = 1;
+    cfg.scope_kind = PW_SCOPE_CGROUP;
+    cfg.cgroup_id = 12345ULL;
+    read_fail_at = 7;
+    struct pw_iter_task_vma c = walk_ctx(&task_member, &vma);
+    assert(p11_pw_walk(&c) == 0);
+    assert(state.faults == 1);
+    assert(state.found_slots == 0);
+    check_busy_zero("walk vm_file cgroup");
+}
+
 static void test_walk_found_and_member(void)
 {
     /* Member FOUND for a non-exec watched VMA. */
@@ -801,6 +841,7 @@ int main(void)
     test_migrate_paths();
     test_migrate_depth_fault();
     test_migrate_read_fault();
+    test_walk_read_faults();
     test_walk_found_and_member();
     test_walk_runs_and_clear();
     test_walk_zombie_and_double_end();

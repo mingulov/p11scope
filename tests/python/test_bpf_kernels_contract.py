@@ -14,6 +14,7 @@ no unknown sums file escapes review. Historical 5.15 sums remain pinned.
 Run: python3 -I tests/python/test_bpf_kernels_contract.py -v
 """
 
+import json
 import re
 import sys
 import unittest
@@ -244,6 +245,21 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertIn("--attach-backend multi --counter-mode $MODE", driver)
         self.assertIn("--prearm-module /bin/true --attach-backend multi", driver)
         self.assertNotIn("v5.15.*|v6.1.*)", driver)
+
+    def test_witness_gate_legs_probe_through_cgroup_scope(self):
+        # p11_pw_migrate loads only for --cgroup (spec section 4.4), so
+        # both witness legs must probe through the production cgroup
+        # path: a --system probe loads no migrate, which the budgeted
+        # guest leg FAILs (missing root) and the budgetless host leg
+        # silently never scores.
+        driver = (ROOT / "scripts/check-bpf-load-kernels.sh").read_text()
+        self.assertIn("--cgroup /sys/fs/cgroup --prearm-module /bin/true", driver)
+        self.assertNotIn("--system --prearm-module", driver)
+        self.assertIn("--cgroup /sys/fs/cgroup --prearm-module /bin/true", self.bpf)
+        self.assertNotIn("--system --prearm-module", self.bpf)
+        budgets = json.loads((ROOT / "tests/bpf-verifier-budgets.json").read_text(
+            encoding="ascii"))
+        self.assertIn("prearm-witness/p11_pw_migrate", budgets["programs"])
 
 
 if __name__ == "__main__":

@@ -763,8 +763,9 @@ jobs:
           # The witness leg: /bin/true is a universal identified ELF for
           # --prearm-module (any identified file pins; the load gate
           # scores BPF loads, never verdicts), so no provider install.
+          # Cgroup scope: the only scope that loads p11_pw_migrate.
           wrc=0
-          sudo bash -c 'LD_PRELOAD="$3" P11SCOPE_VERIFIER_STATS_FD=9 "$0" profile --system --prearm-module /bin/true --attach-backend multi --duration 5s 9>"$1" >"$2" 2>&1' \
+          sudo bash -c 'LD_PRELOAD="$3" P11SCOPE_VERIFIER_STATS_FD=9 "$0" profile --cgroup /sys/fs/cgroup --prearm-module /bin/true --attach-backend multi --duration 5s 9>"$1" >"$2" 2>&1' \
             "$OBSERVER" "$OUT/witness-probe-host.jsonl" "$OUT/witness-host.txt" "$PROBE" || wrc=$?
           echo "witness rc=$wrc"
           for f in "$OUT/witness-probe-host.jsonl" "$OUT/witness-host.txt"; do

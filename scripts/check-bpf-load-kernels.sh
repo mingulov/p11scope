@@ -24,10 +24,11 @@
 # inventory-probe-K.jsonl), one bounded `profile --system --mode
 # metrics --counter-mode <mode>` per mode (that mode's counter bank
 # object, counter-<mode>-probe-K.jsonl), and one bounded `profile
-# --system --prearm-module /bin/true` (witness object,
-# witness-probe-K.jsonl, scored as prearm-witness; /bin/true is a
-# universal identified ELF, and the load gate scores BPF loads, never
-# verdicts, so no provider is needed). Separate guests because virtme
+# --cgroup /sys/fs/cgroup --prearm-module /bin/true` (witness object,
+# witness-probe-K.jsonl, scored as prearm-witness; the cgroup scope is
+# the only one that loads p11_pw_migrate; /bin/true is a universal
+# identified ELF, and the load gate scores BPF loads, never verdicts,
+# so no provider is needed). Separate guests because virtme
 # carries --exec base64 on the kernel command line (2048 bytes); one
 # combined command overflows it and the guest then silently never runs.
 # Separate counter runs per mode because probe rows key programs by root
@@ -428,7 +429,7 @@ for KERNEL in "$@"; do
     W_TXT="$OUTDIR/witness-$KERNEL.txt"
     W_VNG_LOG="$OUTDIR/vng-witness-$KERNEL.log"
     rm -f "$W_PROBE_JSON" "$W_TXT" "$W_VNG_LOG"
-    EXEC_W="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 60 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") profile --system --prearm-module /bin/true --attach-backend multi --duration 5s 9>$(q "witness-probe-$KERNEL.jsonl") >$(q "witness-$KERNEL.txt") 2>&1; echo witness-rc=\$?; echo guest-release=\$(uname -r)"
+    EXEC_W="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 60 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") profile --cgroup /sys/fs/cgroup --prearm-module /bin/true --attach-backend multi --duration 5s 9>$(q "witness-probe-$KERNEL.jsonl") >$(q "witness-$KERNEL.txt") 2>&1; echo witness-rc=\$?; echo guest-release=\$(uname -r)"
     if [ "${#EXEC_W}" -gt 950 ]; then
         echo "# error: witness guest command exceeds the kernel-cmdline budget on $KERNEL"
         FAILED=1

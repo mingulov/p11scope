@@ -1247,9 +1247,9 @@ class ReportTests(unittest.TestCase):
         self.assertIn("5606", result.stdout)
 
     def mixed_witness_loads(self):
-        # A profile --system --prearm-module probe file: the witness
-        # BTF group (old-kernel departure pair) plus the Detailed
-        # group the profile run loads beside it.
+        # A profile --cgroup /sys/fs/cgroup --prearm-module probe
+        # file: the witness BTF group (old-kernel departure pair)
+        # plus the Detailed group the profile run loads beside it.
         return [
             load_row("p11_pw_unmap", processed=3997, btf_id=61),
             load_row("p11_pw_depart_exit", processed=4028, btf_id=61),

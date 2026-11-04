@@ -41,8 +41,10 @@
 #
 # Apt prerequisites on a GitHub ubuntu-26.04 runner (installed by the
 # calling workflow, not here): busybox-static qemu-system-x86 qemu-utils
-# seabios ipxe-qemu gcc (guest cc for the owned fixtures). virtme-ng comes
-# from pipx at the workflow's pinned CI_VNG_VERSION.
+# seabios ipxe-qemu gcc (guest cc for the owned fixtures) softhsm2
+# libp11-kit-dev (the guest shares the runner rootfs, so the provider
+# cells see the runner's SoftHSM install). virtme-ng comes from pipx at
+# the workflow's pinned CI_VNG_VERSION.
 set -u
 
 [ $# -ge 2 ] || { echo "usage: lib-cells-vng.sh LIBTEST OUTDIR [KERNEL...]" >&2; exit 2; }

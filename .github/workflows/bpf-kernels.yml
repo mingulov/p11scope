@@ -654,7 +654,7 @@ jobs:
           sudo chmod 0666 /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static gcc qemu-system-x86 qemu-utils seabios ipxe-qemu
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static gcc libp11-kit-dev softhsm2 qemu-system-x86 qemu-utils seabios ipxe-qemu
       - name: Install pinned virtme-ng
         shell: bash
         run: |

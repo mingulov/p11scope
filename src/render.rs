@@ -94,6 +94,13 @@ pub struct LoaderDiscovery {
     /// Scoped BPF debug-state hit counter, incremented before ring
     /// reservation. Never derived from received-record counts.
     pub hits: u64,
+    /// Loader hits whose records resolved benignly: accepted, scan
+    /// complete, no new provider module, no suspicious close — or
+    /// pause-protected (the pause, not the scan, is the proof). A hit
+    /// is exonerated only when its record is fully accounted; see
+    /// `complete`. Never above `hits`: the checker refuses the report
+    /// when it is.
+    pub benign_hits: u64,
     /// The separate BPF counter for `_r_debug.r_state` reads. There is no
     /// second public copy of it.
     pub state_read_failures: u64,
@@ -105,16 +112,20 @@ impl LoaderDiscovery {
     /// `pause_protected`, and `initial_set_capture.eligible` /
     /// `.pause_protected` are neutral (design §9.2).
     ///
-    /// A dlopen timing class is a gap only once a load happened. Every hit
-    /// of a bound context is counted before its record is reserved, so zero
-    /// `hits` proves no load occurred during the capture: an armed loader
-    /// that never fired cannot have missed a late provider's first call. An
-    /// unbound context counts nothing, so `unavailable` stays a gap on its
-    /// own.
+    /// A dlopen timing class is a gap only while a hit is unaccounted.
+    /// Every hit of a bound context is counted before its record is
+    /// reserved, so zero `hits` proves no load occurred during the
+    /// capture: an armed loader that never fired cannot have missed a
+    /// late provider's first call. A hit whose record resolved benignly
+    /// (accepted, scan complete, no new provider, no suspicious close)
+    /// loaded nothing the capture could have missed calls through, so
+    /// fully benign hits do not gate exactness even with unproven
+    /// timing. An unbound context counts nothing, so `unavailable`
+    /// stays a gap on its own.
     fn complete(&self) -> bool {
         self.strategies.dlopen_return == 0
             && self.strategies.unavailable == 0
-            && (self.hits == 0 || self.dlopen_timing.gaps() == 0)
+            && (self.benign_hits == self.hits || self.dlopen_timing.gaps() == 0)
             && self.initial_set_timing.gaps() == 0
             && self.initial_set_capture.none == 0
             && self.state_read_failures == 0
@@ -8768,12 +8779,12 @@ pub(crate) mod tests {
                 assert!(object[key].is_u64(), "{group}.{key} is not a u64 count");
             }
         }
-        for key in ["hits", "state_read_failures"] {
+        for key in ["hits", "benign_hits", "state_read_failures"] {
             assert!(aggregate[key].is_u64(), "{key} is not a u64 count");
         }
         assert_eq!(
             aggregate.as_object().unwrap().len(),
-            6,
+            7,
             "loader_discovery grew a key: {aggregate}"
         );
         // No second public copy of an internal counter, no proof/identity, no
@@ -9401,6 +9412,70 @@ pub(crate) mod tests {
         assert!(
             lossy
                 .gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery")
+        );
+    }
+
+    /// A loader hit whose record resolved benignly (accepted, scan
+    /// complete, no new provider, no suspicious close) loaded nothing the
+    /// capture could have missed calls through — not even with unproven
+    /// timing. The SoftHSM `rdrand` engine probe (a failed dlopen that
+    /// fires one debug-state hit with no mapping change) is the live
+    /// shape: exact counts with a lossy observation until this lands.
+    #[test]
+    fn benign_loader_hits_do_not_gate_exactness() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.hits = 1;
+        ev.loader_discovery.benign_hits = 1;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        assert!(
+            !ev.gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "a fully benign loader hit must not name loader_discovery: {:?}",
+            ev.gap_classes(true).observation.causes
+        );
+    }
+
+    /// Benign resolution is per-hit: one unresolved hit keeps the
+    /// capture lossy.
+    #[test]
+    fn partially_benign_loader_hits_stay_lossy() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.hits = 2;
+        ev.loader_discovery.benign_hits = 1;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert!(
+            ev.gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery")
+        );
+    }
+
+    /// A benign count above the hit count is inconsistent evidence,
+    /// never an exoneration: without pause proof the capture stays
+    /// lossy (and the checker refuses the report outright).
+    #[test]
+    fn benign_hits_above_hits_stays_lossy_without_pause_proof() {
+        let mut ev = evidence();
+        ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        ev.loader_discovery.hits = 1;
+        ev.loader_discovery.benign_hits = 2;
+        ev.loader_discovery.dlopen_timing.unproven = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert!(
+            ev.gap_classes(true)
                 .observation
                 .causes
                 .contains(&"loader_discovery")

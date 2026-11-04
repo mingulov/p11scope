@@ -110,6 +110,21 @@ Short-lived processes missed at system scale are counted only as gaps
 (`pid_descendant_gaps`); their calls through attached providers still
 count. A process whose main thread had already exited when the capture
 first met it is not admitted, and its calls are not counted.
+Every process admitted after the initial membership sweep — a fork child,
+an ambient fork, any newcomer — and every leader exit that matches no
+admitted generation counts `pid_descendant_gaps` and keeps the observation
+lossy, even when the owned counts prove exact. The gap is a true
+disclosure, not an over-broad one: between the process's birth and the
+observer's admission (and loader arming), it could have mapped, used, and
+unmapped a provider the observer never attached, leaving no trace the
+later scan could find. A capture whose scope forks, or a `--system`
+capture on a machine with any process churn, is therefore inherently
+`PARTIAL` on this axis; exact observation needs a quiescent scope. Loader
+hits are different: a load whose record resolves benignly — accepted,
+scan complete, no new provider, no suspicious close — is counted in
+`loader_discovery.benign_hits` and no longer gates exactness. What still
+gates it is an unaccounted hit: a new provider (a true late window), a
+close nobody's mapping explains, an incomplete scan, or a lost record.
 
 If a process exits while loader inspection is still pending, the report may
 include a `discovery_truncated` gap. Unread metadata remains unavailable;

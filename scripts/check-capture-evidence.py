@@ -86,6 +86,11 @@ LOADER_DISCOVERY_GROUPS = {
     "initial_set_capture": ("eligible", "none", "pause_protected"),
 }
 LOADER_DISCOVERY_COUNTERS = ("hits", "state_read_failures")
+# Optional counters: accepted when present, defaulted when absent so old
+# reports verify under the old rule. `benign_hits` counts loader hits whose
+# records resolved benignly (accepted, scan complete, no new provider, no
+# suspicious close) or under pause proof; it never exceeds `hits`.
+LOADER_DISCOVERY_OPTIONAL_COUNTERS = ("benign_hits",)
 # Consumer-scheduling evidence (Task 3.1 repair): one nested object, closed
 # keys, exact loss-split identities. The terminal drain bound is a source
 # constant (events.rs TERMINAL_DRAIN_BOUND); pinning its value here forces
@@ -1644,15 +1649,18 @@ def exact_task_uprobe_link_losses(evidence):
 def loader_discovery_complete(loader):
     """render.rs `LoaderDiscovery::complete`: only neutral strategies,
     qualified pre-constructor or pause-protected timing, and eligible or
-    pause-protected initial sets; dlopen timing is a gap only once a load
-    happened (hits > 0)."""
+    pause-protected initial sets; dlopen timing is a gap only while a hit
+    is unaccounted. Fully benign hits do not gate exactness even with
+    unproven timing; a missing `benign_hits` defaults to zero so old
+    reports verify under the old rule."""
     def timing_gaps(timing):
         return timing["known_pre_relocation"] + timing["unproven"] + timing["none"]
 
+    benign_hits = loader.get("benign_hits", 0)
     return (
         loader["strategies"]["dlopen_return"] == 0
         and loader["strategies"]["unavailable"] == 0
-        and (loader["hits"] == 0 or timing_gaps(loader["dlopen_timing"]) == 0)
+        and (benign_hits == loader["hits"] or timing_gaps(loader["dlopen_timing"]) == 0)
         and timing_gaps(loader["initial_set_timing"]) == 0
         and loader["initial_set_capture"]["none"] == 0
         and loader["state_read_failures"] == 0
@@ -2571,7 +2579,11 @@ def exact_loader_discovery(evidence):
     aggregate = evidence["loader_discovery"]
     require(isinstance(aggregate, dict), f"loader_discovery is not an object: {aggregate!r}")
     require(
-        set(aggregate) == set(LOADER_DISCOVERY_GROUPS) | set(LOADER_DISCOVERY_COUNTERS),
+        set(aggregate) == set(LOADER_DISCOVERY_GROUPS) | set(LOADER_DISCOVERY_COUNTERS)
+        or set(aggregate)
+        == set(LOADER_DISCOVERY_GROUPS)
+        | set(LOADER_DISCOVERY_COUNTERS)
+        | set(LOADER_DISCOVERY_OPTIONAL_COUNTERS),
         f"loader_discovery key set: {sorted(aggregate)}",
     )
     for group, keys in LOADER_DISCOVERY_GROUPS.items():
@@ -2590,10 +2602,19 @@ def exact_loader_discovery(evidence):
             require(u64(value[key]), f"loader_discovery.{group}.{key}: {value[key]!r}")
     for counter in LOADER_DISCOVERY_COUNTERS:
         require(u64(aggregate[counter]), f"loader_discovery.{counter}: {aggregate[counter]!r}")
+    for counter in LOADER_DISCOVERY_OPTIONAL_COUNTERS:
+        if counter in aggregate:
+            require(u64(aggregate[counter]), f"loader_discovery.{counter}: {aggregate[counter]!r}")
+    require(
+        aggregate.get("benign_hits", 0) <= aggregate["hits"],
+        f"loader_discovery benign_hits above hits: {aggregate.get('benign_hits', 0)} > {aggregate['hits']}",
+    )
     # Every exact bound context is counted once as a strategy and once in
     # exactly one timing group, and an initial-set context additionally states
     # its capture outcome. `hits` and `state_read_failures` are BPF counters
-    # over records, not contexts, and are deliberately unconstrained here.
+    # over records, not contexts, and are deliberately unconstrained here;
+    # `benign_hits` is a userspace classification over the same records,
+    # bounded above by `hits` only.
     strategies = sum(aggregate["strategies"].values())
     dlopen = sum(aggregate["dlopen_timing"].values())
     initial_set = sum(aggregate["initial_set_timing"].values())

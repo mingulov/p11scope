@@ -246,8 +246,11 @@ from another.
 
 #### `evidence.loader_discovery`
 
-Six keys, always all present, every leaf an unsigned 64-bit count. Key order
-carries no meaning (a real document's object keys arrive sorted).
+Seven keys in current v3 documents (six in v2: `benign_hits` is v3-only),
+always all present, every leaf an unsigned 64-bit count. V3 documents
+written before `benign_hits` existed omit it; readers treat the absence
+as zero. Key order carries no meaning (a real document's object keys
+arrive sorted).
 
 | Field | Meaning |
 | --- | --- |
@@ -258,13 +261,21 @@ carries no meaning (a real document's object keys arrive sorted).
 | `initial_set_timing.*` | The same five classifications for the owned run's pre-exec initial-set context. |
 | `initial_set_capture.eligible` / `.none` / `.pause_protected` | Whether an owned `run` could capture its child's initial provider set before the child's first constructor ran (`eligible`), could not (`none`, forces `PARTIAL`), or had it held by its pause as above (`pause_protected`, not a gap). |
 | `hits` | Scoped BPF debug-state hit counter, incremented before ring reservation and never derived from received-record counts. A hit is not a loss: this counter alone never changes the verdict. |
+| `benign_hits` (v3 only) | Loader hits whose records resolved benignly: accepted, scan complete, no new provider module, no suspicious close — or pause-protected (the pause, not the scan, is the proof). Never above `hits`; the checker refuses the document when it is. Absent in v2 documents, where it reads as zero. |
 | `state_read_failures` | The separate BPF counter for `_r_debug.r_state` reads. There is no second public copy of it, in this object or beside it. |
 
 With the empty compiled-in timing catalog this build ships, only `unproven`,
 `none` and `pause_protected` are reachable in either timing group, and
 `initial_set_capture.eligible` is unreachable. A dlopen timing class is a gap
-only once a load happened (`hits > 0`): an armed loader that never fired cannot
-have missed a late provider's first call.
+only while a hit is unaccounted: an armed loader that never fired cannot have
+missed a late provider's first call, and (v3) a hit whose record resolved
+benignly loaded nothing the capture could have missed calls through — a failed
+or refcount `dlopen`, a close that removed only retained code, or any load
+under pause proof. What stays a gap is a hit with no benign resolution: a new
+provider (a true late window), a close nobody's mapping explains (a transient
+open-close cycle), an incomplete or skipped scan, or a lost or rejected record.
+Pause-protected timing exonerates independently of the hit accounting, as
+before.
 
 The three classification groups are one partition of the same exact bound
 context set, not three independent tallies:
@@ -305,15 +316,17 @@ because the value is an inference, never for privacy: both of its inputs are
 already public.
 
 It is worth stating plainly how the value is obtained: the implementation
-treats a capture as having had an unprotected live window when
-`loader_discovery.hits > 0` and `pause` is not `sigstop` — "a live window
-happened at all, and no confirmed pause owner protected it". That is a
-capture-level approximation of a per-module condition, and it is inexact in
-both directions: over-inclusive, because a hit that established no module's
-first required key still forces `PARTIAL`; and under-inclusive, because the
+treats a capture as having had an unprotected live window when a loader hit
+is unaccounted — `loader_discovery.hits` above `benign_hits` (v2: `hits > 0`,
+which reads `benign_hits` as zero) — and `pause` is not `sigstop`: "an
+unresolved live window happened at all, and no confirmed pause owner protected
+it". That is a capture-level approximation of a per-module condition, and it
+is inexact in one remaining direction: under-inclusive, because the
 export-event lane can establish a first required key without incrementing
-`hits`. It can only ever downgrade a verdict, never raise one, and it is
-expected to be replaced by a measured value.
+`hits`. The old over-inclusion — a benign load forcing `PARTIAL` — is gone:
+hits whose records resolve benignly no longer count as windows. It can only
+ever downgrade a verdict, never raise one, and it is expected to be replaced
+by a measured value.
 
 Process and semantic uncertainty:
 
@@ -367,9 +380,10 @@ them:
 - in `loader_discovery`: `strategies.dlopen_return` and `strategies.unavailable`
   are zero, every timing classification other than `qualified_pre_constructor`
   and `pause_protected` is zero in **both** timing groups (the dlopen group
-  only when `hits > 0`), `initial_set_capture.none` is zero, and
-  `state_read_failures` is zero. `hits`, `initial_set_capture.eligible` and
-  `.pause_protected` are not gaps;
+  only while a hit is unaccounted: v3 `benign_hits < hits`, v2 `hits > 0`),
+  `initial_set_capture.none` is zero, and `state_read_failures` is zero.
+  `hits`, `benign_hits`, `initial_set_capture.eligible` and `.pause_protected`
+  are not gaps;
 - no `functions[]` row is `module_unresolved`;
 - the unpublished unprotected-live-window input above is zero.
 

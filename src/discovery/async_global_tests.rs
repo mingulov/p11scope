@@ -512,7 +512,7 @@ fn async_global_mid_batch_handoff_preserves_due_fallback_instead_of_scanning() {
         view: other_id,
         context: LoaderContextId::from_case_id(9),
     };
-    case.engine.pending_loader_scans.insert(due, 77);
+    case.engine.pending_loader_scans.insert(due, (77, 1));
     let outcome = case
         .engine
         .apply_discovery_batch(&mut case.session, vec![refresh_exec(9_000_000).record], 0)
@@ -522,7 +522,7 @@ fn async_global_mid_batch_handoff_preserves_due_fallback_instead_of_scanning() {
     case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(
         case.engine.pending_loader_scans.get(&due),
-        Some(&77),
+        Some(&(77, 1)),
         "fallback must retain its original queued intent until a fresh scoped frame"
     );
     assert_eq!(case.engine.discovery_truncated, 0);
@@ -758,8 +758,8 @@ fn async_global_fix_round_fallback_first_scan_parks_other_held_view() {
     case.engine.views.push(other);
     let first = case.scan_context(case.engine.views[0].id(), None);
     let second = case.scan_context(other_id, None);
-    case.engine.pending_loader_scans.insert(first, 11);
-    case.engine.pending_loader_scans.insert(second, 22);
+    case.engine.pending_loader_scans.insert(first, (11, 1));
+    case.engine.pending_loader_scans.insert(second, (22, 1));
     let scans = case.engine.deep_scans;
     let outcome = case
         .engine
@@ -781,7 +781,10 @@ fn async_global_fix_round_fallback_first_scan_parks_other_held_view() {
         scans + 1,
         "the later held view must not be scanned behind the ticket"
     );
-    assert_eq!(case.engine.pending_loader_scans.get(&second), Some(&22));
+    assert_eq!(
+        case.engine.pending_loader_scans.get(&second),
+        Some(&(22, 1))
+    );
     assert!(case.session.attached_slots.is_empty());
 }
 

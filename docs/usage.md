@@ -517,6 +517,12 @@ tell (`unknown`); the cells persist across unmap and exec, so `mapped`
 never means the file was still mapped at the exit instant.
 Multi-threaded exits and late watches read `unknown`; nothing here
 proves a process did not map a watched provider.
+Any admission after the initial sweep, and any unmatched leader exit, keeps
+the observation lossy by design: the process could have used an unattached
+provider before admission left no trace (see the
+[known limitations](known-limitations.md)). A forking workload,
+or a `--system` capture with ambient process churn, therefore reports exact
+counts with `PARTIAL` observation; only a quiescent scope can be exact.
 `p11scope doctor` needs no scope flags for a system capture: its host
 program preflight already covers the whole-machine lane.
 `--duration` (bare

@@ -56,6 +56,7 @@ RUN = [
     ("test_bank_object_proof_off_on.py", []),
     ("test_bench_count_overhead.py", []),
     ("test_bench_marker_cost.py", []),
+    ("test_benign_loader_evidence.py", []),
     ("test_bpf_kernels_contract.py", []),
     ("test_check_bpf_load_journal.py", []),
     ("test_privileged_tests_workflow.py", []),

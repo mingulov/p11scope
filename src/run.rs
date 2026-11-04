@@ -8989,11 +8989,14 @@ pub(crate) fn evidence_for(
         // captures without one keep the key absent, never zero.
         instance_reload_not_excluded: None,
         // Design §5.7: a live-learned attach key is protected only inside a
-        // confirmed pause owner's window. A nonzero debug-state hit counter is
-        // what says a live window happened at all; the design forbids
-        // publishing a count, so this only gates the verdict.
+        // confirmed pause owner's window. An unaccounted debug-state hit is
+        // what says a live window happened at all: hits whose records
+        // resolved benignly loaded nothing the capture could have missed
+        // calls through. The design forbids publishing a count, so this
+        // only gates the verdict.
         unprotected_live_windows: usize::from(
-            facts.loader_discovery().hits > 0 && pause_status != PauseStatus::Sigstop,
+            facts.loader_discovery().hits > facts.loader_discovery().benign_hits
+                && pause_status != PauseStatus::Sigstop,
         ),
         module_unresolved_slots: reports
             .iter()
@@ -19526,6 +19529,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn evidence_for_exonerates_benign_loader_hits_from_unprotected_windows() {
+        use crate::discovery::pause::PauseCounters;
+
+        let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+        let state = semantics::State::new(engine.plan());
+        for (hits, benign_hits, unprotected) in [(1, 1, 0), (2, 1, 1), (2, 0, 1)] {
+            let mut facts = engine.capture_facts();
+            facts.loader_discovery.hits = hits;
+            facts.loader_discovery.benign_hits = benign_hits;
+            let evidence = evidence_for(
+                &engine,
+                facts,
+                0,
+                false,
+                false,
+                Default::default(),
+                render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+                &[],
+                &[],
+                metrics::KernelEvidence::default(),
+                process::TrackingEvidence::default(),
+                0,
+                &state,
+                false,
+                true,
+                PauseCounters::default(),
+                None,
+                false,
+                render::SchedulingEvidence::default(),
+                None,
+                None,
+            );
+            assert_eq!(
+                evidence.unprotected_live_windows, unprotected,
+                "hits={hits} benign={benign_hits}"
+            );
         }
     }
 

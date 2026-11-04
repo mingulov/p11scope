@@ -182,6 +182,40 @@ class OracleTests(unittest.TestCase):
     def test_valid_metrics(self):
         self.run_case(cell="metrics-pid")
 
+    def test_benign_loader_hit_stays_exact(self):
+        def benign(report, ledger, receipt):
+            report["evidence"]["loader_discovery"] = {
+                "strategies": {"debug_state_every_hit": 1, "dlopen_return": 0,
+                               "unavailable": 0},
+                "dlopen_timing": {"qualified_pre_constructor": 0,
+                                  "known_pre_relocation": 0, "unproven": 1,
+                                  "none": 0, "pause_protected": 0},
+                "initial_set_timing": {"qualified_pre_constructor": 0,
+                                       "known_pre_relocation": 0, "unproven": 0,
+                                       "none": 0, "pause_protected": 0},
+                "initial_set_capture": {"eligible": 0, "none": 0,
+                                        "pause_protected": 0},
+                "hits": 1, "benign_hits": 1, "state_read_failures": 0,
+            }
+        self.run_case(benign)
+
+    def test_benign_key_present_on_clean_capture(self):
+        self.run_case(lambda d, l, r: d["evidence"]["loader_discovery"].update(benign_hits=0))
+
+    def test_benign_above_hits_is_refused(self):
+        oracle = runpy.run_path(str(ORACLE))
+        report, ledger, receipt = inputs()
+        report["evidence"]["loader_discovery"].update(
+            strategies={"debug_state_every_hit": 1, "dlopen_return": 0,
+                        "unavailable": 0},
+            dlopen_timing={"qualified_pre_constructor": 0,
+                           "known_pre_relocation": 0, "unproven": 1,
+                           "none": 0, "pause_protected": 0},
+            hits=1, benign_hits=2)
+        with self.assertRaisesRegex(oracle["EvidenceError"], "above"):
+            oracle["judge"](json.dumps(report), "\n".join(ledger) + "\n",
+                            receipt, "profile-pid")
+
     def test_system_six_500_call_totals_pass(self):
         self.run_case(cell="system")
 

@@ -12237,6 +12237,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             initial_set_timing: Default::default(),
             initial_set_capture: Default::default(),
             hits: 4,
+            benign_hits: 0,
             state_read_failures: 0,
         },
         interface_selection: InterfaceSelection::default(),

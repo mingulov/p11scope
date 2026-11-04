@@ -186,6 +186,11 @@ def terminal(evidence, *, profile):
                 "invalid verdict loader authority: " + group)
     for key in VERDICT["LOADER_DISCOVERY_COUNTERS"]:
         require(integer(loader.get(key)), "invalid verdict loader counter: " + key)
+    for key in VERDICT["LOADER_DISCOVERY_OPTIONAL_COUNTERS"]:
+        if key in loader:
+            require(integer(loader.get(key)), "invalid verdict loader counter: " + key)
+    require(loader.get("benign_hits", 0) <= loader["hits"],
+            "loader_discovery benign_hits above hits")
     VERDICT["exact_stop_quiescence"](evidence)
     VERDICT["exact_verdict_classes"](evidence)
     require(evidence.get("completeness") == VERDICT["expected_terminal_completeness"](evidence),

@@ -1889,6 +1889,351 @@ fn frame_deferred_loader_records_resolve_rt_add_before_exec_retirement() {
     }
 }
 
+/// A loader record whose scan finds no new provider and loses no mapping
+/// exonerates its hit: nothing loaded that the capture could have missed
+/// calls through. Live shape: the SoftHSM `rdrand` engine probe, a failed
+/// dlopen that fires one unmatched debug-state hit with no mapping change.
+#[test]
+fn benign_loader_record_exonerates_its_hit() {
+    let (_fixture, mut engine, _context, mut record, mut session) =
+        armed_seed_route_with_retained_provider(1);
+    record.announced_count = 0; // RT_CONSISTENT, unmatched: a failed/refcount open.
+    engine.update_counter_snapshot(&session).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+    engine
+        .dispatch_discovery_record(
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut true,
+            &mut pending_views,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        1,
+        "an unmatched no-change load resolves benignly"
+    );
+}
+
+/// A loader record whose scan rediscovers a provider as new is a late
+/// load: its hit stays unresolved.
+#[test]
+fn provider_loader_record_keeps_its_hit_unresolved() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    // The live process still maps its provider: the rescan rediscovers it
+    // as a new module, the late-load shape.
+    engine.modules.clear();
+    record.announced_count = 0;
+    engine.update_counter_snapshot(&session).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+    engine
+        .dispatch_discovery_record(
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut true,
+            &mut pending_views,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(
+        !engine.modules.is_empty(),
+        "the rescan must rediscover the live provider or the twin is vacuous"
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "a newly observed provider is never benign"
+    );
+}
+
+/// A close nobody's mapping explains is a transient: the DELETE notifies
+/// (benign on its own scan) but its CONSISTENT finds nothing vanished, so
+/// the transaction keeps the capture lossy.
+#[test]
+fn transient_close_loader_record_keeps_its_hit_unresolved() {
+    let (_fixture, mut engine, _context, mut record, mut session) =
+        armed_seed_route_with_retained_provider(2);
+    engine.update_counter_snapshot(&session).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+    record.announced_count = 2; // RT_DELETE: defers, nothing actually closed.
+    engine
+        .dispatch_discovery_record(
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut true,
+            &mut pending_views,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    let mut consistent = record;
+    consistent.announced_count = 0;
+    engine
+        .dispatch_discovery_record(
+            QueuedDiscoveryRecord {
+                record: consistent,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut true,
+            &mut pending_views,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(engine.loader_records_accepted, 2);
+    assert_eq!(engine.loader_discovery().hits, 2);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        1,
+        "the DELETE notifies; its unmatched CONSISTENT is the transient"
+    );
+    assert!(
+        engine.loader_discovery().hits > engine.loader_discovery().benign_hits,
+        "the transient keeps the capture lossy"
+    );
+}
+
+/// Pause proof exonerates even a new provider: the child was stopped
+/// while the load happened, so no first call could have run unobserved.
+#[test]
+fn pause_protected_loader_record_exonerates_despite_new_provider() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    engine.modules.clear();
+    // Direct dispatch skips protection marking; set the held-record
+    // outcome a pause-owned batch would have recorded.
+    engine.paused_loader_views.insert(engine.views[0].id());
+    record.announced_count = 0;
+    engine.update_counter_snapshot(&session).unwrap();
+    let mut pending_views = PendingViewRetirements::new();
+    engine
+        .dispatch_discovery_record(
+            QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut true,
+            &mut pending_views,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(
+        !engine.modules.is_empty(),
+        "vacuous unless the scan rediscovers the provider"
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        1,
+        "pause proof exonerates even a new provider"
+    );
+}
+
+/// A terminal loader record was never held by a pause stop: stale pause
+/// proof from an earlier held batch must not exonerate it. Live shape: a
+/// `--pause` run leaves a view paused, then Finish detaches its loader
+/// context with a late-load record still queued.
+#[test]
+fn terminal_loader_record_ignores_stale_pause_proof() {
+    let (_fixture, mut engine, context, mut record, mut session) = armed_seed_route(1);
+    // The live process still maps its provider: the rescan rediscovers it
+    // as a new module, the late-load shape.
+    engine.modules.clear();
+    // Stale proof: an earlier pause-owned batch left this view paused, and
+    // no ordinary record has since marked it unpaused.
+    engine.paused_loader_views.insert(engine.views[0].id());
+    record.announced_count = 0; // RT_CONSISTENT, unmatched.
+    engine
+        .begin_terminal_drain(context, Vec::new(), || Ok::<(), anyhow::Error>(()))
+        .unwrap()
+        .unwrap();
+    engine.retain_terminal_batch([record], true, 0).unwrap();
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .apply_discovery_batch_with(&mut session, Vec::new(), 0, true, true, &mut collect, None)
+        .unwrap();
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(
+        !engine.modules.is_empty(),
+        "vacuous unless the scan rediscovers the provider"
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "a terminal record never held by a pause stop stays unresolved"
+    );
+}
+
+/// A same-file second load shares its (view, mount namespace, key, path)
+/// with the retained first load, so the mapping diff alone sees no change —
+/// but the second instance owns a distinct PKCS#11 session namespace whose
+/// first calls before attach went unobserved. Any double-load transition
+/// in either direction keeps its hit unresolved.
+#[test]
+fn double_load_transition_keeps_its_hit_unresolved() {
+    let (_fixture, mut engine, _context, _record, session) = armed_seed_route(1);
+    engine.update_counter_snapshot(&session).unwrap();
+    let view = engine.views[0].id();
+    let mount_namespace = engine.views[0].mount_namespace();
+    let module = |double_loaded| ScannedModule {
+        mapped_identity: None,
+        view,
+        mount_namespace,
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        double_loaded,
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    for (retained_double, found_double) in [(false, true), (true, false)] {
+        for class in [
+            LoaderHitClass::Announced(1),
+            LoaderHitClass::Consistent { resolving: None },
+        ] {
+            let retained = vec![module(retained_double)];
+            let found = vec![module(found_double)];
+            engine.classify_loader_record_scan(view, class, &retained, &found, true);
+        }
+    }
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "a double-load transition is a new instance, never benign"
+    );
+}
+
+/// An incomplete scan proves nothing: truncating skips, budget stops, new
+/// refusals and unavailability already fail closed in the scan's own
+/// verdict, and the classifier returns early on it even when the visible
+/// mappings show no change.
+#[test]
+fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
+    let (_fixture, mut engine, _context, _record, session) = armed_seed_route(1);
+    engine.update_counter_snapshot(&session).unwrap();
+    let view = engine.views[0].id();
+    let mount_namespace = engine.views[0].mount_namespace();
+    let module = ScannedModule {
+        mapped_identity: None,
+        view,
+        mount_namespace,
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        double_loaded: false,
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    // No mapping change at all: only the incomplete verdict keeps this lossy.
+    let retained = vec![module.clone()];
+    let found = vec![module];
+    engine.classify_loader_record_scan(
+        view,
+        LoaderHitClass::Consistent { resolving: None },
+        &retained,
+        &found,
+        false,
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "an incomplete scan never exonerates, even with no visible change"
+    );
+}
+
+/// Pause proof through the real batch path: a pause-owned batch marks its
+/// held loader record, so the rescan's new provider still resolves
+/// benignly. Pins `note_record_protection` and the held-record handoff,
+/// not just the classifier's paused branch.
+#[test]
+fn pause_owned_batch_loader_record_exonerates_through_real_marking() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    engine.modules.clear();
+    record.announced_count = 0;
+    let view = engine.views[0].id();
+    engine.set_pause_owned_batch(true);
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    engine.set_pause_owned_batch(false);
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(
+        !engine.modules.is_empty(),
+        "vacuous unless the scan rediscovers the provider"
+    );
+    assert!(
+        engine.paused_loader_views.contains(&view),
+        "the real marking must record the held view as paused"
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        1,
+        "a genuinely held record exonerates even a new provider"
+    );
+}
+
+/// The always-held direction through the real batch path: an ordinary
+/// (non-pause-owned) batch marks its loader record unheld, so a new
+/// provider stays unresolved. A marking that held every record would
+/// false-complete here.
+#[test]
+fn ordinary_batch_loader_record_marks_its_view_unpaused() {
+    let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
+    engine.modules.clear();
+    record.announced_count = 0;
+    let view = engine.views[0].id();
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(
+        !engine.modules.is_empty(),
+        "vacuous unless the scan rediscovers the provider"
+    );
+    assert!(
+        engine.unpaused_loader_views.contains(&view),
+        "the real marking must record the unheld view as unpaused"
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "an unheld new provider is never benign"
+    );
+}
+
 /// F4: a frame that defers work delays it, it does not drop it, so the
 /// deferral is a scheduling fact (`scheduling.discovery_deferrals`), never an
 /// observation-loss skip. Only work still deferred when the capture ends —
@@ -9180,6 +9525,7 @@ fn loader_deferral_bound_drops_with_explicit_loss() {
                 context,
             },
             7,
+            1,
         );
     }
     assert_eq!(
@@ -14078,6 +14424,40 @@ fn selection_provider_address(engine: &Engine, binding: SelectionBindingFact) ->
         .find(|mapping| ObjectKey::of(mapping) == provider)
         .unwrap()
         .start
+}
+
+/// [`armed_seed_route`] plus a retained provider: the engine already
+/// discovered and holds the seed module when the loader record arrives —
+/// the live shape of a no-change hit (a failed or refcount open resolves
+/// against retained state, it does not discover the provider).
+fn armed_seed_route_with_retained_provider(
+    loader_hits: u64,
+) -> (
+    LoadedSeedProvider,
+    Engine,
+    LoaderContextId,
+    DiscoveryRecord,
+    ScriptedSession,
+) {
+    let (fixture, engine, mut session) = initial_export_route();
+    session.counters.loader_hits = loader_hits;
+    let pid = engine.views[0].pid();
+    let context = engine.loader_registry.ids_for_view(ProcessViewId(0))[0];
+    let spec = engine
+        .loader_registry
+        .context(context)
+        .unwrap()
+        .spec
+        .clone();
+    let mapping = spec.mapping.as_ref().unwrap();
+    let mut record = loader_record_for(context, pid);
+    record.table_ptr = mapping.start + (spec.hook.file_offset - mapping.file_offset);
+    record.hook_ts_ns = engine.views[0].admitted_ns();
+    assert!(
+        !engine.modules.is_empty(),
+        "the route must retain the seed provider or no-change twins are vacuous"
+    );
+    (fixture, engine, context, record, session)
 }
 
 fn armed_seed_route(
@@ -36571,6 +36951,7 @@ fn e07_rescan(
             session,
             additions,
             pending,
+            None,
         )
         .expect("a live loader rescan applies")
 }
@@ -37061,6 +37442,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
             &mut session,
             &mut additions,
             &mut pending,
+            None,
         )
         .expect_err("a stale generation refuses");
     assert!(

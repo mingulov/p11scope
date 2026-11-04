@@ -471,9 +471,10 @@ trace evidence object. Historical documents predate them (see Migration).
   that disagrees.
 - `semantic_unverified_slots`, `unprotected_live_windows` (0 or 1: a live
   loader or export window no confirmed pause owner protected, inferred from
-  `loader_discovery.hits > 0` and `pause` other than `sigstop`), and
-  `module_unresolved_slots` (the number of `functions[].module_unresolved`
-  rows) are the three verdict inputs that were previously unpublished.
+  an unaccounted loader hit — `loader_discovery.hits` above `benign_hits` —
+  and `pause` other than `sigstop`), and `module_unresolved_slots` (the
+  number of `functions[].module_unresolved` rows) are the three verdict
+  inputs that were previously unpublished.
 - Static detach history uses the existing `skipped` record with name
   `discovery subject` and one of two fixed reasons: `static probe coverage gap
   incomplete` or `static probes detached and exact pairs reattached`. The first

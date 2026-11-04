@@ -584,6 +584,12 @@ pub struct Engine {
     last_refresh_serial: u64,
     scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
+    /// Loader hits whose records resolved benignly (accepted, scan
+    /// complete, no new provider, no suspicious close) or under pause
+    /// proof. At most one per accepted record scan, so never above
+    /// `counter_snapshot.loader_hits` by construction; the checker
+    /// refuses the report when it is.
+    loader_benign_hits: u64,
     timings: CausalTimings,
     physical_gap: crate::attach::PhysicalGapSummary,
     continuity_deferred: bool,
@@ -706,7 +712,10 @@ pub struct Engine {
     /// All identity stays out: only the classification is kept, and it is all
     /// that can be rendered.
     loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
-    pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
+    /// Deferred loader memory scans: the hook timestamp plus the deferring
+    /// announcement (RT_ADD or RT_DELETE), so the resolving scan can tell
+    /// a close completing from an open completing.
+    pending_loader_scans: BTreeMap<PendingLoaderScanKey, (u64, u32)>,
     /// One noncausal catch-up owed by each newly armed live PID context.
     /// Context retirement bounds and prunes this independently of RT_ADD work.
     pending_loader_arm_scans: BTreeSet<PendingLoaderScanKey>,
@@ -869,6 +878,19 @@ struct LoaderContextClass {
 struct PendingLoaderScanKey {
     view: ProcessViewId,
     context: LoaderContextId,
+}
+
+/// Which loader hit a record-driven scan classifies for benign-hit
+/// accounting: its own announcement, plus — for a completion — the
+/// announcement it resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoaderHitClass {
+    /// An RT_ADD/RT_DELETE record's own scan.
+    Announced(u32),
+    /// An RT_CONSISTENT scan; `resolving` is the deferred announcement
+    /// it completes, or `None` when no announcement is pending (a failed
+    /// or refcount open, which fires no RT_ADD of its own).
+    Consistent { resolving: Option<u32> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8922,6 +8944,15 @@ fn is_newly_observed_module(retained: &[ScannedModule], module: &ScannedModule) 
     })
 }
 
+fn is_still_observed_module(found: &[ScannedModule], module: &ScannedModule) -> bool {
+    found.iter().any(|current| {
+        current.view == module.view
+            && current.mount_namespace == module.mount_namespace
+            && current.key == module.key
+            && current.path == module.path
+    })
+}
+
 fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedModule) {
     let Some(position) = modules.iter().position(|module| {
         module.view == incoming.view
@@ -10240,6 +10271,7 @@ impl Engine {
             last_refresh_serial: 0,
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
+            loader_benign_hits: 0,
             timings: CausalTimings::default(),
             physical_gap: crate::attach::PhysicalGapSummary::default(),
             continuity_deferred: false,
@@ -10358,6 +10390,7 @@ impl Engine {
     pub fn loader_discovery(&self) -> render::LoaderDiscovery {
         let mut aggregate = render::LoaderDiscovery {
             hits: self.counter_snapshot.loader_hits,
+            benign_hits: self.loader_benign_hits,
             state_read_failures: self.counter_snapshot.loader_state_read_failures,
             ..render::LoaderDiscovery::default()
         };
@@ -12726,9 +12759,17 @@ impl Engine {
         self.facts_revision = self.facts_revision.saturating_add(1);
     }
 
-    fn defer_loader_memory_scan(&mut self, key: PendingLoaderScanKey, hook_ts_ns: u64) {
-        if let Some(earliest) = self.pending_loader_scans.get_mut(&key) {
-            *earliest = (*earliest).min(hook_ts_ns);
+    fn defer_loader_memory_scan(
+        &mut self,
+        key: PendingLoaderScanKey,
+        hook_ts_ns: u64,
+        announced: u32,
+    ) {
+        if let Some(pending) = self.pending_loader_scans.get_mut(&key) {
+            // One transaction at a time per key: the loader lock serializes
+            // a process's map changes, so a second deferral only moves the
+            // timestamp. Keep the first announcement.
+            pending.0 = pending.0.min(hook_ts_ns);
             return;
         }
         if self.pending_loader_scans.len() == crate::discovery::loader::MAX_LOADER_CONTEXTS {
@@ -12737,7 +12778,8 @@ impl Engine {
             );
             return;
         }
-        self.pending_loader_scans.insert(key, hook_ts_ns);
+        self.pending_loader_scans
+            .insert(key, (hook_ts_ns, announced));
     }
 
     fn record_pending_loader_scan_loss(&mut self, reason: &str) {
@@ -16111,6 +16153,7 @@ impl Engine {
                 session,
                 additions_allowed,
                 pending_views,
+                None,
             )?;
             changed |= outcome.changed();
             complete &= outcome.required_complete();
@@ -16155,6 +16198,72 @@ impl Engine {
         Ok(valid.then_some(locator.authority))
     }
 
+    /// Classify one accepted loader record's scan for benign-hit
+    /// accounting: bump `loader_benign_hits` by exactly one when the scan
+    /// proves the hit harmless, else leave the hit unresolved (a gap).
+    ///
+    /// A hit is harmless when its scan is complete and the mapping diff
+    /// shows no provider relevance: no new module (a late provider load
+    /// is a true window), and no unexplained close. Every close fires an
+    /// RT_DELETE record, so a completion that resolves a delete with
+    /// nothing vanished is a transient open-close cycle whose calls are
+    /// unknown. Pause proof exonerates regardless of the diff: the child
+    /// was stopped while the load happened, so no first call could have
+    /// run unobserved. Anything unproven — an incomplete scan, an
+    /// unreadable announcement, a new or unclassifiable module — stays
+    /// unresolved.
+    ///
+    /// Completeness is the scan's own verdict: it already fails closed on
+    /// truncating skips, budget stops, new refusals and unavailability.
+    /// Benign noise skips (examined objects with no wanted table) must not
+    /// disqualify: every ordinary scan records them.
+    fn classify_loader_record_scan(
+        &mut self,
+        view_id: ProcessViewId,
+        class: LoaderHitClass,
+        retained_before: &[ScannedModule],
+        found: &[ScannedModule],
+        found_complete: bool,
+    ) {
+        const RT_ADD: u32 = 1;
+        const RT_DELETE: u32 = 2;
+        if !found_complete {
+            return;
+        }
+        let protected = self.paused_loader_views.contains(&view_id)
+            && !self.unpaused_loader_views.contains(&view_id);
+        if protected {
+            self.loader_benign_hits = self.loader_benign_hits.saturating_add(1);
+            return;
+        }
+        let new_provider = found
+            .iter()
+            .any(|module| is_newly_observed_module(retained_before, module));
+        if new_provider {
+            return;
+        }
+        let vanished = retained_before
+            .iter()
+            .any(|module| !is_still_observed_module(found, module));
+        let benign = match class {
+            // An open/close notification whose scan shows no change yet:
+            // the transaction's completion carries the verdict.
+            LoaderHitClass::Announced(RT_ADD) | LoaderHitClass::Announced(RT_DELETE) => !vanished,
+            LoaderHitClass::Announced(_) => false,
+            LoaderHitClass::Consistent { resolving } => match resolving {
+                // A close that removed retained code completed.
+                Some(RT_DELETE) => vanished,
+                // An open that changed nothing: a failed or refcount open,
+                // which fires no RT_ADD of its own.
+                Some(RT_ADD) | None => !vanished,
+                Some(_) => false,
+            },
+        };
+        if benign {
+            self.loader_benign_hits = self.loader_benign_hits.saturating_add(1);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn process_validated_loader_scan(
         &mut self,
@@ -16168,6 +16277,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         additions_allowed: &mut bool,
         pending_views: &mut PendingViewRetirements,
+        classify: Option<LoaderHitClass>,
     ) -> Result<DiscoveryRecordOutcome> {
         #[cfg(test)]
         if mode == LoaderScanMode::Memory {
@@ -16269,6 +16379,27 @@ impl Engine {
                 module.tables = current.scanned.tables.clone();
                 module.interfaces = current.scanned.interfaces.clone();
             }
+        }
+        // Benign-hit accounting (W4-1): a record-driven scan classifies
+        // exactly its own hit, before this view's retained modules are
+        // replaced below. Pin and plan skips land later and gap
+        // independently; the scan's own completeness verdict already
+        // fails closed on truncating skips.
+        if let Some(class) = classify {
+            let view_id = self.views[position].id();
+            let retained_before: Vec<ScannedModule> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == view_id)
+                .map(|module| module.scanned.clone())
+                .collect();
+            self.classify_loader_record_scan(
+                view_id,
+                class,
+                &retained_before,
+                &found,
+                found_complete,
+            );
         }
         // A catch-up has no loader occurrence to seed an already published
         // provider again. Keep the full candidate scan, but request export
@@ -16497,7 +16628,7 @@ impl Engine {
                 self.note_frame_deferral();
                 break;
             }
-            let Some(hook_ts_ns) = self.pending_loader_scans.remove(&key) else {
+            let Some((hook_ts_ns, _announced)) = self.pending_loader_scans.remove(&key) else {
                 continue;
             };
             if let Some(reason) = self.budget.stopped_now() {
@@ -16523,6 +16654,9 @@ impl Engine {
             if !self.pause_owned_batch {
                 self.unpaused_loader_views.insert(key.view);
             }
+            // An early fallback scan is interim: the record's own scan at
+            // its announcement, and the transaction's completion scan,
+            // carry the benign-hit verdicts.
             match self.process_validated_loader_scan(
                 position,
                 key.context,
@@ -16534,6 +16668,7 @@ impl Engine {
                 session,
                 additions_allowed,
                 pending_views,
+                None,
             ) {
                 Ok(outcome) => {
                     changed |= outcome.changed();
@@ -16721,7 +16856,7 @@ impl Engine {
         // RT_ADD path's existing deferred memory scan. No duplicate catch-up.
         self.pending_loader_arm_scans.remove(&key);
         if matches!(record.announced_count, 1 | 2) {
-            self.defer_loader_memory_scan(key, record.hook_ts_ns);
+            self.defer_loader_memory_scan(key, record.hook_ts_ns, record.announced_count);
             let result = self.process_validated_loader_scan(
                 position,
                 context_id,
@@ -16733,6 +16868,7 @@ impl Engine {
                 session,
                 additions_allowed,
                 pending_views,
+                Some(LoaderHitClass::Announced(record.announced_count)),
             );
             if result.is_err() {
                 // A scan that failed while its process provably ended: the
@@ -16756,7 +16892,9 @@ impl Engine {
             }
             result
         } else {
-            let resolving_pending = self.pending_loader_scans.remove(&key).is_some();
+            let resolving = self.pending_loader_scans.remove(&key);
+            let resolving_pending = resolving.is_some();
+            let resolving_kind = resolving.map(|(_, announced)| announced);
             let result = self.process_validated_loader_scan(
                 position,
                 context_id,
@@ -16768,6 +16906,9 @@ impl Engine {
                 session,
                 additions_allowed,
                 pending_views,
+                Some(LoaderHitClass::Consistent {
+                    resolving: resolving_kind,
+                }),
             );
             if resolving_pending && result.is_err() {
                 // A zero-state scan that failed after its process provably

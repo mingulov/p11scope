@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -297,13 +298,24 @@ class _ProfilerSession:
 
         Raises CellError when the profiler exits first or the marker
         never arrives inside the grace period (the profiler is killed).
+        Readiness slower than ``SLOW_ATTACH_WARN_SECONDS`` logs a
+        regression warning on stderr but still passes inside the grace.
         """
-        deadline = time.monotonic() + timeout_seconds
+        started = time.monotonic()
+        deadline = started + timeout_seconds
         while time.monotonic() < deadline:
             if self._ready.wait(0.05):
                 with self._lock:
                     assert self._attached is not None
-                    return self._attached
+                    attached = self._attached
+                elapsed = time.monotonic() - started
+                if elapsed > SLOW_ATTACH_WARN_SECONDS:
+                    print(f"p11scope-test: slow attach: capture readiness took "
+                          f"{elapsed:.1f}s (past the {SLOW_ATTACH_WARN_SECONDS:g}s "
+                          f"regression signal; bound {timeout_seconds:g}s, host load "
+                          f"{_host_load()})",
+                          file=sys.stderr)
+                return attached
             if self._proc.poll() is not None:
                 raise CellError(
                     f"profiler exited (rc={self._proc.returncode}) before capture "
@@ -362,11 +374,25 @@ def _require_liveness(pid: int, match: str, profiler: _ProfilerSession, when: st
             f"browser target pid {pid} no longer matches {match!r} {when} (PID reused?)")
 
 
+#: Capture-readiness grace for the strict attach cells: 15s clears the
+#: measured BPF-verification pessimum with ~2x margin (5.76s of
+#: ``BPF_PROG_LOAD`` on Fedora 7.2.9, discovery→capturing ≈7s; <1s
+#: elsewhere) while staying tight enough to catch a hung profiler.
+#: Single source of truth: the strict cells reference this constant,
+#: never a literal.
+ATTACH_GRACE_SECONDS = 15
+
+#: The original 5s readiness bound, preserved as a logged regression
+#: signal: readiness slower than this warns on stderr but still passes
+#: inside ``ATTACH_GRACE_SECONDS``.
+SLOW_ATTACH_WARN_SECONDS = 5
+
+
 def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
                  flow, observe_module: Path, register_module: Path | None = None,
                  browser_env: dict | None = None,
                  duration_seconds: int = 90,
-                 attach_grace_seconds: int = 30,
+                 attach_grace_seconds: int = ATTACH_GRACE_SECONDS,
                  wait_for_map: tuple[str, ...] | None = None,
                  extra_browser_args: tuple[str, ...] = (),
                  auto_select_cert: bool = True,
@@ -378,9 +404,10 @@ def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
     profiler observes ``observe_module`` and starts first
     (duration-bounded); the flow runs only after the profiler prints its
     capture-readiness marker (``attach_grace_seconds`` bounds the wait —
-    30s by default, since a quiet attach takes under a second but a
-    post-campaign loaded host needs more), so early flow traffic is inside
-    the window. ``register_module`` is the
+    ``ATTACH_GRACE_SECONDS`` by default: BPF verification takes ≈6–8s on
+    Fedora 7.2.9 but <1s elsewhere, and readiness past
+    ``SLOW_ATTACH_WARN_SECONDS`` logs a regression warning), so early
+    flow traffic is inside the window. ``register_module`` is the
     provider registered in the fresh profile (`None` leaves the profile
     without one, for absence twins). ``browser_env`` (notably
     ``SOFTHSM2_CONF``) is applied to this process so the Playwright-launched

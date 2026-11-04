@@ -345,13 +345,9 @@ class WrapperTests(unittest.TestCase):
         code = extract_python_block(
             ROOT / "scripts/qualify-lifecycle-cli.sh", 'python3 - "$@"')
         with tempfile.TemporaryDirectory() as raw:
-            bad = write_results(
-                raw, nonqualifying_cell="profile-pid-reload")
-            # The summary block reads results.jsonl from its cwd.
-            target = Path(raw) / "results.jsonl"
-            if bad != target:
-                target.write_text(bad.read_text(encoding="utf-8"),
-                                  encoding="utf-8")
+            write_results(raw, nonqualifying_cell="profile-pid-reload")
+            # The summary block reads results.jsonl from its cwd, which
+            # write_results already populates.
             completed = subprocess.run(
                 [sys.executable, "-I", "-", *LIFECYCLE_CELLS],
                 input=code, capture_output=True, text=True, timeout=30,

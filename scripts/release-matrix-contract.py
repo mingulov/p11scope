@@ -171,7 +171,8 @@ RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixt
                    "tests/fixtures/public-cli/prearm-first-use.c")
 SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                 "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
-                "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py",
+                "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/system-scope-measure.py",
+                "scripts/check-capture-evidence.py",
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                 "tests/fixtures/public-cli/inventory-ledger.c", "tests/fixtures/public-cli/prearm-first-use.c")

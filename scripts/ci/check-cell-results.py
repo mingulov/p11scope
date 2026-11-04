@@ -4,13 +4,14 @@
 
 Each line must be one JSON object with exactly the keys cell, pass,
 qualification and detail. Qualification is a closed set: qualified,
-command-contract, owned-provider-counts, verdict-consistency,
-semantic-names and failed are qualified and every qualified row must
-pass; nonqualifying smoke may pass or fail but every nonqualifying row
-must be allow-listed and the allow-list must equal the nonqualifying
-set; expected-failure must equal its declared list and an expected
-failure that passes is a failure. Every --require cell must appear, so
-a dropped row fails.
+command-contract, owned-provider-counts,
+owned-provider-counts-with-runner-noise, prearm-exactness,
+verdict-consistency, semantic-names and failed are qualified and every
+qualified row must pass; nonqualifying smoke may pass or fail but every
+nonqualifying row must be allow-listed and the allow-list must equal
+the nonqualifying set; expected-failure must equal its declared list
+and an expected failure that passes is a failure. Every --require cell
+must appear, so a dropped row fails.
 
 Usage:
   python3 -I scripts/ci/check-cell-results.py RESULTS.JSONL [--expected-failure CELL ...] [--allow-nonqualifying CELL ...] [--require CELL ...]
@@ -27,6 +28,7 @@ def fail(message):
 
 
 QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
+             "owned-provider-counts-with-runner-noise", "prearm-exactness",
              "verdict-consistency", "semantic-names", "failed"}
 VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}
 

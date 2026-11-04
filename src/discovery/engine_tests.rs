@@ -5842,25 +5842,36 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
     // The fixture builds its function tables at run time, outside the
     // memory scan's reach, so the designed manifest flow prepares
     // them: the helper executes provider code in its own process
-    // (never in this observer). The lane builds the helper beside
-    // this test binary; delivery layouts keep them side by side.
+    // (never in this observer). `P11SCOPE_DISCOVER_BIN` names it
+    // explicitly (the privileged-inputs layout stages it under bin/,
+    // not beside lib-tests); otherwise the lane builds the helper
+    // beside this test binary.
     let discover = {
-        let deps = std::env::current_exe().expect("test binary path");
-        let sibling = deps.parent().expect("deps dir").join("p11scope-discover");
-        let cargo = deps
-            .parent()
-            .expect("deps dir")
-            .parent()
-            .expect("profile dir")
-            .join("p11scope-discover");
-        [sibling, cargo]
-            .into_iter()
-            .find(|candidate| candidate.is_file())
-            .unwrap_or_else(|| {
-                panic!(
-                    "{WHAT}: build the discover helper first (`cargo build -p p11scope-discover`)"
-                )
-            })
+        if let Ok(path) = std::env::var("P11SCOPE_DISCOVER_BIN") {
+            let explicit = std::path::PathBuf::from(&path);
+            assert!(
+                explicit.is_file(),
+                "{WHAT}: P11SCOPE_DISCOVER_BIN={path} is missing"
+            );
+            explicit
+        } else {
+            let deps = std::env::current_exe().expect("test binary path");
+            let sibling = deps.parent().expect("deps dir").join("p11scope-discover");
+            let cargo = deps
+                .parent()
+                .expect("deps dir")
+                .parent()
+                .expect("profile dir")
+                .join("p11scope-discover");
+            [sibling, cargo]
+                .into_iter()
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{WHAT}: no discover helper: set P11SCOPE_DISCOVER_BIN or build it beside this test binary (`cargo build -p p11scope-discover`)"
+                    )
+                })
+        }
     };
     let manifest_path = dir.path().join("manifest.json");
     let status = Command::new(&discover)

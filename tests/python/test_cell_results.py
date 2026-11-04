@@ -51,6 +51,12 @@ class CheckCellResultsTests(unittest.TestCase):
         result = run_checker([row("a", True), row("b", True, "owned-provider-counts")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_public_cli_qualified_kinds_accepted(self):
+        result = run_checker([row("run-prearm", True, "prearm-exactness", "held [] with 3/3 ledger"),
+                              row("system", True, "owned-provider-counts-with-runner-noise",
+                                  "counts match; disclosed runner noise")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_qualified_failure_fails(self):
         result = run_checker([row("a", True), row("b", False, "command-contract")])
         self.assertNotEqual(result.returncode, 0)

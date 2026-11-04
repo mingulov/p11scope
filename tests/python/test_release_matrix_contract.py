@@ -469,7 +469,8 @@ class MatrixContract(unittest.TestCase):
         repo = self.base / "source-clone"
         for name in ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                      "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
-                     "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py",
+                     "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/system-scope-measure.py",
+                     "scripts/check-capture-evidence.py",
                      "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                      "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                      "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
@@ -2238,7 +2239,8 @@ class MatrixContract(unittest.TestCase):
         # contract sealing and judge are the production bytes and entrypoints.
         repo = self.base / "controlled-source"
         (repo / "scripts").mkdir(parents=True)
-        for path in (RUNNER, CHECKER, ROOT / "scripts/public-cli-oracle.py", ROOT / "scripts/check-capture-evidence.py"):
+        for path in (RUNNER, CHECKER, ROOT / "scripts/public-cli-oracle.py", ROOT / "scripts/system-scope-measure.py",
+                     ROOT / "scripts/check-capture-evidence.py"):
             shutil.copy2(path, repo / "scripts" / path.name)
         for name in ("qualify-public-cli.sh", "qualify-inventory-native.sh", "run-privileged-lib-tests.sh"):
             path = repo / "scripts" / name

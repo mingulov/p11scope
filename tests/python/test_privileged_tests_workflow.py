@@ -199,6 +199,39 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         btrfs = job_body(self.yml, "privileged-btrfs")
         self.assertIn("--teardown", btrfs)
 
+    def test_privileged_input_downloads_match_uploads(self):
+        # Every privileged-inputs download must name an artifact a
+        # build job uploads; a renamed producer with a stale consumer
+        # fails the job at the download step with zero cells run.
+        steps = re.finditer(
+            r"uses: actions/(upload|download)-artifact@\S+[^\n]*\n"
+            r"(?P<indent>[ ]+)with:\n"
+            r"(?P<body>(?:(?P=indent)[ ]+[^\n]*\n)+)",
+            self.yml)
+        uploads = set()
+        downloads = []
+        for step in steps:
+            name = re.search(r"^\s+name: (\S.*\S|\S)\s*$",
+                             step.group("body"), re.M)
+            if name is None:
+                continue
+            if step.group(1) == "upload":
+                uploads.add(name.group(1))
+            else:
+                downloads.append(name.group(1))
+        self.assertTrue(downloads, "no named artifact downloads found")
+        for name in downloads:
+            if name.startswith("privileged-inputs"):
+                self.assertIn(name, uploads,
+                              f"download {name} has no producing upload")
+
+    def test_shard_step_exports_the_discover_helper(self):
+        # The exit-mappings cell resolves p11scope-discover through
+        # P11SCOPE_DISCOVER_BIN: the staged layout keeps it under bin/,
+        # not beside lib-tests.
+        shard = job_body(self.yml, "privileged-shard")
+        self.assertIn('P11SCOPE_DISCOVER_BIN="$in/bin/p11scope-discover"', shard)
+
     def test_campaign_input_selects_default_long_and_all(self):
         self.assertIn("campaign:", self.yml)
         self.assertIn("[default, long, all]", self.yml)
@@ -334,6 +367,15 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         block = summary.split("privileged-second-flavor:", 1)[0]
         self.assertIn("pattern: privileged-shard-*", block)
         self.assertIn("name: privileged-inputs-default", block)
+
+    def test_filesystem_campaigns_download_default_inputs(self):
+        for job, follower in (("privileged-btrfs:", "privileged-overlay:"),
+                              ("privileged-overlay:", "release-build:")):
+            block = self.yml.split(job, 1)[1].split(follower, 1)[0]
+            self.assertIn("name: privileged-inputs-default", block,
+                          f"{job} must download the decoupled default inputs")
+        self.assertNotIn("name: privileged-inputs\n", self.yml,
+                           "stale single-flavor inputs download remains")
 
     def test_second_flavor_build_and_cells(self):
         self.assertIn("privileged-build-journal:", self.yml)

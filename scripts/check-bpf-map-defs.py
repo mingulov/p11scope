@@ -2374,9 +2374,9 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
 )} | {
     # Inventory-only objects carry no journal words: 544 B, not 560 B.
     "THREAD_OWNER": map_def(29, 4, 544, 0, 1),
-    # The Inventory lifecycle ring is 2 MiB (Detailed keeps 64 KiB in
+    # The Inventory lifecycle ring is 8 MiB (Detailed keeps 64 KiB in
     # SAFE_MAPS); tracks ebpf-common INVENTORY_DISCOVERY_BYTES.
-    "DISCOVERY": map_def(27, 0, 0, 2 * 1024 * 1024),
+    "DISCOVERY": map_def(27, 0, 0, 8 * 1024 * 1024),
     "USAGE": map_def(2, 4, 8, 1),
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),

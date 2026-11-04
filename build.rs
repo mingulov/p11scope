@@ -349,7 +349,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(p11scope_small_discovery_ring)");
     println!("cargo:rustc-check-cfg=cfg(p11scope_image_bank_proof)");
     // The Inventory validator pins the DISCOVERY size this build compiled
-    // (2 MiB, or 4 KiB here), so the small-ring build loads again.
+    // (8 MiB, or 4 KiB here), so the small-ring build loads again.
     if small_discovery_ring {
         println!("cargo:rustc-cfg=p11scope_small_discovery_ring");
     }

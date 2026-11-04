@@ -31,6 +31,10 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ] && [ "$CONTROL" = 1 ]; then
   echo 'P11SCOPE_PUBLIC_CLI_CELLS cannot be combined with a --control mode' >&2
   exit 64
 fi
+if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ] && [ "${P11SCOPE_PUBLIC_CLI_ONLY_IA32:-0}" = 1 ]; then
+  echo 'P11SCOPE_PUBLIC_CLI_CELLS cannot be combined with P11SCOPE_PUBLIC_CLI_ONLY_IA32=1' >&2
+  exit 64
+fi
 # shellcheck disable=SC2086
 for _cell in ${P11SCOPE_PUBLIC_CLI_CELLS:-}; do
   case $_cell in
@@ -221,8 +225,8 @@ emit_judged() {
     result "$cell" 0 "oracle produced no output rc=$rc" failed; return 1
   fi
   local qual detail
-  qual=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qualification"])') || qual=failed
-  detail=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["detail"])') || detail="$line"
+  qual=$(printf '%s' "$line" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["qualification"])') || qual=failed
+  detail=$(printf '%s' "$line" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["detail"])') || detail="$line"
   if [ "$rc" = 0 ]; then
     result "$cell" 1 "UNEXPECTED PASS ($reason may have landed): [$qual] $detail" expected-failure
     return 1
@@ -433,7 +437,9 @@ cgroup_capture() {
   local scope=cgroup wl=''
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   if [ -e "$CG" ]; then
-    if [ -s "$CG/cgroup.procs" ]; then
+    # cgroupfs files report st_size 0 even with content, so test -s is
+    # always false here; read the content instead.
+    if [ -n "$(cat "$CG/cgroup.procs" 2>/dev/null)" ]; then
       result "$cell" 0 "stale owned cgroup not empty $CG (prior leak, manual cleanup required)" failed; return 1
     fi
     rmdir "$CG" 2>/dev/null || { result "$cell" 0 "stale owned cgroup not removable $CG" failed; return 1; }

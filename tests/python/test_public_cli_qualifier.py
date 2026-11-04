@@ -70,9 +70,7 @@ class SummaryTests(unittest.TestCase):
                 cwd=tmp)
         self.assertIn("EXIT=2", proc.stdout,
                       f"summary must exit 2 (valid with smoke/expected), got: {proc.stdout}\n{proc.stderr}")
-        summary = (tmp / "summary.txt").read_text() if (tmp / "summary.txt").exists() else ""
-        # tmp is cleaned; re-read from proc? summary.txt was in temp dir, now gone.
-        # Check via stdout (tee prints to stdout too).
+        # tmp is cleaned with its summary.txt; check via stdout (tee prints too).
         self.assertIn("terminal_rows_valid=True", proc.stdout)
 
     def test_unexpected_pass_fails_summary(self):

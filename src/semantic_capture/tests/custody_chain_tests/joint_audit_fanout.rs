@@ -8485,12 +8485,14 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     );
 }
 
-/// A void the pool cannot pay for is all-or-nothing: the lane stays
-/// broken and un-voided (no key refused, no custody dropped), and the
-/// refusal takes the machine's ordinary disposition gate like any other
-/// Idle refusal, so the owner ends Joint by its named S1 fallback.
+/// A void the pool cannot pay for is all-or-nothing and retried: the
+/// lane stays broken and un-voided (no key refused, no custody dropped)
+/// while the pool is short, every Idle tick yields instead of refusing,
+/// so the machine never takes the disposition gate (a Joint fault never
+/// stops S1). Once the pool can pay, the next tick voids, re-syncs and
+/// S1 joins the follow-up call.
 #[test]
-fn joint_machine_unpaid_linked_break_void_takes_the_disposition_gate() {
+fn joint_machine_unpaid_linked_break_void_retries_until_paid() {
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
     fixture.scene.drain.source_mut().push_record(vec![0; 17]);
@@ -8532,27 +8534,35 @@ fn joint_machine_unpaid_linked_break_void_takes_the_disposition_gate() {
     assert!(room >= bound, "the pool could pay before the hold");
     let hold = reserve.reserve(room - (bound - 1)).unwrap();
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
-    let mut refused = None;
-    for _ in 0..64 {
+    for _ in 0..16 {
         let result = fixture.service(1);
+        assert_eq!(result.err(), None, "an unpaid void yields, never refuses");
         assert_eq!(pending(&fixture), (true, false), "no partial void");
-        if let Err(reason) = result {
-            refused = Some(reason);
+    }
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "the unpaid void never takes the disposition gate"
+    );
+    assert_eq!(api_returns(&fixture), before, "nothing joins while unpaid");
+    drop(hold);
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the paid void and its re-sync never refuse");
+        if pending(&fixture) == (false, false) {
+            resynced = true;
             break;
         }
     }
-    assert_eq!(refused, Some(SemanticRefusal::Unavailable));
-    assert_eq!(
-        fixture.machine.disposition_reason(),
-        Some(SemanticRefusal::Unavailable),
-        "the unpaid void takes the ordinary disposition gate"
-    );
+    assert!(resynced, "the retried void applies once the pool can pay");
+    fixture.published_labeled("unpaid-void-followup", None);
     assert_eq!(
         api_returns(&fixture),
-        before,
-        "nothing joins before the disposition"
+        before + 1,
+        "S1 joins the follow-up call"
     );
-    drop(hold);
 }
 
 /// A mid-call call straddling an unlinked break still completes:

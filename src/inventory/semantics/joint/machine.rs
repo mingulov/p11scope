@@ -2798,11 +2798,20 @@ impl LiveJointMachine {
                 // The void returns no seal failure, so it names its own
                 // ending here; the break quantum's seal gap and the
                 // refused keys' later seals are disclosed separately.
+                // A void the semantic pool cannot pay for yet is retried on
+                // later running Idle ticks (it is idempotent and
+                // all-or-nothing): the tick yields instead of refusing, so
+                // a short pool never takes the disposition gate and stops
+                // S1. A finish keeps the refusal, so a stop never waits on
+                // the pool.
                 if self.producers.journal_linked() {
-                    let voided = retain_on_refusal!(
-                        Phase::Idle,
-                        coordinator.joint_capture_mut().void_ingest_break()
-                    );
+                    let voided = match coordinator.joint_capture_mut().void_ingest_break() {
+                        Ok(voided) => voided,
+                        Err(RawQuantumRefusal::Resource(_)) if q.is_none() => {
+                            return (Phase::Idle, Ok(Step::Yield));
+                        }
+                        Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),
+                    };
                     if voided {
                         coordinator.note_scope_gap(
                             "Joint key operations unavailable; retained S1".to_string(),

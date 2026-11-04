@@ -291,6 +291,8 @@ pub(crate) struct InstanceTracking {
     /// the first): growth raises the fault era, see
     /// [`audit_image_hooks_with`].
     hook_misses: std::sync::Mutex<BTreeMap<&'static str, u64>>,
+    /// Fault raises made for recursion-miss growth (counts only).
+    miss_raises: std::sync::atomic::AtomicU64,
 }
 
 /// Test-only Stage A measurement toggle (Task 1d): `P11SCOPE_T3A_DISABLE_HOOKS`
@@ -523,11 +525,31 @@ impl InstanceTracking {
         tracking
     }
 
+    /// The hook recursion-miss total at the last audit and the number of
+    /// fault raises those misses caused. Counts only, for the stop line
+    /// and the router's miss-era carry.
+    pub(super) fn miss_totals(&self) -> (u64, u64) {
+        let misses = self
+            .hook_misses
+            .lock()
+            .map(|baseline| {
+                baseline
+                    .values()
+                    .fold(0u64, |sum, n| sum.saturating_add(*n))
+            })
+            .unwrap_or(0);
+        (
+            misses,
+            self.miss_raises.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// Returns whether this audit raised the fault era for new misses.
     pub(super) fn audit(
         &self,
         ebpf: &Ebpf,
         coverage: &super::image_query::CoverageControl,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Ok(mut misses) = self.hook_misses.lock() else {
             coverage.fail();
             bail!("image hook miss baseline poisoned");
@@ -544,7 +566,12 @@ impl InstanceTracking {
                 Ok((maps.sticky()?, maps.fault()?))
             },
             &mut misses,
-            || InstanceMaps { ebpf }.raise_fault(),
+            || {
+                let raised = InstanceMaps { ebpf }.raise_fault()?;
+                self.miss_raises
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(raised)
+            },
         )
     }
 
@@ -1982,20 +2009,39 @@ fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<u64> {
 
 pub(super) fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
     use std::sync::atomic::Ordering;
-    let mut seen = cell.load(Ordering::SeqCst);
+    raise_fault_with(cell.load(Ordering::SeqCst), |seen, next| {
+        cell.compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst)
+    })
+}
+
+/// The bounded raise over one compare-and-swap seam (the real atomic cell
+/// in production; a scripted swap in the contention twins).
+fn raise_fault_with(
+    mut seen: u64,
+    mut swap: impl FnMut(u64, u64) -> std::result::Result<u64, u64>,
+) -> Result<u64> {
     for _ in 0..8 {
         ensure!(
             seen <= u64::from(u32::MAX),
             "instance fault generation exhausted"
         );
         let next = seen + 1;
-        match cell.compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst) {
+        match swap(seen, next) {
             Ok(_) => {
                 ensure!(
                     next <= u64::from(u32::MAX),
                     "instance fault generation exhausted"
                 );
                 return Ok(next);
+            }
+            // A lost swap means another raiser (BPF or userspace) already
+            // moved the cell past the value read: that is all a raise needs.
+            Err(current) if current > seen => {
+                ensure!(
+                    current <= u64::from(u32::MAX),
+                    "instance fault generation exhausted"
+                );
+                return Ok(current);
             }
             Err(current) => seen = current,
         }
@@ -2058,6 +2104,26 @@ mod fault_raise_tests {
     use super::raise_fault_cell;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
+
+    /// A lost swap means another raiser already moved the cell past the
+    /// value read, which is all a raise needs: no retry storm can latch
+    /// coverage, and the exhaustion checks still hold.
+    #[test]
+    fn a_raise_lost_to_other_raisers_still_succeeds() {
+        let mut cell = 41u64;
+        let raised = super::raise_fault_with(41, |seen, _| {
+            // Another raiser wins every swap.
+            cell = cell.max(seen) + 1;
+            Err(cell)
+        });
+        assert_eq!(raised.unwrap(), 42);
+        let exhausted =
+            super::raise_fault_with(u64::from(u32::MAX) - 1, |_, _| Err(u64::from(u32::MAX) + 1));
+        assert!(
+            exhausted.is_err(),
+            "a lost swap to exhaustion still refuses"
+        );
+    }
 
     #[test]
     fn healthy_fault_raise_updates_the_real_atomic_cell() {
@@ -2291,7 +2357,7 @@ pub(super) fn audit_image_hooks_with(
     read_faults: impl FnOnce() -> Result<(u64, u64)>,
     misses: &mut BTreeMap<&'static str, u64>,
     raise_fault: impl FnOnce() -> Result<u64>,
-) -> Result<()> {
+) -> Result<bool> {
     let result = (|| {
         ensure!(active && coverage.enabled(), "image continuity unavailable");
         let mut seen = BTreeMap::new();
@@ -2308,10 +2374,18 @@ pub(super) fn audit_image_hooks_with(
         // every call stamped across the miss (collected before this audit)
         // fails as a counted coverage fault and later calls re-prove. A
         // counter that went backwards, or a failed raise, stays permanent.
+        // The exec-release hook keeps the permanent latch: BPF treats a lost
+        // exec invalidation as permanent too, and it shows no misses even
+        // under an exec storm, so the latch costs nothing in practice.
         let mut grew = false;
         for (name, now) in &seen {
             let before = misses.get(name).copied().unwrap_or(0);
             ensure!(*now >= before, "image hook miss counter regressed");
+            ensure!(
+                *now == before
+                    || (*name != INSTANCE_PROGRAMS[3].0 && *name != EXEC_RELEASE_MMAP_PROGRAM),
+                "image exec-release hook missed"
+            );
             grew |= *now > before;
         }
         if grew {
@@ -2327,7 +2401,7 @@ pub(super) fn audit_image_hooks_with(
             coverage.enabled(),
             "image continuity failed during health audit"
         );
-        Ok(())
+        Ok(grew)
     })();
     if result.is_err() {
         coverage.fail();
@@ -2693,7 +2767,9 @@ mod tests {
             .into_iter()
             .map(|(name, stats)| (name, stats.program_id))
             .collect();
-        for missed in 0..super::INSTANCE_PROGRAMS.len() {
+        // The exec-release hook (index 3) keeps the permanent latch; see
+        // `production_exec_release_hook_misses_still_latch_coverage`.
+        for missed in 0..super::INSTANCE_PROGRAMS.len() - 1 {
             let coverage = super::super::image_query::CoverageControl::test_owner(true);
             let mut misses = std::collections::BTreeMap::new();
             let raises = std::cell::Cell::new(0);
@@ -2728,6 +2804,48 @@ mod tests {
             assert!(audit(5).is_ok());
             assert_eq!(raises.get(), 2, "each later growth raises again");
             assert!(coverage.enabled(), "coverage survives recursion misses");
+        }
+    }
+
+    /// BPF treats a lost exec invalidation as permanent, so a miss on the
+    /// exec-release hook (either variant) still latches coverage off.
+    #[test]
+    fn production_exec_release_hook_misses_still_latch_coverage() {
+        for exec in [
+            super::INSTANCE_PROGRAMS[3].0,
+            super::EXEC_RELEASE_MMAP_PROGRAM,
+        ] {
+            let mut names: Vec<&'static str> = super::INSTANCE_PROGRAMS
+                .iter()
+                .map(|(name, _)| *name)
+                .collect();
+            names[3] = exec;
+            let expected: std::collections::BTreeMap<_, _> = healthy_hook_stats_for(&names)
+                .into_iter()
+                .map(|(name, stats)| (name, stats.program_id))
+                .collect();
+            let coverage = super::super::image_query::CoverageControl::test_owner(true);
+            let mut stats = healthy_hook_stats_for(&names);
+            stats[3].1.recursion_misses = 1;
+            let raises = std::cell::Cell::new(0);
+            let result = super::audit_image_hooks_with(
+                &coverage,
+                true,
+                4,
+                &expected,
+                || Ok("1".into()),
+                || Ok(stats),
+                || Ok((0, 0)),
+                &mut std::collections::BTreeMap::new(),
+                || {
+                    raises.set(raises.get() + 1);
+                    Ok(1)
+                },
+            );
+            assert!(result.is_err(), "{exec}: an exec-release miss latches");
+            assert_eq!(raises.get(), 0);
+            assert!(!coverage.enabled());
+            assert!(coverage.enable().is_err());
         }
     }
 

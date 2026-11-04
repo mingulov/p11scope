@@ -2333,3 +2333,115 @@ fn colliding_maps_keys_are_confirmed_by_map_files_identity() {
     });
     assert!(refused.is_err());
 }
+
+/// Repeated hook-miss eras over an unchanged load never use up the
+/// instance ceiling: the first re-proof of each era whose ranges and local
+/// epoch match the previous era reuses that era's instance, so IDs are
+/// bounded by distinct loads, not by eras. The reuse is disclosed once
+/// (continuity is uncertain across the miss).
+#[test]
+fn hook_miss_eras_reuse_the_instance_of_an_unchanged_load() {
+    let mut r = InstanceRouter::new(
+        domain(),
+        RouterLimits {
+            instances: 2,
+            ..RouterLimits::default()
+        },
+    );
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    for fault in 1..=20u32 {
+        r.note_hook_miss_era();
+        r.audit(u64::from(fault), 0, 0);
+        let (outcome, _) = r.observe_legacy(fresh(
+            &r,
+            observation(2, u64::from(fault), u64::from(fault), load(BASE_A)),
+        ));
+        assert_eq!(outcome, ObserveOutcome::Continued, "era {fault}");
+        assert_eq!(
+            r.route(call(
+                u64::from(fault) + 1,
+                stamp(2, fault, fault),
+                ip_in(BASE_A)
+            )),
+            Route::Joined(first),
+            "era {fault} joins the reused instance"
+        );
+    }
+    assert_eq!(r.instances_minted(), 1);
+    assert_eq!(r.counters().eras, 20);
+    assert_eq!(r.counters().continued_across_miss_era, 20);
+    let disclosed = r.take_reload_not_excluded();
+    assert_eq!(disclosed.len(), 1, "the uncertain identity is named once");
+    assert_eq!(disclosed[0].ids, vec![first]);
+}
+
+/// The reuse is narrow: a changed load, a moved local epoch, or an
+/// ordinary (non-miss) fault era still mints.
+#[test]
+fn hook_miss_era_reuse_needs_the_same_load_and_local_epoch() {
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    // Moved load: mints.
+    r.note_hook_miss_era();
+    r.audit(1, 0, 0);
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(2, 0, 1, load(BASE_B))))
+            .0,
+        ObserveOutcome::New
+    );
+    let moved = joined(r.route(call(2, stamp(2, 0, 1), ip_in(BASE_B))));
+    assert_ne!(moved, first);
+    // Moved local epoch: mints.
+    r.note_hook_miss_era();
+    r.audit(2, 0, 0);
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(3, 0, 2, load(BASE_B))))
+            .0,
+        ObserveOutcome::New
+    );
+    let local = joined(r.route(call(3, stamp(3, 0, 2), ip_in(BASE_B))));
+    assert_ne!(local, moved);
+    // An ordinary fault era (no hook miss): mints.
+    r.audit(3, 0, 0);
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(3, 0, 3, load(BASE_B))))
+            .0,
+        ObserveOutcome::New
+    );
+    let ordinary = joined(r.route(call(4, stamp(3, 0, 3), ip_in(BASE_B))));
+    assert_ne!(ordinary, local);
+    assert_eq!(r.instances_minted(), 4);
+    assert_eq!(r.counters().continued_across_miss_era, 0);
+}
+
+/// A key not re-proven during one miss era keeps its carry into the next
+/// miss era, and an image retired meanwhile never revives through it.
+#[test]
+fn hook_miss_era_carry_survives_unproven_eras_but_not_retirement() {
+    let mut r = router();
+    r.observe_legacy(observation(2, 0, 0, load(BASE_A)));
+    let first = joined(r.route(call(1, stamp(2, 0, 0), ip_in(BASE_A))));
+    for fault in 1..=3 {
+        r.note_hook_miss_era();
+        r.audit(fault, 0, 0);
+    }
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(2, 0, 3, load(BASE_A))))
+            .0,
+        ObserveOutcome::Continued
+    );
+    assert_eq!(
+        r.route(call(2, stamp(2, 0, 3), ip_in(BASE_A))),
+        Route::Joined(first)
+    );
+    r.note_hook_miss_era();
+    r.audit(4, 0, 0);
+    r.retire_image(image(COOKIE, 0));
+    assert_eq!(
+        r.observe_legacy(fresh(&r, observation(2, 0, 4, load(BASE_A))))
+            .0,
+        ObserveOutcome::Retired
+    );
+}

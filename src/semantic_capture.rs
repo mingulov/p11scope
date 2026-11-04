@@ -1250,6 +1250,11 @@ trait CaptureIo {
     fn collect(&mut self, limit: usize) -> Collection;
     fn health(&mut self) -> Result<Health, ()>;
     fn raise_fault(&mut self) -> Result<u64, ()>;
+    /// Hook recursion-miss total and the fault raises those misses caused
+    /// (counts only). Read after `health`; fixtures without hooks report none.
+    fn hook_miss_totals(&mut self) -> (u64, u64) {
+        (0, 0)
+    }
     fn retained_attachment(
         &self,
         slot: u32,
@@ -1407,6 +1412,9 @@ impl CaptureIo for SessionIo<'_> {
     fn raise_fault(&mut self) -> Result<u64, ()> {
         self.session.instance_maps().raise_fault().map_err(|_| ())
     }
+    fn hook_miss_totals(&mut self) -> (u64, u64) {
+        self.session.hook_miss_totals()
+    }
     fn retained_attachment(
         &self,
         slot: u32,
@@ -1544,6 +1552,11 @@ pub(crate) struct SemanticCapture {
     pending_discovery_status: CollectionStatus,
     stopped: bool,
     continuity_cuts: u64,
+    /// Hook recursion-miss total and miss-caused fault raises at the last
+    /// audit (counts only): a raise count that moved marks the fault move
+    /// as a hook-miss era for the router's instance carry.
+    hook_misses: u64,
+    miss_raises: u64,
     /// Last tick's scan count and refusals, for the stuck-transaction
     /// diagnostic only. Test-visible; production behavior never reads it.
     #[cfg(test)]
@@ -1651,6 +1664,8 @@ impl SemanticCapture {
             pending_discovery_status: CollectionStatus::Complete,
             stopped: false,
             continuity_cuts: 0,
+            hook_misses: 0,
+            miss_raises: 0,
             #[cfg(test)]
             last_tick_scans_for_test: 0,
             #[cfg(test)]
@@ -2767,6 +2782,10 @@ impl SemanticCapture {
         }
         Ok(report)
     }
+    /// The hook recursion-miss total at the last audit (counts only).
+    pub(crate) fn hook_misses(&self) -> u64 {
+        self.hook_misses
+    }
     pub(crate) fn tick(
         &mut self,
         session: &mut Session,
@@ -3261,6 +3280,14 @@ impl SemanticCapture {
             self.fail_coverage(io, report);
             return false;
         };
+        let (misses, raises) = io.hook_miss_totals();
+        self.hook_misses = misses;
+        if raises != self.miss_raises && health.fault != self.fault {
+            // The fault moved for hook misses: unchanged loads re-prove
+            // onto their previous instances (continuity uncertain).
+            self.router.note_hook_miss_era();
+        }
+        self.miss_raises = raises;
         self.audit_health(health, report)
     }
     fn audit_health(&mut self, health: Health, report: &mut TickReport) -> bool {

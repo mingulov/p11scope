@@ -2872,6 +2872,9 @@ struct SemanticStopCounts {
     lost: u64,
     bindings: u64,
     refused: u64,
+    hook_misses: u64,
+    eras: u64,
+    instances: u64,
 }
 
 impl SemanticStopCounts {
@@ -2883,6 +2886,7 @@ impl SemanticStopCounts {
         let (collected, joined, shed, refused) = lane.semantic_stop_call_counts();
         let lost = lane.events_ring_loss_disclosed();
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
+        let (hook_misses, eras, instances) = lane.semantic_era_counts();
         Self {
             refusals,
             collected,
@@ -2891,6 +2895,9 @@ impl SemanticStopCounts {
             lost,
             bindings,
             refused,
+            hook_misses,
+            eras,
+            instances,
         }
     }
 }
@@ -2913,6 +2920,9 @@ fn disclose_semantic_stop(
         counts.lost,
         counts.bindings,
         counts.refused,
+        counts.hook_misses,
+        counts.eras,
+        counts.instances,
     ));
     // Diagnostic-only settlement latency rides the same disclosure:
     // cumulative since enabling, silent unless the toggle enabled it.
@@ -5085,8 +5095,14 @@ where
             });
         // No drainer thread: the load runs undrained, exactly as before
         // the startup drain (the ring keeps what it can and counts the
-        // rest).
-        let _ = drainer;
+        // rest). Say so once, so the counted ring loss has a cause.
+        if let Err(error) = drainer {
+            eprintln!(
+                "p11scope: startup lifecycle drain unavailable ({}); \
+                 the semantic start runs undrained",
+                error.kind()
+            );
+        }
         // Released on return and on unwind, so the scope never waits on
         // a drainer whose load panicked.
         let _done = Done(&done);
@@ -13717,7 +13733,7 @@ mod tests {
             assert_eq!(
                 take_warned_for_test(),
                 vec![crate::inventory_semantics::semantic_stop_line(
-                    0, 0, 3, 7, 1, 0
+                    0, 0, 3, 7, 1, 0, 0, 0, 0
                 )],
                 "the stop line carries loss past the last terminal commit"
             );
@@ -21338,7 +21354,7 @@ mod promotion_driver_tests {
     /// collected/joined/refused, real shed, no bound callers in the
     /// scene.
     fn expected_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 0, 12)
+        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 0, 12, 0, 0, 0)
     }
 
     #[test]
@@ -21355,8 +21371,9 @@ mod promotion_driver_tests {
         assert_eq!(counts.shed, 7, "shed counts drained calls only");
         assert_eq!(counts.lost, 11, "ring loss reads as lost records");
         assert_eq!(
-            crate::inventory_semantics::semantic_stop_line(68, 5, 7, 11, 0, 12),
-            "p11scope: semantic calls: collected 68, joined 5, shed 7, lost 11, bindings 0, refused 12"
+            crate::inventory_semantics::semantic_stop_line(68, 5, 7, 11, 0, 12, 3, 2, 1),
+            "p11scope: semantic calls: collected 68, joined 5, shed 7, lost 11, bindings 0, refused 12, \
+             hook misses 3, eras 2, instances 1"
         );
     }
 
@@ -21787,7 +21804,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -21817,7 +21834,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -21947,7 +21964,7 @@ mod promotion_driver_tests {
     /// The stop line the final-lane twin expects: its own scripted
     /// collected/joined/refused, its own real shed, no bound callers.
     fn expected_final_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 0, 5)
+        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 0, 5, 0, 0, 0)
     }
 
     #[test]
@@ -22499,7 +22516,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                68, 5, 7, 9, 0, 12
+                68, 5, 7, 9, 0, 12, 0, 0, 0
             )],
             "the stop line carries the hold-polled loss"
         );
@@ -22585,12 +22602,15 @@ mod promotion_driver_tests {
             lost: 0,
             bindings: 1,
             refused: 0,
+            hook_misses: 0,
+            eras: 0,
+            instances: 0,
         };
         disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
         assert_eq!(
             take_warned_for_test(),
             vec![
-                crate::inventory_semantics::semantic_stop_line(5, 5, 0, 0, 1, 0),
+                crate::inventory_semantics::semantic_stop_line(5, 5, 0, 0, 1, 0, 0, 0, 0),
                 "p11scope: settlement latency: samples=0 p50=- p99=- \
                  max=0ms overflow=0 unknown_ts=0 (1ms buckets, entry-based)"
                     .to_string(),
@@ -22973,7 +22993,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                68, 5, 7, 9, 0, 12
+                68, 5, 7, 9, 0, 12, 0, 0, 0
             )],
             "the stop line carries the hold-polled loss"
         );
@@ -23311,7 +23331,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0
             )],
             "the wind-down discloses the legacy lane once"
         );

@@ -45,6 +45,12 @@ enum Variant {
     /// no definition in the witness, but the presence bit must survive
     /// the pin → bind chain.
     IfuncGetter,
+    /// The Fedora/Chromium shape: the table is stamped 3.2 (with a
+    /// deterministic non-pointer tail refuting wider layouts), and the
+    /// loader preloads a second provider exporting `C_GetFunctionList`,
+    /// so the bootstrap slot forwards out of the module by ordinary
+    /// dynamic-linker interposition.
+    Interposed32,
 }
 
 fn legacy_names() -> Vec<&'static str> {
@@ -87,12 +93,27 @@ fn source(variant: Variant) -> String {
         }
     };
     let entries: Vec<String> = (0..LEGACY_ORDINALS).map(entry).collect();
-    c.push_str(&format!(
-        "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{LEGACY_ORDINALS}]; }};\n\
-         __attribute__((used)) static const struct p11scope_legacy_table p11scope_table = \
-         {{ 2, 40, {{ {} }} }};\n",
-        entries.join(", ")
-    ));
+    if matches!(variant, Variant::Interposed32) {
+        // The 3.2 stamp walks the 68-slot known prefix; the embedded tail
+        // of small non-pointer words refutes wider layouts at ordinal 68
+        // deterministically (low addresses never resolve to executable
+        // file mappings), proving the prefix complete.
+        let tail: Vec<String> = (1..=24).map(|word| word.to_string()).collect();
+        c.push_str(&format!(
+            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{LEGACY_ORDINALS}]; unsigned long tail[24]; }};\n\
+             __attribute__((used)) static const struct p11scope_legacy_table p11scope_table = \
+             {{ 3, 2, {{ {} }}, {{ {} }} }};\n",
+            entries.join(", "),
+            tail.join(", ")
+        ));
+    } else {
+        c.push_str(&format!(
+            "struct p11scope_legacy_table {{ unsigned char major, minor; void *fns[{LEGACY_ORDINALS}]; }};\n\
+             __attribute__((used)) static const struct p11scope_legacy_table p11scope_table = \
+             {{ 2, 40, {{ {} }} }};\n",
+            entries.join(", ")
+        ));
+    }
     if matches!(variant, Variant::IfuncGetter) {
         c.push_str(
             "static unsigned long get_interface_impl(void) { return 0; }\n\
@@ -152,6 +173,77 @@ int main(int argc, char **argv) {
     driver
 }
 
+/// A second provider exporting only the `C_GetFunctionList` bootstrap, so a
+/// provider loaded after it (globally visible) interposes that one slot.
+fn build_preload(dir: &Path) -> PathBuf {
+    let c = dir.join("preload.c");
+    let path = dir.join("preload.so");
+    std::fs::write(
+        &c,
+        "unsigned long C_GetFunctionList(void) { return 0xC11CE5; }\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new("gcc")
+        .args(["-shared", "-fPIC", "-O0", "-o"])
+        .arg(&path)
+        .arg(&c)
+        .output()
+        .expect("spawn gcc for the preload fixture");
+    assert!(
+        output.status.success(),
+        "the preload fixture must compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    path
+}
+
+fn build_interposed_loader(dir: &Path) -> PathBuf {
+    let source = dir.join("load-interposed.c");
+    let driver = dir.join("load-interposed");
+    std::fs::write(
+        &source,
+        r#"#include <dlfcn.h>
+#include <errno.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 3) return 64;
+    void *pre = dlopen(argv[1], RTLD_NOW | RTLD_GLOBAL);
+    if (!pre) {
+        (void)write(STDERR_FILENO, "fixture preload failed\n", 23);
+        return 65;
+    }
+    void *handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+    if (!handle) {
+        (void)write(STDERR_FILENO, "fixture dlopen failed\n", 22);
+        return 65;
+    }
+    if (write(STDOUT_FILENO, "ready\n", 6) != 6) return 66;
+    char input;
+    ssize_t result;
+    do { result = read(STDIN_FILENO, &input, 1); }
+    while (result < 0 && errno == EINTR);
+    dlclose(handle);
+    dlclose(pre);
+    return result < 0 ? 67 : 0;
+}
+"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new("gcc")
+        .args(["-O0", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&driver)
+        .arg(&source)
+        .arg("-ldl")
+        .output()
+        .expect("spawn gcc for load-interposed fixture");
+    assert!(
+        output.status.success(),
+        "the load-interposed fixture must compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    driver
+}
+
 impl Loaded {
     fn build(variant: Variant) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -183,6 +275,44 @@ impl Loaded {
             _dir: dir,
             path,
         }
+    }
+
+    /// The interposed twin: the preload lands first and globally visible,
+    /// so the provider's bootstrap relocation binds to the preload's
+    /// `C_GetFunctionList`. Returns the loaded subject and the preload path.
+    fn build_interposed() -> (Self, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("provider.c");
+        let path = dir.path().join("provider.so");
+        std::fs::write(&c, source(Variant::Interposed32)).unwrap();
+        let output = std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-O0", "-o"])
+            .arg(&path)
+            .arg(&c)
+            .output()
+            .expect("spawn gcc");
+        assert!(
+            output.status.success(),
+            "the export-linkage fixture must compile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let preload = build_preload(dir.path());
+        let child = std::process::Command::new(build_interposed_loader(dir.path()))
+            .arg(&preload)
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .expect("spawn owned load-interposed subject");
+        let subject = OwnedMapper::from_child(child, std::time::Duration::from_secs(5))
+            .expect("the loaded subject must acknowledge readiness and stop");
+        let loaded = Self {
+            subject,
+            _dir: dir,
+            path,
+        };
+        (loaded, preload)
     }
 
     /// The production scan → pin → reconcile chain over the retained
@@ -424,6 +554,65 @@ fn exported_standard_names_that_agree_with_every_ordinal_name_the_table() {
     assert_count_only(&plan);
 }
 
+/// RED (live triage): the Fedora/Chromium shape — a 3.2-stamped table whose
+/// bootstrap slot forwards to a preloaded provider's same-named export by
+/// ordinary linker interposition — still names every ordinal (linkage
+/// `exports`) and publishes the proven-complete prefix as a full walk.
+/// The unanimous 67 same-object agreements prove the layout; the forwarded
+/// bootstrap keeps its ABI-definitional name instead of poisoning the table.
+#[test]
+fn interposed_bootstrap_names_the_table_and_publishes_full_walk() {
+    let (loaded, preload) = Loaded::build_interposed();
+    let exports = loaded.exports_by_offset();
+    assert_eq!(exports.len(), LEGACY_ORDINALS, "every name is its own stub");
+    let preload_file = std::fs::File::open(&preload).unwrap();
+    let preload_offsets =
+        p11scope_manifest::elf::exports_matching(&preload_file, &["C_GetFunctionList"]).unwrap();
+    assert_eq!(
+        preload_offsets.len(),
+        1,
+        "the preload exports the bootstrap"
+    );
+    let (_, preload_offset) = &preload_offsets[0];
+    let plan = loaded.plan();
+
+    let tables = &plan.modules[0].tables;
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].version, (3, 2), "{tables:?}");
+    assert_eq!(tables[0].linkage, "exports", "{tables:?}");
+    assert_eq!(plan.slots.len(), LEGACY_ORDINALS);
+    let (forwarded, local): (Vec<_>, Vec<_>) = plan
+        .slots
+        .iter()
+        .partition(|slot| slot.names == ["C_GetFunctionList"]);
+    assert_eq!(forwarded.len(), 1, "one bootstrap slot: {:?}", plan.slots);
+    assert_eq!(
+        forwarded[0].file_offset, *preload_offset,
+        "the bootstrap slot targets the preload's export: {:?}",
+        forwarded[0]
+    );
+    for slot in local {
+        assert_eq!(
+            Some(&slot.names),
+            exports.get(&slot.file_offset),
+            "slot at {:#x} carries the name exported there",
+            slot.file_offset
+        );
+    }
+    for slot in &plan.slots {
+        assert!(!slot.aliased, "{slot:?}");
+    }
+    let surface = plan
+        .surfaces
+        .iter()
+        .find(|surface| surface.source.contains("table 3.2"))
+        .expect("the 3.2 table surface is published");
+    assert_eq!(surface.walk, "full", "{surface:?}");
+    assert_eq!(surface.acquisition, "ok", "{surface:?}");
+    assert_eq!(surface.functions, LEGACY_ORDINALS, "{surface:?}");
+    assert_count_only(&plan);
+}
+
 /// A table that contradicts any exported name is refused as a whole: the
 /// single table predicate never names a suspect layout by position.
 #[test]
@@ -584,6 +773,192 @@ fn an_unpinned_entry_whose_name_is_exported_contradicts_the_table() {
             disagreeing: 1,
         },
         "the unpinned C_Sign contradicts; the NULL entry stays neutral"
+    );
+    assert!(!agreement.corroborates());
+}
+
+/// RED (live triage): the interposed bootstrap — `C_GetFunctionList`
+/// forwarded to another object while the rest of the table agrees —
+/// keeps its ABI-definitional name instead of contradicting the table.
+/// The dynamic linker resolves that relocation by name, so the target is
+/// a `C_GetFunctionList` definition by construction; the unanimous rest
+/// proves the layout is a real function list.
+#[test]
+fn forwarded_bootstrap_with_agreeing_rest_keeps_its_name() {
+    use super::{ExportAgreement, ObjectExports, ScannedEntry, ScannedTable, export_agreement};
+    use p11scope_manifest::maps::{Device, ObjectKey};
+
+    let object = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let forwarded = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 43,
+    };
+    let table = ScannedTable {
+        version: (3, 2),
+        walk: "known_prefix",
+        entries: vec![
+            ScannedEntry {
+                name: "C_Initialize",
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            },
+            ScannedEntry {
+                name: "C_GetFunctionList",
+                object: forwarded,
+                object_path: "/opt/dep.so".into(),
+                file_offset: 0xebe0,
+            },
+        ],
+        null_entries: Vec::new(),
+        unpinned: Vec::new(),
+        address: 0x7000,
+        file_offset: Some(0x100),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: true,
+    };
+    let symbols = vec![
+        ("C_Initialize".to_string(), 0x10),
+        ("C_GetFunctionList".to_string(), 0x20),
+    ];
+    let agreement = export_agreement(
+        &table,
+        &ObjectExports {
+            object,
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        },
+    );
+    assert_eq!(
+        agreement,
+        ExportAgreement {
+            agreeing: 2,
+            disagreeing: 0,
+        },
+        "the forwarded bootstrap agrees once the rest proves the layout"
+    );
+    assert!(agreement.corroborates());
+}
+
+/// The bootstrap exemption needs the layout proof: a forwarded
+/// `C_GetFunctionList` with no agreeing entry anywhere is a contradiction,
+/// exactly as before — a lone forward proves nothing.
+#[test]
+fn forwarded_bootstrap_without_agreeing_rest_still_contradicts() {
+    use super::{ExportAgreement, ObjectExports, ScannedEntry, ScannedTable, export_agreement};
+    use p11scope_manifest::maps::{Device, ObjectKey};
+
+    let object = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let forwarded = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 43,
+    };
+    let table = ScannedTable {
+        version: (3, 2),
+        walk: "known_prefix",
+        entries: vec![ScannedEntry {
+            name: "C_GetFunctionList",
+            object: forwarded,
+            object_path: "/opt/dep.so".into(),
+            file_offset: 0xebe0,
+        }],
+        null_entries: Vec::new(),
+        unpinned: Vec::new(),
+        address: 0x7000,
+        file_offset: Some(0x100),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: true,
+    };
+    let symbols = vec![("C_GetFunctionList".to_string(), 0x20)];
+    let agreement = export_agreement(
+        &table,
+        &ObjectExports {
+            object,
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        },
+    );
+    assert_eq!(
+        agreement,
+        ExportAgreement {
+            agreeing: 0,
+            disagreeing: 1,
+        },
+        "a lone forwarded bootstrap contradicts"
+    );
+    assert!(!agreement.corroborates());
+}
+
+/// The bootstrap exemption is narrow: a forwarded ordinary entry still
+/// contradicts even when the rest of the table agrees.
+#[test]
+fn forwarded_non_bootstrap_with_agreeing_rest_still_contradicts() {
+    use super::{ExportAgreement, ObjectExports, ScannedEntry, ScannedTable, export_agreement};
+    use p11scope_manifest::maps::{Device, ObjectKey};
+
+    let object = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 42,
+    };
+    let forwarded = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 43,
+    };
+    let table = ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![
+            ScannedEntry {
+                name: "C_Initialize",
+                object,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x10,
+            },
+            ScannedEntry {
+                name: "C_Login",
+                object: forwarded,
+                object_path: "/opt/dep.so".into(),
+                file_offset: 0x30,
+            },
+        ],
+        null_entries: Vec::new(),
+        unpinned: Vec::new(),
+        address: 0x7000,
+        file_offset: Some(0x100),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    };
+    let symbols = vec![
+        ("C_Initialize".to_string(), 0x10),
+        ("C_Login".to_string(), 0x70),
+    ];
+    let agreement = export_agreement(
+        &table,
+        &ObjectExports {
+            object,
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        },
+    );
+    assert_eq!(
+        agreement,
+        ExportAgreement {
+            agreeing: 1,
+            disagreeing: 1,
+        },
+        "only the bootstrap forward is exempt"
     );
     assert!(!agreement.corroborates());
 }

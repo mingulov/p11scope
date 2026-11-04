@@ -190,10 +190,20 @@ class BreadthTests(unittest.TestCase):
             report["evidence"]["counter_collection"]["mode"] = "counts"
             for row in report["functions"]:
                 row["latency_ns"] = None
+            selected = {"slot": 2, "object": 0, "file_offset": 4096 + 2 * 16,
+                        "entered": 7, "returned": 7, "errors": 0, "rv_counts": {"0": 7}}
+            idle = {"slot": 5, "object": 0, "file_offset": 4096 + 5 * 16,
+                    "entered": 0, "returned": 0, "errors": 0, "rv_counts": {}}
             report["evidence"]["selected_detail"] = {
                 "selection": {"endpoint": "C_Digest", "slot": 2, "file_offset": 4096 + 2 * 16,
-                              "names": ["C_Digest"], "refusal": "bundle_unavailable"},
-                "events": []}
+                              "names": ["C_Digest"]},
+                "events": [],
+                "detail": {"scope": "detail", "unit": "calls", "mode": "counts",
+                           "detail_generation": 1, "mode_mixed": False,
+                           "rows": [dict(selected)]},
+                "aggregate": {"scope": "broad", "unit": "calls", "mode": "counts",
+                              "seq_before": 1, "seq_after": 2, "mode_mixed": False,
+                              "rows": [dict(selected), idle]}}
         if cell == "select-endpoint-system":
             report["evidence"]["counter_collection"]["mode"] = "counts"
             for row in report["functions"]:
@@ -327,13 +337,34 @@ class BreadthTests(unittest.TestCase):
     def test_counter_latency_system_exact_passes(self):
         self.run_case(cell="counter-latency-system")
 
-    def test_select_endpoint_pid_exact_aggregates_with_bundle_unavailable(self):
+    def test_select_endpoint_pid_closed_window_exact_passes(self):
         result = self.run_case(cell="select-endpoint-pid")
         self.assertIn("owned-provider", result["qualification"])
 
-    def test_select_endpoint_pid_wrong_refusal_fails(self):
-        self.run_case(lambda d, l, r: d["evidence"]["selected_detail"]["selection"].update(refusal="endpoint_unknown"),
+    def test_select_endpoint_pid_refusal_fails(self):
+        self.run_case(lambda d, l, r: d["evidence"]["selected_detail"]["selection"].update(refusal="bundle_unavailable"),
                       cell="select-endpoint-pid", want=1)
+
+    def test_select_endpoint_pid_detail_drift_fails(self):
+        def mutate(d, l, r):
+            d["evidence"]["selected_detail"]["detail"]["rows"][0]["returned"] = 6
+        self.run_case(mutate, cell="select-endpoint-pid", want=1)
+
+    def test_select_endpoint_pid_missing_detail_fails(self):
+        def mutate(d, l, r):
+            del d["evidence"]["selected_detail"]["detail"]
+        self.run_case(mutate, cell="select-endpoint-pid", want=1)
+
+    def test_select_endpoint_pid_lineage_fails(self):
+        def mutate(d, l, r):
+            d["evidence"]["selected_detail"]["lineage"] = {"drift": None}
+        self.run_case(mutate, cell="select-endpoint-pid", want=1)
+
+    def test_select_endpoint_pid_aggregate_missing_slot_fails(self):
+        def mutate(d, l, r):
+            rows = d["evidence"]["selected_detail"]["aggregate"]["rows"]
+            del rows[0]
+        self.run_case(mutate, cell="select-endpoint-pid", want=1)
 
     def test_select_endpoint_pid_count_drift_fails(self):
         self.run_case(lambda d, l, r: d["functions"][0].update(calls=6),

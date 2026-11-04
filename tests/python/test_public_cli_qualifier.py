@@ -106,13 +106,13 @@ class SummaryTests(unittest.TestCase):
 class EmitJudgedTests(unittest.TestCase):
     def test_known_gap_becomes_expected_failure(self):
         oracle_row = json.dumps({
-            "cell": "run-short", "pass": False,
-            "detail": "loss or unknown discovery_truncated",
+            "cell": "profile-cgroup", "pass": False,
+            "detail": "lossy or unknown observation gap class",
             "qualification": "failed"})
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             (tmp / "results.jsonl").write_text("")
-            body = f"emit_judged run-short 1 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
+            body = f"emit_judged profile-cgroup 1 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
             proc = run_shell(body, cwd=tmp)
         self.assertIn("EMIT_RC=0", proc.stdout,
                       f"known gap must emit expected with rc 0, got: {proc.stdout}\n{proc.stderr}")
@@ -120,20 +120,20 @@ class EmitJudgedTests(unittest.TestCase):
         lines = [line for line in proc.stdout.splitlines() if line.startswith("{")]
         self.assertTrue(lines, f"no emitted row in: {proc.stdout}")
         row = json.loads(lines[-1])
-        self.assertEqual(row["cell"], "run-short")
+        self.assertEqual(row["cell"], "profile-cgroup")
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "expected-failure")
         self.assertIn("product fix lane", row["detail"])
 
     def test_qualified_pass_becomes_unexpected_pass(self):
         oracle_row = json.dumps({
-            "cell": "run-short", "pass": True,
+            "cell": "profile-cgroup", "pass": True,
             "detail": "owned physical-provider counts match",
             "qualification": "owned-provider-counts"})
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             (tmp / "results.jsonl").write_text("")
-            body = f"emit_judged run-short 0 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
+            body = f"emit_judged profile-cgroup 0 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
             proc = run_shell(body, cwd=tmp)
         lines = [line for line in proc.stdout.splitlines() if line.startswith("{")]
         self.assertTrue(lines, f"no emitted row in: {proc.stdout}\n{proc.stderr}")
@@ -144,13 +144,13 @@ class EmitJudgedTests(unittest.TestCase):
 
     def test_unknown_failure_sig_stays_failed(self):
         oracle_row = json.dumps({
-            "cell": "run-short", "pass": False,
+            "cell": "profile-cgroup", "pass": False,
             "detail": "some brand new failure mode never seen before",
             "qualification": "failed"})
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             (tmp / "results.jsonl").write_text("")
-            body = f"emit_judged run-short 1 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
+            body = f"emit_judged profile-cgroup 1 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
             proc = run_shell(body, cwd=tmp)
         lines = [line for line in proc.stdout.splitlines() if line.startswith("{")]
         self.assertTrue(lines, f"no emitted row in: {proc.stdout}\n{proc.stderr}")
@@ -174,6 +174,27 @@ class EmitJudgedTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "expected-failure")
         self.assertTrue(row["pass"])
         self.assertIn("UNEXPECTED PASS", row["detail"])
+
+    def test_promoted_cells_pass_oracle_lines_through(self):
+        # run-short, run-cover and metrics-cgroup are qualified now:
+        # the oracle line passes through untouched, never wrapped as
+        # expected-failure.
+        for cell in ("run-short", "run-cover", "metrics-cgroup"):
+            oracle_row = json.dumps({
+                "cell": cell, "pass": True,
+                "detail": "owned physical-provider counts match",
+                "qualification": "owned-provider-counts"})
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                (tmp / "results.jsonl").write_text("")
+                body = f"emit_judged {cell} 0 '{oracle_row}'; echo EMIT_RC=$?; cat results.jsonl"
+                proc = run_shell(body, cwd=tmp)
+            lines = [line for line in proc.stdout.splitlines() if line.startswith("{")]
+            self.assertTrue(lines, f"no emitted row for {cell} in: {proc.stdout}\n{proc.stderr}")
+            row = json.loads(lines[-1])
+            self.assertEqual(row["qualification"], "owned-provider-counts", cell)
+            self.assertTrue(row["pass"], cell)
+            self.assertIn("EMIT_RC=0", proc.stdout, cell)
 
     def test_trace_cgroup_known_loss_becomes_expected(self):
         oracle_row = json.dumps({
@@ -202,9 +223,11 @@ class ScriptTextTests(unittest.TestCase):
 
     def test_expected_reasons_present(self):
         text = QUAL.read_text()
-        for name in ("REASON_RUN", "REASON_CGROUP", "REASON_TRACE_CGROUP",
+        for name in ("REASON_CGROUP", "REASON_TRACE_CGROUP",
                      "REASON_INVENTORY_7X", "REASON_IA32"):
             self.assertIn(name, text, f"missing {name} with named product-gap reason")
+        self.assertNotIn("REASON_RUN", text,
+                         "run exact loss is fixed and qualified; its reason must be gone")
         self.assertIn("product fix lane", text)
 
     def test_ia32_prereq_missing_is_expected(self):
@@ -222,6 +245,16 @@ class ScriptTextTests(unittest.TestCase):
         text = QUAL.read_text()
         self.assertIn("IA32_MODULE=${IA32_MODULE:-", text,
                       "IA32_MODULE must allow override for unpacked i386 copies")
+
+    def test_ia32_only_mode_skips_the_amd64_probe(self):
+        # The ia32-only job carries no amd64 provider (libsofthsm2:i386
+        # cannot coexist with it), so ONLY_IA32 must select the i386
+        # module before the amd64 --select-module probe runs.
+        text = QUAL.read_text()
+        use = text.index("MODULE=$IA32_MODULE")
+        probe = text.index("--select-module")
+        self.assertLess(use, probe,
+                        "ONLY_IA32 must select IA32_MODULE before the amd64 probe")
 
     def test_cgroup_force_cleanup_present(self):
         text = QUAL.read_text()

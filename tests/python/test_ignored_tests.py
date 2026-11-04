@@ -74,6 +74,12 @@ INTEGRATION_EXPECTED = [
     "tests/inventory_identity.rs:kernel_identity_positive_cell_rejects_refusal",
     "tests/object_producer_activation.rs:counter_bank_btf_maps_and_programs_load",
     "tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_report_and_exits_130",
+    "tests/prearm_witness_cli.rs:privileged_profile_pid_prearm_clean_exact_counts",
+    "tests/prearm_witness_cli.rs:privileged_profile_cgroup_prearm_clean_exact_counts",
+    "tests/prearm_witness_cli.rs:privileged_profile_system_prearm_clean_exact_counts",
+    "tests/prearm_witness_cli.rs:privileged_profile_metrics_system_prearm_clean_exact_counts",
+    "tests/prearm_witness_cli.rs:privileged_profile_pid_prearm_twin_exact_window",
+    "tests/prearm_witness_cli.rs:privileged_trace_system_prearm_clean_exact_counts",
 ]
 
 # The revived opt-in groups, pinned literally so a dropped or renamed
@@ -1531,8 +1537,8 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 194 + 2.
-        self.assertIn("default (196)", result.stdout)
+        # exactly one), so the default section shows 214 + 2.
+        self.assertIn("default (216)", result.stdout)
         self.assertIn("btrfs (14, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (2, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (4, --include-expected-failures "
@@ -1540,7 +1546,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (254 tests)",
+        self.assertIn("verify: curation matches the binary (274 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1734,7 +1740,7 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=194",
+            "DEFAULT_TESTS=214",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "BTRFS_TESTS=14",
@@ -1746,7 +1752,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
-            "INTEGRATION_TESTS=11",
+            "INTEGRATION_TESTS=17",
         ):
             with self.subTest(pin=pin):
                 self.assertIn(pin, result.stdout)
@@ -1865,14 +1871,22 @@ class IgnoredTestsTests(unittest.TestCase):
             write_fake_integration_binary(
                 deps, "run_abandon_report",
                 ["second_sigint_during_teardown_publishes_truthful_report_and_exits_130"])
+            write_fake_integration_binary(
+                deps, "prearm_witness_cli",
+                ["privileged_profile_pid_prearm_clean_exact_counts",
+                 "privileged_profile_cgroup_prearm_clean_exact_counts",
+                 "privileged_profile_system_prearm_clean_exact_counts",
+                 "privileged_profile_metrics_system_prearm_clean_exact_counts",
+                 "privileged_profile_pid_prearm_twin_exact_window",
+                 "privileged_trace_system_prearm_clean_exact_counts"])
             result = run_runner("--list-integration", str(deps))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        self.assertIn("integration (11)", result.stdout)
+        self.assertIn("integration (17)", result.stdout)
         for entry in INTEGRATION_EXPECTED:
             self.assertIn(entry, result.stdout)
         self.assertIn("verify: integration curation selects exactly one "
-                      "test per entry (11 entries)", result.stdout)
+                      "test per entry (17 entries)", result.stdout)
 
     def test_integration_list_mode_refuses_zero_selection(self):
         # The inventory_identity binary below is missing one of its two

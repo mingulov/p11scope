@@ -967,7 +967,10 @@ jobs:
             # Template proof: the host leg runs through run-cell-script.sh,
             # which validates with check-cell-results.py (smoke allow-listed).
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/run-cell-script.sh public-cli-host "$in/p11scope" "$out/cells" \
-              --allow-nonqualifying run-short --allow-nonqualifying run-cover --allow-nonqualifying trace-pid \
+              --allow-nonqualifying trace-pid \
+              --expected-failure profile-cgroup --expected-failure trace-cgroup \
+              --expected-failure inventory-cgroup --expected-failure profile-pid-ia32 \
+              --expected-failure run-ia32 \
               --require doctor --require profile-pid --require names-pid --require verdict-pid \
               --require metrics-pid --require trace-pid --require run-short --require run-cover \
               --require mt-exact --require system --require sigint --require second-sigint \
@@ -1000,14 +1003,14 @@ jobs:
           problems = sorted("missing cell " + name for name in need - set(cells))
           # trace-pid stays nonqualifying smoke; the gap cells below are
           # declared expected-failures with named product reasons.
+          # run-short, run-cover and metrics-cgroup are qualified now
+          # that their observation gaps closed; inventory-cgroup shows
+          # the owned-module gap signature on every kernel, so it is
+          # declared everywhere. The harness emits expected only on
+          # the known signatures, qualified on pass.
           smoke_cells = {"trace-pid"}
-          expected_cells = {"run-short", "run-cover", "profile-cgroup", "metrics-cgroup",
-                            "trace-cgroup", "profile-pid-ia32", "run-ia32"}
-          if "${{ matrix.kernel }}" == "v7.3.1":
-              # inventory-cgroup fails on 7.x with owned-module gaps and
-              # passes on 6.x/host; the harness emits expected only on the
-              # known signature, qualified on pass.
-              expected_cells.add("inventory-cgroup")
+          expected_cells = {"profile-cgroup", "trace-cgroup", "inventory-cgroup",
+                            "profile-pid-ia32", "run-ia32"}
           actual_expected = set()
           actual_smoke = set()
           for row in rows:
@@ -1092,7 +1095,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - run: sudo -n dpkg --add-architecture i386 && sudo -n apt-get update && sudo -n apt-get install -y gcc jq procps python3 libsofthsm2:i386 gcc-multilib libc6-dev-i386
+      - run: sudo -n dpkg --add-architecture i386 && sudo -n apt-get update && sudo -n apt-get install -y gcc jq procps python3 libsofthsm2:i386 softhsm2:i386 gcc-multilib libc6-dev-i386
       - name: Download the release observer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

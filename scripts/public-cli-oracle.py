@@ -370,24 +370,90 @@ def counter_judge(evidence, rows, cell):
                         "latency percentile missing or above max: " + key)
 
 
-def select_judge(evidence, cell):
+def check_close_row_shape(row, where):
+    require(isinstance(row, dict), where + " row is not an object")
+    require(set(row) == {"slot", "object", "file_offset", "entered", "returned",
+                         "errors", "rv_counts"},
+            where + " row carries unexpected keys")
+    for key in ("slot", "object", "file_offset", "entered", "returned", "errors"):
+        require(integer(row.get(key)), where + " row lacks " + key)
+    counts = row.get("rv_counts")
+    require(isinstance(counts, dict) and
+            all(type(key) is str and integer(value) for key, value in counts.items()),
+            where + " row return counts are not a string-keyed u64 map")
+
+
+def check_close_row(row, slot, offset, want, where):
+    check_close_row_shape(row, where)
+    require(row["slot"] == slot and row["file_offset"] == offset,
+            where + " row differs from the selected endpoint")
+    require(row["object"] == 0, where + " row names an unexpected object")
+    require(row["entered"] == want and row["returned"] == want,
+            where + " row counts differ from the independent ledger")
+    require(row["errors"] == 0, where + " row has errors")
+    require(row["rv_counts"] == {"0": want},
+            where + " row return values are not all clean")
+
+
+def select_judge(evidence, cell, expected):
     envelope = evidence.get("selected_detail")
     require(isinstance(envelope, dict), "missing selected_detail envelope")
     selection = envelope.get("selection")
     require(isinstance(selection, dict), "missing selection record")
     require(selection.get("endpoint") == "C_Digest", "selection endpoint differs from declared cell")
     require(envelope.get("events") == [], "selection events are not empty")
-    require(envelope.get("lineage") is None and envelope.get("aggregate") is None and
-            envelope.get("detail") is None, "selection close products present without a closed window")
     if cell == "select-endpoint-pid":
-        require(selection.get("refusal") == "bundle_unavailable",
-                "selection refusal differs from today's named unavailability: %r" % selection.get("refusal"))
-        require(integer(selection.get("slot")) and integer(selection.get("file_offset")),
+        # The K0 window closed with detail: resolved with no refusal,
+        # and exact close products — the broad aggregate bracketing
+        # the capture interval plus the selected endpoint's own row.
+        require(selection.get("refusal") is None,
+                "resolved pid selection carries a refusal: %r" % (selection.get("refusal"),))
+        slot, offset = selection.get("slot"), selection.get("file_offset")
+        require(integer(slot) and integer(offset),
                 "resolved selection lacks slot or file offset")
         require(selection.get("names") == ["C_Digest"], "resolved selection names differ")
-        require(set(selection) == {"endpoint", "slot", "file_offset", "names", "refusal"},
+        require(set(selection) == {"endpoint", "slot", "file_offset", "names"},
                 "resolved selection carries unexpected keys")
+        require(envelope.get("lineage") is None,
+                "selection lineage present without a lineage window")
+        detail = envelope.get("detail")
+        require(isinstance(detail, dict), "closed K0 window lacks detail")
+        require(set(detail) == {"scope", "unit", "mode", "detail_generation",
+                                "mode_mixed", "rows"},
+                "Detail carries unexpected keys")
+        require(detail.get("scope") == "detail" and detail.get("unit") == "calls" and
+                detail.get("mode") == "counts" and detail.get("mode_mixed") is False,
+                "Detail shape differs from the declared counts cell")
+        generation = detail.get("detail_generation")
+        require(type(generation) is int and generation == 1,
+                "Detail is not the capture's first generation")
+        rows = detail.get("rows")
+        require(isinstance(rows, list) and len(rows) == 1,
+                "Detail covers exactly the selected endpoint")
+        want = expected["C_Digest"]
+        check_close_row(rows[0], slot, offset, want, "Detail")
+        aggregate = envelope.get("aggregate")
+        require(isinstance(aggregate, dict), "closed K0 window lacks aggregate")
+        require(set(aggregate) == {"scope", "unit", "mode", "seq_before", "seq_after",
+                                   "mode_mixed", "rows"},
+                "aggregate carries unexpected keys")
+        require(aggregate.get("scope") == "broad" and aggregate.get("unit") == "calls" and
+                aggregate.get("mode") == "counts" and aggregate.get("mode_mixed") is False,
+                "aggregate shape differs from the declared counts cell")
+        before, after = aggregate.get("seq_before"), aggregate.get("seq_after")
+        require(integer(before) and integer(after) and after == before + 1,
+                "aggregate does not bracket exactly the capture interval")
+        grows = aggregate.get("rows")
+        require(isinstance(grows, list) and grows, "aggregate has no broad rows")
+        hits = [row for row in grows
+                if isinstance(row, dict) and row.get("slot") == slot]
+        require(len(hits) == 1, "aggregate lacks the selected slot exactly once")
+        check_close_row(hits[0], slot, offset, want, "aggregate")
+        for row in grows:
+            check_close_row_shape(row, "aggregate")
     else:
+        require(envelope.get("lineage") is None and envelope.get("aggregate") is None and
+                envelope.get("detail") is None, "selection close products present without a closed window")
         require(selection.get("refusal") == "promotion_scope_unsupported",
                 "system selection refusal differs from named refusal: %r" % selection.get("refusal"))
         require("slot" not in selection and "file_offset" not in selection and "names" not in selection,
@@ -466,7 +532,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     if cell in RUN_CELLS:
         run_judge(evidence)
     if cell.startswith("select-endpoint-"):
-        select_judge(evidence, cell)
+        select_judge(evidence, cell, expected)
     provider = identity(receipt["provider_before"])
     admitted = evidence.get("discovery")
     require(isinstance(admitted, list) and any(identity(row) == provider for row in admitted

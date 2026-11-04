@@ -68,8 +68,17 @@ if [ "$CONTROL" = 1 ]; then
   READY_TICKS=10; LEDGER_TICKS=10; EXIT_TICKS=20
 else
   [ "$(id -u)" = 0 ] || { echo 'must run as root' >&2; exit 64; }
-  MODULE_ARGS=(); [ -z "${MODULE+x}" ] || MODULE_ARGS=(--module "$MODULE")
-  MODULE=$(python3 -I "$HERE/release-matrix-contract.py" --select-module "${MODULE_ARGS[@]}") || exit 64
+  IA32_MODULE=${IA32_MODULE:-/usr/lib/i386-linux-gnu/softhsm/libsofthsm2.so}
+  if [ "${P11SCOPE_PUBLIC_CLI_ONLY_IA32:-0}" = 1 ]; then
+    # The ia32-only job carries no amd64 provider (libsofthsm2:i386
+    # cannot coexist with it), so there is nothing to probe: take the
+    # i386 module; the ia32 branch below validates the prereq and
+    # fails harness-loud when it is missing.
+    MODULE=$IA32_MODULE
+  else
+    MODULE_ARGS=(); [ -z "${MODULE+x}" ] || MODULE_ARGS=(--module "$MODULE")
+    MODULE=$(python3 -I "$HERE/release-matrix-contract.py" --select-module "${MODULE_ARGS[@]}") || exit 64
+  fi
   READY_TICKS=1800; LEDGER_TICKS=600; EXIT_TICKS=1800
 fi
 mkdir -p "$OUT" && chmod 755 "$OUT" && OUT=$(realpath -e -- "$OUT") && cd "$OUT" || exit 64
@@ -178,7 +187,6 @@ PY
 }
 # Expected-failure reasons for known product gaps. Each names the gap and the
 # product fix lane. Unexpected passes fail via summary() and the WP-1 template.
-REASON_RUN="run exact loss (discovery_truncated/lossy observation); product fix lane for run pause/discovery"
 REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
 REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
 REASON_INVENTORY_7X="inventory cgroup owned-module gaps on 7.x (native endpoint attach failed, 68 deferred); product fix lane for inventory 7.x"
@@ -213,8 +221,7 @@ emit_judged() {
   local cell=$1 rc=$2 line=$3
   local reason=""
   case "$cell" in
-    run-short|run-cover) reason=$REASON_RUN ;;
-    profile-cgroup|metrics-cgroup) reason=$REASON_CGROUP ;;
+    profile-cgroup) reason=$REASON_CGROUP ;;
     trace-cgroup) reason=$REASON_TRACE_CGROUP ;;
   esac
   if [ -z "$reason" ]; then
@@ -237,11 +244,7 @@ emit_judged() {
   fi
   local known=0
   case "$cell" in
-    run-short|run-cover)
-      case "$detail" in
-        *discovery_truncated*|*lossy\ or\ unknown\ observation*|*run\ pause*) known=1 ;;
-      esac ;;
-    profile-cgroup|metrics-cgroup)
+    profile-cgroup)
       case "$detail" in
         *lossy\ or\ unknown\ observation\ gap\ class*) known=1 ;;
       esac ;;

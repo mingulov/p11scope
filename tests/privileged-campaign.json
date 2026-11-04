@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 195,
+  "default_floor": 215,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -129,6 +129,10 @@
     "discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64",
     "discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback",
     "discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4",
     "discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4",
     "events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains",
@@ -196,6 +200,22 @@
     "metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64",
     "metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64",
     "metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64",
+    "attach::prearm_witness::prearm_witness_tests::privileged_map_and_call_after_finalize_is_clean",
+    "attach::prearm_witness::prearm_witness_tests::privileged_observer_self_map_during_startup_is_clean",
+    "attach::prearm_witness::prearm_witness_tests::privileged_readonly_mapped_before_start_is_found",
+    "attach::prearm_witness::prearm_witness_tests::privileged_mprotect_dance_before_finalize_is_found",
+    "attach::prearm_witness::prearm_witness_tests::privileged_map_unmap_inside_window_is_latched",
+    "attach::prearm_witness::prearm_witness_tests::privileged_zombie_leader_holding_file_is_found",
+    "attach::prearm_witness::prearm_witness_tests::privileged_held_teardown_is_pending",
+    "attach::prearm_witness::prearm_witness_tests::privileged_exec_departure_under_holder_is_pending",
+    "attach::prearm_witness::prearm_witness_tests::privileged_cgroup_member_migrated_out_is_migration",
+    "attach::prearm_witness::prearm_witness_tests::privileged_nested_pidns_observer_is_unavailable",
+    "attach::prearm_witness::prearm_witness_tests::privileged_walk_scale_completes",
+    "attach::prearm_witness::tests::privileged_prearm_witness_loads_and_attaches",
+    "attach::prearm_witness::tests::privileged_cgroup_id_matches_kernfs_id",
+    "attach::prearm_witness::tests::privileged_start_activates_on_host",
+    "attach::prearm_witness::tests::privileged_finalize_clears_clean_start",
+    "attach::prearm_witness::tests::privileged_finalize_settles_under_churn",
     "attach::tests::full_root_load_refusal_is_classified"
   ],
   "alternative_cells": [
@@ -230,7 +250,7 @@
     }
   },
   "second_flavor": {
-    "note": "Journal-flavor privileged build. Today P11SCOPE_JOURNAL=1; once WU-2b makes journal+birth marker the default (ruling CP-1), the second flavor becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0. Pending until WU-2a lands here; on port to dev drop pending (the cells exist there) and regenerate the floor.",
+    "note": "Journal-flavor privileged build. Today P11SCOPE_JOURNAL=1; once WU-2b makes journal+birth marker the default (ruling CP-1), the second flavor becomes P11SCOPE_JOURNAL=0 P11SCOPE_BIRTH_MARKER=0. Every listed cell exists, so the job hard-fails on any absent cell.",
     "build_env": {
       "P11SCOPE_JOURNAL": "1"
     },
@@ -241,13 +261,6 @@
       "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
       "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
       "attach::tests::sealed_session_drain_linkage_is_behavioral"
-    ],
-    "pending": [
-      "inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery",
-      "inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching",
-      "inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag",
-      "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
-      "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed"
     ]
   },
   "journal_proof": {

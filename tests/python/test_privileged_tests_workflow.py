@@ -95,6 +95,28 @@ def check_floor_and_branches(want, full_lines, campaign):
     return checked, notes
 
 
+def check_second_flavor_presence(cells, listed, pending):
+    """Mirror of the privileged-second-flavor presence step, for fake-list tests.
+
+    cells is the campaign's second_flavor cell list, listed the journal
+    build's `--list` output, pending the tolerated-absent set. Returns the
+    wanted list, or raises SystemExit on the same absent-cell failure the
+    workflow reports.
+    """
+    wanted = []
+    for cell in cells:
+        present = (f"\n{cell}\n" in f"\n{listed}\n"
+                   or f"\n{cell} :: " in listed)
+        if present:
+            wanted.append(cell)
+        elif cell in pending:
+            continue
+        else:
+            raise SystemExit(f"expected journal cell absent from the binary: {cell}")
+    assert wanted, "no journal cells present"
+    return wanted
+
+
 def journal_proof_test_names(source):
     """Fully-qualified #[test] names under root_proof_tests, the source of truth.
 
@@ -224,6 +246,12 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
             if name.startswith("privileged-inputs"):
                 self.assertIn(name, uploads,
                               f"download {name} has no producing upload")
+
+    def test_ia32_job_installs_i386_token_tooling(self):
+        # The ia32-only leg carries no amd64 SoftHSM, so token setup
+        # needs the i386 softhsm2-util alongside the i386 library.
+        ia32 = job_body(self.yml, "public-cli-ia32")
+        self.assertRegex(ia32, r"(?<!lib)softhsm2:i386")
 
     def test_shard_step_exports_the_discover_helper(self):
         # The exit-mappings cell resolves p11scope-discover through
@@ -392,6 +420,26 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                       second["cells"])
         self.assertIn("inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
                       second["cells"])
+        # The WU-2a tolerance is spent: every second-flavor cell exists,
+        # so an absent cell must fail the job, never print PENDING.
+        self.assertEqual(second.get("pending", []), [])
+
+    def test_second_flavor_absent_cell_fails(self):
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        second = campaign["second_flavor"]
+        cells = second["cells"]
+        pending = set(second.get("pending", []))
+        listed = "\n".join(cells[1:]) + "\n"
+        with self.assertRaisesRegex(SystemExit, "expected journal cell absent"):
+            check_second_flavor_presence(cells, listed, pending)
+
+    def test_second_flavor_all_present_passes(self):
+        campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
+        second = campaign["second_flavor"]
+        cells = second["cells"]
+        pending = set(second.get("pending", []))
+        listed = "\n".join(cells) + "\n"
+        self.assertEqual(check_second_flavor_presence(cells, listed, pending), cells)
 
     def test_journal_proof_build_and_tests(self):
         self.assertIn("P11SCOPE_JOURNAL_PROOF=1", self.yml)
@@ -447,7 +495,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
     def test_cell_script_template_proof(self):
         self.assertIn("scripts/ci/run-cell-script.sh public-cli-host", self.yml)
         self.assertIn("scripts/ci/check-cell-results.py", self.yml)
-        self.assertIn("--allow-nonqualifying run-short", self.yml)
+        self.assertIn("--allow-nonqualifying trace-pid", self.yml)
+        self.assertIn("--expected-failure profile-cgroup", self.yml)
+        self.assertIn("--expected-failure inventory-cgroup", self.yml)
+        self.assertNotIn("--allow-nonqualifying run-short", self.yml)
         self.assertIn("--require doctor", self.yml)
         self.assertIn("--require profile-pid", self.yml)
         self.assertIn("--require trace-pid", self.yml)

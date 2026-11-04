@@ -8569,6 +8569,11 @@ fn unavailable_admission_errors_carry_finite_site_labels() {
         );
         assert_eq!(error.refusal(), SemanticRefusal::Unavailable);
         assert_eq!(error.site(), Some(site));
+        assert_eq!(
+            error.is_deferral(),
+            site == Site::NoReceipt,
+            "only a missing receipt defers; {expected} stays a refusal"
+        );
     }
     // Other refusals pass through bare, with no site attached.
     for refusal in [
@@ -8580,7 +8585,10 @@ fn unavailable_admission_errors_carry_finite_site_labels() {
         assert_eq!(error.to_string(), refusal.code());
         assert_eq!(error.refusal(), refusal);
         assert_eq!(error.site(), None);
+        assert!(!error.is_deferral(), "a bare refusal never defers");
     }
+    // A bare Unavailable (no site) is not a deferral either.
+    assert!(!AdmissionPreparationError::refused(SemanticRefusal::Unavailable).is_deferral());
 }
 
 // B17 W2 RED: the batch must carry the disclosure quadrant of the tick

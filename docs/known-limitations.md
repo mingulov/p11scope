@@ -174,8 +174,11 @@ provider call the kernel has seen yet), so key-operation tracking for that
 caller starts at a later pass. Calls the caller makes in the meantime wait for that pass and are
 counted. If the caller is never admitted (for example, it exits first), each
 call it made is shed and reported under the separate
-`semantic calls unrouted` loss gap. Every other `semantic admission refused`
-reason still marks a loss.
+`semantic calls unrouted` loss gap. Waiting calls also share one
+capture-wide queue of 1,024 calls: past it, later calls are shed even
+while their caller is still waiting to be admitted, and are reported in
+the same gap (`pending_capacity=N`). Every other
+`semantic admission refused` reason still marks a loss.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are

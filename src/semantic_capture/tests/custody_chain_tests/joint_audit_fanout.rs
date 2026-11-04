@@ -7834,6 +7834,10 @@ fn joint_machine_negative_dispositions_are_finite() {
         let roles = coordinator.joint_capture().ledger().roles_for_test();
         let h3 = coordinator.reference_h3_audit_state();
         let frontier = coordinator.joint_capture().adapter().consumed_frontier();
+        let lost_through = coordinator
+            .joint_capture()
+            .adapter()
+            .consumed_through_for_test();
         let charged = coordinator
             .registry()
             .semantic_resource_snapshot()
@@ -7887,6 +7891,18 @@ fn joint_machine_negative_dispositions_are_finite() {
                 "the malformed window is voided"
             );
             assert_eq!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .voided_through_for_test(),
+                lost_through,
+                "the fence is exactly the consumed history, never above it"
+            );
+            assert_eq!(
                 fixture.service(1).unwrap(),
                 crate::inventory_semantics::JointServiceProgress::Pending
             );
@@ -7903,8 +7919,15 @@ fn joint_machine_negative_dispositions_are_finite() {
                         && gap.reason == "partition"),
                 "a new demand cannot erase the original disclosure"
             );
+            assert!(
+                fixture.machine.retained_raw_for_test().is_some(),
+                "the re-synced idle read keeps its actual paid allocation"
+            );
+            // The pre-re-sync check that charged bytes stay unchanged no
+            // longer holds: like the healthy branch, the re-synced idle
+            // read holds its paid allocation. Every shared check below
+            // still applies.
             let _ = charged;
-            continue;
         } else {
             assert!(cut.is_ok());
             assert_eq!(
@@ -7936,6 +7959,123 @@ fn joint_machine_negative_dispositions_are_finite() {
         assert!(coordinator.joint_capture().adapter().consumed_frontier() == frontier);
         assert!(!coordinator.publication_pending());
     }
+}
+
+/// Post-re-sync publication on a journal-linked lane: a malformed
+/// first quantum is disposed unlocalized (its named gap published),
+/// the next collect re-syncs above a fence on exactly the consumed
+/// history, and the follow-up call still publishes its S1 edge. The
+/// machine never parks in a disposition. (A break taken through
+/// ingest after a grant keeps the fail-closed Gap; see
+/// `joint_machine_linked_break_refuses_gap_without_resync`.)
+#[test]
+fn joint_machine_linked_resync_followup_publishes() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let mut fixture = MachineScene::new(1);
+    assert!(fixture.scene.producers.journal_linked());
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.machine.begin_commit(false).unwrap();
+    let mut published = false;
+    for _ in 0..128 {
+        if let JointCommitProgress::Published(_) = fixture.poll_commit(1).unwrap() {
+            published = true;
+            break;
+        }
+    }
+    assert!(published, "the malformed negative publishes");
+    let lost_through = {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            adapter.invalidated_for_test(),
+            "the unlocalized disposal invalidates the stream"
+        );
+        adapter.consumed_through_for_test()
+    };
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("linked-resync-followup", None);
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        assert!(
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "the follow-up collect re-syncs the broken linked stream"
+        );
+        assert_eq!(
+            adapter.voided_through_for_test(),
+            lost_through,
+            "the fence is exactly the consumed history, never above it"
+        );
+        assert!(
+            adapter.consumed_through_for_test() > lost_through,
+            "the follow-up history lies above the fence"
+        );
+    }
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision()
+            > revision,
+        "the next quantum publishes"
+    );
+    assert_eq!(
+        api_returns(&fixture),
+        before + 1,
+        "the re-synced follow-up joins its one S1 call"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    let disclosed: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        disclosed.contains(&(
+            "semantic receipt refused".to_string(),
+            "partition".to_string()
+        )),
+        "the lost window stays disclosed: {disclosed:?}"
+    );
 }
 
 /// Post-re-sync publication completes on an unlinked lane: a

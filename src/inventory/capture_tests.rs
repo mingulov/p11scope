@@ -8043,3 +8043,250 @@ mod publication_progress_tests {
         }
     }
 }
+
+/// A `Send` scripted facade for the startup drainer, which services the
+/// lane from its own thread: it activates on the first extend, returns
+/// `records_per_service` non-exec records per discovery quantum and
+/// records every quantum's start stamp in drain order.
+struct DrainLane {
+    domain: NativeDomainId,
+    stamps: Stamps,
+    activated: bool,
+    records_per_service: usize,
+    drained: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    drained_ns: u64,
+    stopping: bool,
+}
+
+impl DrainLane {
+    fn new(records_per_service: usize) -> Self {
+        Self {
+            domain: NativeDomainId::mint(),
+            stamps: Stamps::default(),
+            activated: false,
+            records_per_service,
+            drained: std::sync::Arc::default(),
+            drained_ns: 0,
+            stopping: false,
+        }
+    }
+}
+
+impl NativeIdentity<Pin> for DrainLane {
+    fn owner_image(&mut self, _: u32) -> Option<BoundImage> {
+        None
+    }
+
+    fn query_cookie(&mut self, _: NativeDomainId, _: &Pin) -> CookieQuery {
+        CookieQuery::NoCookie
+    }
+}
+
+impl CaptureLane<Pin> for DrainLane {
+    fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+
+    fn scope_coverage(&self) -> CaptureScopeCoverage {
+        CaptureScopeCoverage::System
+    }
+
+    fn extend(
+        &mut self,
+        delta: TargetDelta,
+        _: &dyn CaptureTargets,
+        _: ExtendWindow,
+    ) -> ExtendReceipt {
+        let mut receipt = ExtendReceipt {
+            custody: Some(ScopeCustody::System),
+            ..ExtendReceipt::default()
+        };
+        if !self.activated {
+            self.activated = true;
+            receipt.activated_roots = true;
+            receipt.exec_coverage = Some(ExecCoverage::scripted(self.domain, self.stamps.next()));
+        }
+        for endpoint in delta.endpoints {
+            receipt.attached.push(AttachedEndpoint {
+                id: endpoint.id,
+                object: endpoint.object,
+                at_ns: self.stamps.next(),
+            });
+        }
+        receipt
+    }
+
+    fn service_discovery(&mut self, window: ReadWindow) -> DiscoveryBatch {
+        // SAFETY: `DiscoveryRecord` is a plain `repr(C)` integer record; all
+        // zeroes is a valid value (kind 0: no exec, the binder ignores it).
+        let records = (0..self.records_per_service.min(window.max_rows()))
+            .map(|_| unsafe { std::mem::zeroed::<p11scope_ebpf_common::DiscoveryRecord>() })
+            .collect();
+        let batch = DiscoveryBatch::scripted(self.domain, records, self.stamps.next());
+        self.drained.lock().unwrap().push(batch.started_ns);
+        if batch.drained() {
+            self.drained_ns = batch.started_ns;
+        }
+        batch
+    }
+
+    fn read_witnesses(&mut self, _: ReadWindow) -> WitnessBatch {
+        let health_read_ns = self.stamps.next();
+        let rows_read_ns = self.stamps.next();
+        WitnessBatch {
+            domain: self.domain,
+            phase: if self.stopping {
+                CapturePhase::Retiring
+            } else {
+                CapturePhase::Active
+            },
+            rows: Vec::new(),
+            integrity: Vec::new(),
+            integrity_total: 0,
+            visited: 0,
+            sweep_completed: true,
+            sweeps_completed: 1,
+            row_bound_reached: false,
+            deadline_reached: false,
+            read_failures: Vec::new(),
+            unrecorded_rows: 0,
+            sweep_gaps: false,
+            counts: Vec::new(),
+            refresh_sweep_completed: true,
+            refresh_sweep_gaps: false,
+            refresh_deadline_reached: false,
+            refresh_sweeps_completed: 1,
+            seen_rows: 0,
+            pair_limit: 64,
+            lifecycle_loss: None,
+            lifecycle_proven_ns: self.drained_ns,
+            health: CaptureHealth {
+                discovery_counters: Some([0, 0, 0, 0, 0]),
+                ..CaptureHealth::default()
+            },
+            health_regression: None,
+            health_unproven: None,
+            health_baseline_ns: 0,
+            health_read_ns,
+            rows_anchor_ns: rows_read_ns,
+            rows_read_ns,
+            counts_read_ns: rows_read_ns,
+            changed_objects: Vec::new(),
+            custody: ScopeCustody::System,
+            custody_proven_ns: None,
+            unsettled: self.stopping,
+        }
+    }
+
+    fn begin_stop(&mut self) {
+        self.stopping = true;
+    }
+
+    fn poll_retirement(&mut self, _: Instant) -> Result<bool> {
+        Ok(true)
+    }
+
+    fn cleanup(&self) -> Option<CleanupSummary> {
+        Some(CleanupSummary {
+            attempted: 2,
+            closed: 2,
+            failures: Vec::new(),
+            retained_links: 0,
+        })
+    }
+}
+
+/// The startup drain services the lifecycle ring while the semantic
+/// lane loads: what it drains is only held (nothing reaches the host
+/// during the load), and the first pass stages every held quantum in
+/// drain order before its own fresh service quanta.
+#[test]
+fn startup_drain_holds_records_and_stages_them_first_in_drain_order() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = DrainLane::new(1);
+    let drained = std::sync::Arc::clone(&lane.drained);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let loaded = crate::inventory::draining_lifecycle::<Pin, _, _, _>(Some(&mut started), || {
+        // Long enough for several drainer ticks (10 ms each).
+        std::thread::sleep(Duration::from_millis(80));
+        "loaded"
+    });
+    assert_eq!(loaded, "loaded");
+    let held: Vec<u64> = drained.lock().unwrap().clone();
+    assert!(
+        held.len() >= 2,
+        "the drainer serviced the ring during the load: {held:?}"
+    );
+    assert_eq!(
+        started.held.len(),
+        held.len(),
+        "every drained quantum is held"
+    );
+    assert_eq!(started.held_records, held.len());
+    assert!(
+        scene.staged_lifecycle.is_empty(),
+        "nothing reaches the host during the load"
+    );
+    started.after_pass(&mut scene);
+    let all = drained.lock().unwrap().clone();
+    assert!(all.len() > held.len(), "the pass services fresh quanta");
+    assert_eq!(
+        scene.staged_lifecycle[..held.len()],
+        held[..],
+        "the held quanta stage first, in drain order"
+    );
+    assert_eq!(
+        scene.staged_lifecycle, all,
+        "each quantum stages exactly once"
+    );
+    assert!(started.held.is_empty());
+    assert_eq!(started.held_records, 0);
+}
+
+/// A load that panics releases the drainer and re-raises: the startup
+/// never waits on a drainer that would otherwise run forever.
+#[test]
+fn startup_drain_releases_its_drainer_when_the_load_panics() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = DrainLane::new(0);
+    let drained = std::sync::Arc::clone(&lane.drained);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::inventory::draining_lifecycle::<Pin, _, (), _>(Some(&mut started), || {
+            std::thread::sleep(Duration::from_millis(20));
+            panic!("scripted load panic")
+        })
+    }));
+    let payload = outcome.expect_err("the load's panic is re-raised");
+    assert_eq!(
+        payload.downcast_ref::<&str>().copied(),
+        Some("scripted load panic")
+    );
+    let after = drained.lock().unwrap().len();
+    assert!(after >= 1, "the drainer ran its final quantum");
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(
+        drained.lock().unwrap().len(),
+        after,
+        "the drainer stopped with the load"
+    );
+}
+
+/// Without a native lane the load runs once, on the caller's thread.
+#[test]
+fn startup_drain_without_a_lane_runs_the_load_once() {
+    let mut runs = 0;
+    let caller = std::thread::current().id();
+    let ran_on = crate::inventory::draining_lifecycle::<Pin, DrainLane, _, _>(None, || {
+        runs += 1;
+        std::thread::current().id()
+    });
+    assert_eq!(runs, 1);
+    assert_eq!(ran_on, caller);
+}

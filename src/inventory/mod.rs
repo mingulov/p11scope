@@ -1436,7 +1436,7 @@ fn run_with_terminal_budget(
     let semantic = if manifests.is_empty() {
         None
     } else {
-        draining_lifecycle(lane.as_mut(), || {
+        draining_lifecycle::<crate::process::PidPin, _, _, _>(lane.as_mut(), || {
             start_semantic_lane(
                 &mut coordinator,
                 &engine_scope,
@@ -4984,11 +4984,17 @@ fn note_semantic_lane_sealed() {
 /// during a pass's collection: nothing reaches the coordinator until the
 /// first pass stages the held quanta in drain order, bounded by the same
 /// held-record and held-batch caps (past them the ring fills and its loss
-/// is counted as before).
-fn draining_lifecycle<T>(
-    lane: Option<&mut NativeLane<FacadeLane>>,
-    start: impl FnOnce() -> T,
-) -> T {
+/// is counted as before). Those caps are shared with pass 0's own
+/// collection: what the drainer holds is no longer free there, so the
+/// total absorbed before pass 0 ends stays held cap plus ring; the caps'
+/// size, not the drain, sets that headroom. Without a thread for the
+/// drainer, `start` runs undrained.
+pub(crate) fn draining_lifecycle<Pin, L, T, F>(lane: Option<&mut NativeLane<L>>, start: F) -> T
+where
+    L: crate::inventory_capture::CaptureLane<Pin>,
+    NativeLane<L>: Send,
+    F: FnOnce() -> T,
+{
     struct Done<'a>(&'a std::sync::atomic::AtomicBool);
     impl Drop for Done<'_> {
         fn drop(&mut self) {
@@ -5000,14 +5006,20 @@ fn draining_lifecycle<T>(
     };
     let done = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|threads| {
-        threads.spawn(|| {
-            while !done.load(std::sync::atomic::Ordering::Acquire) {
-                lane.collecting_tick::<crate::process::PidPin>();
-                std::thread::sleep(SERVICE_TICK);
-            }
-            // One last quantum after the load: the first pass follows.
-            lane.collecting_tick::<crate::process::PidPin>();
-        });
+        let drainer = std::thread::Builder::new()
+            .name("p11scope-lifecycle-drain".into())
+            .spawn_scoped(threads, || {
+                while !done.load(std::sync::atomic::Ordering::Acquire) {
+                    lane.collecting_tick::<Pin>();
+                    std::thread::sleep(SERVICE_TICK);
+                }
+                // One last quantum after the load: the first pass follows.
+                lane.collecting_tick::<Pin>();
+            });
+        // No drainer thread: the load runs undrained, exactly as before
+        // the startup drain (the ring keeps what it can and counts the
+        // rest).
+        let _ = drainer;
         // Released on return and on unwind, so the scope never waits on
         // a drainer whose load panicked.
         let _done = Done(&done);

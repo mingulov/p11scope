@@ -3689,6 +3689,112 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
     );
 }
 
+/// Hold ledger reservations outside any quantum (live key
+/// associations) until exactly `room` entries stay free.
+fn fill_ledger_to_room(scene: &mut MachineScene, room: usize) {
+    loop {
+        let free = scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .reservation_room();
+        if free <= room {
+            assert_eq!(free, room, "the ledger leaves exactly the wanted room");
+            return;
+        }
+        scene
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .ledger_mut()
+            .mint_keyassoc(0)
+            .expect("a held association");
+    }
+}
+
+fn ledger_gaps(scene: &MachineScene) -> Vec<(String, String)> {
+    scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect()
+}
+
+/// After the grant, reservations carried from earlier quanta leave room
+/// for five STARTs. The quantum's first slice reads exactly that room,
+/// so no START is refused for want of a reservation (no history loss is
+/// disclosed); the rest wait on the wire for a later quantum.
+#[test]
+fn joint_postgrant_carried_reservations_bound_the_first_slice() {
+    use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+    let mut scene = primed_scene(1);
+    fill_ledger_to_room(&mut scene, 5);
+    scene.scene.drain.source_mut().bound = 4_096;
+    for thread in 1..=10 {
+        let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+        scene.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    scene.service(100_000).expect("the first quantum collects");
+    assert_eq!(
+        scene.scene.drain.source_mut().pending_records(),
+        5,
+        "the first slice took exactly the ledger's room"
+    );
+    let gaps = ledger_gaps(&scene);
+    assert!(
+        !gaps
+            .iter()
+            .any(|(_, reason)| reason == "joint_seal_resource_unavailable_history_loss"),
+        "no START was refused for want of a reservation: {gaps:?}"
+    );
+}
+
+/// A ledger already full at quantum start still reads one record, so a
+/// requested poll stays real; that START is refused and its loss is
+/// disclosed under the named history-loss gap.
+#[test]
+fn joint_postgrant_full_ledger_at_quantum_start_discloses_history_loss() {
+    use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+    let mut scene = primed_scene(1);
+    fill_ledger_to_room(&mut scene, 0);
+    scene.scene.drain.source_mut().bound = 4_096;
+    for thread in 1..=2 {
+        let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+        scene.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    scene.service(100_000).expect("the first quantum collects");
+    assert_eq!(
+        scene.scene.drain.source_mut().pending_records(),
+        1,
+        "a full ledger still reads exactly one record"
+    );
+    let named = (
+        "Joint key operations unavailable; retained S1".to_string(),
+        "joint_seal_resource_unavailable_history_loss".to_string(),
+    );
+    for _ in 0..64 {
+        if ledger_gaps(&scene).contains(&named) {
+            break;
+        }
+        let _ = scene.service(1);
+    }
+    let gaps = ledger_gaps(&scene);
+    assert!(
+        gaps.contains(&named),
+        "the refused START is a named history loss: {gaps:?}"
+    );
+}
+
 /// A refused record closes an extending quantum: the open START and
 /// the count-only record would hold, but the refusal wins.
 #[test]

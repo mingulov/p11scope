@@ -10,7 +10,7 @@
 #             evidence subdirectory per cell)
 #
 # Environment:
-#   RATE      paced calls/s: 1k, 10k or 100k (default 10k)
+#   RATE      paced calls/s: 1k, 2.5k, 5k, 7.5k, 10k or 100k (default 10k)
 #   DURATION  hot-loop seconds, 1..3600 (default 20; gated cells need
 #             >= 2 so a full 1 s window exists)
 #   MIN_RATE  oracle floor in calls/s (default 10000; must not exceed
@@ -144,10 +144,13 @@ select_provider() {
     return 0
 }
 
-# RATE label (1k/10k/100k) to Hz; prints nothing for anything else.
+# RATE label (1k/2.5k/5k/7.5k/10k/100k) to Hz; prints nothing for anything else.
 rate_hz() {
     case "${1:-}" in
         1k) printf '1000\n' ;;
+        2.5k) printf '2500\n' ;;
+        5k) printf '5000\n' ;;
+        7.5k) printf '7500\n' ;;
         10k) printf '10000\n' ;;
         100k) printf '100000\n' ;;
         *) return 0 ;;
@@ -158,7 +161,7 @@ rate_hz() {
 validate_params() {
     hz=$(rate_hz "${RATE:-10k}")
     if [ -z "$hz" ]; then
-        log "RATE must be 1k, 10k or 100k"
+        log "RATE must be 1k, 2.5k, 5k, 7.5k, 10k or 100k"
         return 1
     fi
     case "${DURATION:-20}" in
@@ -829,7 +832,7 @@ usage() {
 usage: joint-throughput.sh P11SCOPE OUTDIR
   P11SCOPE  observer binary (p11scope-discover beside it)
   OUTDIR    fresh results directory
-  env RATE (1k/10k/100k, default 10k), DURATION seconds (default 20),
+  env RATE (1k/2.5k/5k/7.5k/10k/100k, default 10k), DURATION seconds (default 20),
       MIN_RATE calls/s (default 10000), CELLS subset, SOFTHSM_LIB
       override, OBS_MARGIN observer seconds beyond DURATION (default 90),
       SETTLEMENT_LAT=1 for the diagnostic settlement-latency line

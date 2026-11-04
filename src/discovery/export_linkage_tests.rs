@@ -931,7 +931,11 @@ fn an_unpinned_entry_whose_name_is_exported_contradicts_the_table() {
 /// keeps its ABI-definitional name instead of contradicting the table.
 /// The dynamic linker resolves that relocation by name, so the target is
 /// a `C_GetFunctionList` definition by construction; the unanimous rest
-/// proves the layout is a real function list.
+/// proves the layout is a real function list. Isolation check for the
+/// scoring arm only: production tables reach this score after bind
+/// verifies the forward against the pinned target's own exports, and a
+/// forward to a wrong offset is refused before scoring (see the
+/// `forwarded_bootstrap_to_a_wrong_offset` twin).
 #[test]
 fn forwarded_bootstrap_with_agreeing_rest_keeps_its_name() {
     use super::{ExportAgreement, ObjectExports, ScannedEntry, ScannedTable, export_agreement};

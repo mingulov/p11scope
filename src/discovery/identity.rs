@@ -29,8 +29,8 @@ use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, ObjectKey};
 
 use crate::discovery::scan::{
-    CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedModule, Skipped, read_mountinfo,
-    standard_function_names,
+    CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
+    read_mountinfo, standard_function_names,
 };
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{MountNamespaceId, MountTableCache, ProcessView, ProcessViewId};
@@ -4692,7 +4692,12 @@ mod conservative_copy {
                             let strings = text_bytes(entry.name)?
                                 .checked_add(text_bytes(&entry.object_path)?)
                                 .and_then(|bytes| {
-                                    bytes.checked_add(ENTRY_MISSING.len().max(ENTRY_ABI.len()))
+                                    bytes.checked_add(
+                                        ENTRY_MISSING
+                                            .len()
+                                            .max(ENTRY_ABI.len())
+                                            .max(UNVERIFIED_FORWARD_REFUSAL.len()),
+                                    )
                                 })
                                 .ok_or(GraphRefusal::Overflow)?;
                             add(
@@ -5391,6 +5396,20 @@ mod conservative_copy {
                         });
                         if compatible {
                             let id = candidate.ok_or(GraphRefusal::Identity)?;
+                            // Same forward check as `bind_scanned_modules`:
+                            // a cross-object bootstrap forward must resolve
+                            // by name in the pinned target's own exports.
+                            let entry = self.entry.as_ref().ok_or(GraphRefusal::Identity)?;
+                            let module_key =
+                                self.module.as_ref().ok_or(GraphRefusal::Identity)?.key;
+                            if entry.object != module_key
+                                && entry.name == "C_GetFunctionList"
+                                && !forwarded_bootstrap_verified(entry, &pins.exports_for(id))
+                            {
+                                self.skip_reason = UNVERIFIED_FORWARD_REFUSAL;
+                                self.phase = BindPhase::EntrySkip;
+                                return Ok(());
+                            }
                             self.ids.push(id);
                             let entry = self.entry.take().ok_or(GraphRefusal::Identity)?;
                             self.module
@@ -7572,6 +7591,32 @@ pub fn canonicalize_scanned_overlays(pinned: &mut PinnedObjects) -> (usize, Vec<
     (canonical.len(), lost)
 }
 
+/// Refusal suffix for a forwarded bootstrap the pinned target does not
+/// define, appended to the target path. Shared by both bind paths, so the
+/// refusal reads identically however the table was bound.
+pub(crate) const UNVERIFIED_FORWARD_REFUSAL: &str =
+    " does not define C_GetFunctionList at the forwarded offset; entry was not attached";
+
+/// Whether a `C_GetFunctionList` entry forwarded out of its module is a
+/// genuine linker interposition: the pinned target object's own `.dynsym`
+/// definitions must define `C_GetFunctionList` exactly at the entry's file
+/// offset. The dynamic linker resolves that relocation by name, so a
+/// genuine forward always satisfies this; a wrong export, a stale mapping,
+/// or a non-provider target (no standard exports) stays unproven and the
+/// entry is refused at bind time, keeping export agreement fail-closed.
+/// Pure over caller-held pin evidence — no I/O. Both bind paths
+/// ([`bind_scanned_modules`] and the conservative cursor's `EntryResolve`)
+/// apply it identically.
+pub(crate) fn forwarded_bootstrap_verified(
+    entry: &ScannedEntry,
+    target_exports: &[(String, u64)],
+) -> bool {
+    entry.name == "C_GetFunctionList"
+        && target_exports
+            .iter()
+            .any(|(name, offset)| name == entry.name && *offset == entry.file_offset)
+}
+
 /// Resolves every process-view-local mapping reference to its final capture-local
 /// opened identity. It does not apply overlay heuristics, so callers can bind after
 /// manifest absorption without moving manifest authority between scan peers.
@@ -7615,8 +7660,27 @@ pub fn bind_scanned_modules(
                             (Some(target), Some(provider)) if target == provider
                         ) =>
                     {
-                        ids.push(id);
-                        kept.push(entry);
+                        // A cross-object bootstrap forward must resolve by
+                        // name in the pinned target's own exports; anything
+                        // else is refused, keeping export agreement
+                        // fail-closed (see `forwarded_bootstrap_verified`).
+                        if entry.object != module.key
+                            && entry.name == "C_GetFunctionList"
+                            && !forwarded_bootstrap_verified(&entry, &pinned.exports_for(id))
+                        {
+                            let skip = Skipped {
+                                subject: entry.name.to_string(),
+                                reason: format!(
+                                    "{}{UNVERIFIED_FORWARD_REFUSAL}",
+                                    entry.object_path
+                                ),
+                            };
+                            table.unpinned.push(skip.clone());
+                            lost.push(skip);
+                        } else {
+                            ids.push(id);
+                            kept.push(entry);
+                        }
                     }
                     candidate => {
                         let skip = Skipped {
@@ -8254,6 +8318,61 @@ mod tests {
         Version, WalkOutcome,
     };
     use std::cell::RefCell;
+
+    #[test]
+    fn forwarded_bootstrap_verifies_only_the_named_definition_at_its_offset() {
+        let entry = ScannedEntry {
+            name: "C_GetFunctionList",
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 43,
+            },
+            object_path: "/opt/dep.so".into(),
+            file_offset: 0xebe0,
+        };
+        // Exact definition: genuine interposition.
+        assert!(forwarded_bootstrap_verified(
+            &entry,
+            &[("C_GetFunctionList".to_string(), 0xebe0)]
+        ));
+        // Right name, wrong offset: a stale mapping or hostile craft.
+        assert!(!forwarded_bootstrap_verified(
+            &entry,
+            &[("C_GetFunctionList".to_string(), 0x20)]
+        ));
+        // Right offset, wrong name: another export sits there.
+        assert!(!forwarded_bootstrap_verified(
+            &entry,
+            &[("C_Initialize".to_string(), 0xebe0)]
+        ));
+        // Non-provider target: no standard exports at all.
+        assert!(!forwarded_bootstrap_verified(&entry, &[]));
+        // An alias beside the definition still verifies.
+        assert!(forwarded_bootstrap_verified(
+            &entry,
+            &[
+                ("C_Initialize".to_string(), 0xebe0),
+                ("C_GetFunctionList".to_string(), 0xebe0),
+            ]
+        ));
+    }
+
+    #[test]
+    fn forwarded_bootstrap_check_never_verifies_another_name() {
+        let entry = ScannedEntry {
+            name: "C_Login",
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 43,
+            },
+            object_path: "/opt/dep.so".into(),
+            file_offset: 0x30,
+        };
+        assert!(!forwarded_bootstrap_verified(
+            &entry,
+            &[("C_Login".to_string(), 0x30)]
+        ));
+    }
 
     #[test]
     fn retained_target_charge_is_bounded_before_the_first_copy() {

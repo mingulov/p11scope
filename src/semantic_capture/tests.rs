@@ -2021,6 +2021,11 @@ fn joint_pre_key_raw_disposal_does_not_taint_the_callers_own_image() {
         "no binding existed to prove this image another caller's"
     );
     assert!(
+        !owner.adapter().image_sighted_for_test(image),
+        "records disposed before any key existed are fenced loss, not a \
+         sighting the later exec birth must answer for"
+    );
+    assert!(
         owner.adapter_mut().bind_admitted_key(&admitted).is_ok(),
         "the later binding of the same process is not refused"
     );

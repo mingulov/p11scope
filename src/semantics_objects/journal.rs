@@ -1306,6 +1306,11 @@ impl JournalAdapter {
         self.is_tainted(image)
     }
 
+    #[cfg(test)]
+    pub(crate) fn image_sighted_for_test(&self, image: (u64, u64)) -> bool {
+        self.sightings.contains_key(&image)
+    }
+
     /// Images with unconverted staging (open or refused) that no bound
     /// key accounts for: the input `has_unbound_staging` refuses on.
     #[cfg(test)]

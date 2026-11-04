@@ -28,7 +28,7 @@ events on small hosts: on a quiet 3-vCPU sm1 host the twelve-thread
 flood lost 356,859 of ~976k events, disclosed as `event_loss` with
 PARTIAL coverage, while the same-volume six-thread flood completed
 947k calls with zero loss (sm1 live-triage measurements). vng guests
-(6.6/6.12/6.18/7.0/7.3.1) and the CI host hold the twelve-thread flood
+(6.6/6.12/6.18/7.0/7.3.1) hold the twelve-thread flood
 in the same runs, except one v6.12 guest `mt-exact` failure observed in
 the same campaign — loss-free at twelve threads is typical off the
 small host, not guaranteed. For exact captures under a synthetic flood,

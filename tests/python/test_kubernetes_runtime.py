@@ -158,6 +158,17 @@ elif tool == "docker":
         for image in args[2:]:
             if image != "-f":
                 state["images"].pop(image, None)
+    elif args[:1] == ["save"]:
+        import io, tarfile
+        digest = state["images"].get(args[-1], state["node_id"])
+        payload = json.dumps([{"Config": "blobs/sha256/" + digest.split(":", 1)[1],
+                               "RepoTags": [args[-1]], "Layers": []}]).encode()
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+        sys.stdout.buffer.write(buf.getvalue())
     elif args[:1] == ["exec"] and "inspecti" in args:
         print(json.dumps({"status": {"id": state["loaded_id"]}}))
     elif args[:1] == ["ps"]:
@@ -345,6 +356,59 @@ print("=== kind e2e: ALL OK (10 gated checks passed; 2 record-only lines; summar
                                 text=True, capture_output=True, timeout=20)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self.calls()), calls_before)
+
+
+class SaveLayoutTests(unittest.TestCase):
+    def tarball(self, members):
+        import io
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name, payload in members.items():
+                data = payload if isinstance(payload, bytes) else payload.encode()
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def digest_of(self, blob):
+        helper = load_helper()
+        helper.command_bytes = lambda *args, **kwargs: blob
+        return helper.local_config_digest("img:t")
+
+    def test_docker29_index_wrapped_save_yields_the_config_digest(self):
+        config = "c" * 64
+        blob = self.tarball({
+            "index.json": json.dumps({
+                "schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{"mediaType": "application/vnd.oci.image.index.v1+json",
+                               "digest": "sha256:" + "d" * 64, "size": 856}]}),
+            "manifest.json": json.dumps(
+                [{"Config": f"blobs/sha256/{config}", "RepoTags": ["img:t"], "Layers": []}]),
+        })
+        self.assertEqual(self.digest_of(blob), "sha256:" + config)
+
+    def test_legacy_save_without_index_yields_the_config_digest(self):
+        config = "e" * 64
+        blob = self.tarball({
+            "manifest.json": json.dumps(
+                [{"Config": f"blobs/sha256/{config}", "RepoTags": ["img:t"], "Layers": []}]),
+            "repositories": json.dumps({"img": {"t": "f" * 64}}),
+        })
+        self.assertEqual(self.digest_of(blob), "sha256:" + config)
+
+    def test_corrupt_save_layouts_are_refused(self):
+        bad = [b"not-a-tar",
+               self.tarball({"index.json": "{}"}),
+               self.tarball({"manifest.json": "[]"}),
+               self.tarball({"manifest.json": "[{},{}]"}),
+               self.tarball({"manifest.json": "[\"x\"]"}),
+               self.tarball({"manifest.json": "[{}]"}),
+               self.tarball({"manifest.json": "[{\"Config\": 7}]"}),
+               self.tarball({"manifest.json": "[{\"Config\": \"sha256:xyz\"}]"})]
+        for blob in bad:
+            with self.subTest(blob=blob[:20]), self.assertRaises(ValueError):
+                self.digest_of(blob)
 
 
 if __name__ == "__main__":

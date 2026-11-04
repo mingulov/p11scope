@@ -5,11 +5,12 @@
 The artifact consumer validates the package before invoking this coordinator.
 This file never builds Rust, downloads an observer or changes a Docker daemon.
 `load-images` is the existing harnesses' narrow setup seam: load once, then
-compare each node's CRI config ID with the exact local Docker image ID.
+compare each node's CRI config ID with the exact local image config digest.
 """
 
 import argparse
 from collections import Counter
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import runpy
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import tomllib
 
@@ -54,6 +56,41 @@ def image_present(image):
     return bool(command(["docker", "image", "ls", "--quiet", "--no-trunc", image]))
 
 
+def command_bytes(args, seconds=120, allowed_statuses=(0,)):
+    result = subprocess.run(["timeout", "--signal=TERM", "--kill-after=10s", f"{seconds}s", *args],
+                            capture_output=True, check=False)
+    if result.returncode not in allowed_statuses:
+        raise ValueError(f"{args[0]} failed ({result.returncode}): {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def local_config_digest(image):
+    # The node's CRI reports the image config digest, but docker 29 reports
+    # {{.Id}} as the OCI index or manifest digest for locally built images,
+    # so read the config digest out of `docker save` instead (the config
+    # binds every layer via diff_ids, so the comparison keeps its original
+    # strength). manifest.json is present in save output on every docker
+    # version, and saving one image yields exactly one entry.
+    blob = command_bytes(["docker", "save", image], 300)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
+            entry = tar.extractfile("manifest.json")
+            if entry is None:
+                raise ValueError(f"local image save layout is unavailable: {image}")
+            manifest = json.loads(entry.read().decode())
+    except (KeyError, ValueError, tarfile.TarError, EOFError) as exc:
+        raise ValueError(f"local image save layout is unavailable: {image}") from exc
+    if not isinstance(manifest, list) or len(manifest) != 1 or not isinstance(manifest[0], dict):
+        raise ValueError(f"local image save layout is unavailable: {image}")
+    config = manifest[0].get("Config")
+    if not isinstance(config, str):
+        raise ValueError(f"local image save layout is unavailable: {image}")
+    match = re.fullmatch(r"blobs/sha256/([0-9a-f]{64})", config)
+    if not match:
+        raise ValueError(f"local image config digest is unavailable: {image}")
+    return f"sha256:{match.group(1)}"
+
+
 def load_images(cluster, images, node_image=None):
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?", cluster) or not images:
         raise ValueError("a named cluster and explicit local images are required")
@@ -71,16 +108,15 @@ def load_images(cluster, images, node_image=None):
             raise ValueError("kind node image ID differs from the pinned local image")
     expected = {}
     for image in images:
-        identity = command(["docker", "image", "inspect", "--format", "{{.Id}}", image])
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
-            raise ValueError(f"local image ID is unavailable: {image}")
-        expected[image] = identity
+        expected[image] = local_config_digest(image)
     command(["kind", "load", "docker-image", "--name", cluster, *images], 1200)
     for node in nodes:
         for image, identity in expected.items():
             loaded = json.loads(command(["docker", "exec", node, "crictl", "inspecti", "-o", "json", image]))
-            if loaded.get("status", {}).get("id") != identity:
-                raise ValueError(f"loaded image identity differs from the local image: {image}")
+            loaded_id = loaded.get("status", {}).get("id")
+            if loaded_id != identity:
+                raise ValueError(f"loaded image identity differs from the local image: {image} "
+                                 f"(local config {identity}, node {loaded_id})")
             print(f"loaded-image node={node} image={image} id={identity}", flush=True)
 
 

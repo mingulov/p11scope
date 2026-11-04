@@ -1888,6 +1888,30 @@
       "path": "privileged_trace_system_prearm_clean_exact_counts",
       "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
       "cell": "live-kernel"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses",
+      "reason": "root: loop overlay mounts drive the production original-file witness",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves",
+      "reason": "root: loop overlay mounts drive the production original-file witness",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback",
+      "reason": "root: loop overlay mounts drive the sweep-side overlay no-fallback",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses",
+      "reason": "root: loop overlay mounts drive the sweep-side witness cell",
+      "cell": "privileged"
     }
   ]
 }

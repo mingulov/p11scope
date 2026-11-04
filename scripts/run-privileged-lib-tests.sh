@@ -347,6 +347,12 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xin
 # and the only-excluded-anchor install failure takes the same witness
 # route (fresh joins, stale and no-witness runs keep the loss).
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses
+# K1 witness campaign siblings (own loop overlays per mode): the
+# budget-exhaustion refusal, the same-key-twice proof, and the K2
+# sweep-side no-fallback cell.
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains

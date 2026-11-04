@@ -17,12 +17,14 @@
 #   negative attach to idle: no module, no call, with a visibility line
 #            from k8s-profile-entry proving the pod was seen
 #   scan     attach to idle, then exec a ledger run inside it (the provider
-#            is mapped AFTER attach): every ledger function must count
-#            exactly its LEDGER successful value (leg counted-exact,
-#            whatever the disclosure causes) or zero with a named
-#            disclosure for the miss (legs absent/attached-zero); loss,
-#            partial counts and silent zeros fail. Setup calls on other
-#            functions are allowed and reported as extra_calls.
+#            is mapped AFTER attach): the controller releases the workload's
+#            gate after its READY plus a settle delay, so discovery always
+#            arms before the burst. Every ledger function must count exactly
+#            its LEDGER successful value (leg counted-exact, whatever the
+#            disclosure causes) or zero with a named disclosure for the miss
+#            (legs absent/attached-zero); loss, partial counts and silent
+#            zeros fail. Setup calls on other functions are allowed and
+#            reported as extra_calls.
 #
 # The CONTROLLER runs every docker/kind/kubectl command below. Workers only run
 # `sh $0 --self-test`, which is unprivileged (PATH stubs) and proves the arg
@@ -49,6 +51,12 @@ DURATION_DEFAULT=30
 NEG_DURATION_DEFAULT=5
 # The scan twin covers an exec'd token init plus a 250-iteration ledger.
 SCAN_DURATION_DEFAULT=90
+# Settle between the scan workload's READY (provider mapped, setup done)
+# and its gate release: discovery arms inside this window, so the burst
+# never starts on unarmed probes. Anchored at READY, never at exec start:
+# a fixed-from-exec sleep lets slow token init eat the margin (a 245/250
+# partial on a 9s setup), while READY-anchored settle is guaranteed.
+SCAN_SETTLE_DEFAULT=10
 
 usage() {
     cat >&2 <<'EOF'
@@ -108,6 +116,7 @@ self_test() {
         [ -f "$tree_file" ] || { echo "node tree file missing: $tree_file" >&2; exit 1; }
     done
     [ "$ITERS_A_DEFAULT" -eq 400 ] && [ "$ITERS_SCAN_DEFAULT" -eq 250 ] \
+        && [ "$SCAN_SETTLE_DEFAULT" -eq 10 ] \
         || { echo "ledger defaults drifted" >&2; exit 1; }
     for bad in "" "--observer" "--observer /nonexistent" \
                "--observer /bin/true --observer /bin/true" \
@@ -335,6 +344,7 @@ k2_provision_self_test() {
                   "/etc/sudoers.d/p11k2" "chmod 440" "sudo -n true" \
                   "admin.conf" "wait --for=condition=Ready" \
                   "get pod ledger-a" \
+                  "exec node-stub sh -c command -v kubectl" \
                   "/opt/k2/scripts/attach-pod.sh" "/opt/k2/scripts/lib.sh" \
                   "/opt/k2/target/release/p11scope"; do
         grep -q "$marker" "$pst_stub/calls.txt" \
@@ -497,6 +507,32 @@ LEDGER good" STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
             exit 1
         fi
     done
+    # Scan workload and gate: the workload exec carries no gate of its own
+    # (the burst must not start on unarmed probes), and the gate is a
+    # separate controller touch after READY; a failed touch fails the run.
+    : > "$cst_stub/calls.txt"
+    WORK=$cst_stub/work STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
+        start_scan_workload
+    wait "$SCAN_EXEC_PID" || { echo "stubbed scan workload failed" >&2; exit 1; }
+    grep -q "kubectl -n p11scope-e2e exec idle -- sh -c exec holder-entry ledger 250" \
+        "$cst_stub/calls.txt" \
+        || { echo "scan workload argv drifted" >&2; exit 1; }
+    if grep "kubectl " "$cst_stub/calls.txt" | grep -q "sleep"; then
+        echo "scan workload still carries its own gate sleep" >&2
+        exit 1
+    fi
+    : > "$cst_stub/calls.txt"
+    STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" release_scan_gate \
+        || { echo "gate release refused" >&2; exit 1; }
+    grep -q "kubectl -n p11scope-e2e exec idle -- touch /tmp/gate" \
+        "$cst_stub/calls.txt" \
+        || { echo "gate release missed the pod path" >&2; exit 1; }
+    if STUB_FAIL="touch" STUB_CALLS=$cst_stub/calls.txt PATH="$cst_stub:$PATH" \
+            release_scan_gate >/dev/null 2>&1; then
+        echo "failed gate release accepted" >&2
+        exit 1
+    fi
+    STUB_FAIL=
 }
 
 # The oracle hooks: the exact subcommand argv the legs use, and an oracle
@@ -656,6 +692,9 @@ PY
         scan_fail "$bad" exec250 "late provider silently zero"
     done
     scan_fail partial exec250 "partial scan count"
+    # A partial names its disclosure causes, so the next undercount carries
+    # its context instead of bare counts.
+    scan_fail partial exec250 "(causes ['pid_namespace'])"
     scan_fail split exec250 "partial scan count"
     scan_fail ledgermismatch exec100 "partial scan count"
     scan_fail lossexact exec250 "scan loss"
@@ -824,7 +863,10 @@ provision_node() {
         || { echo "node sudoers setup failed" >&2; return 1; }
     docker exec -u "$K2_USER" "$NODE" sudo -n true \
         || { echo "node passwordless sudo failed" >&2; return 1; }
-    if docker exec "$NODE" command -v kubectl >/dev/null 2>&1; then
+    # `command` is a shell builtin: probe through the node's shell, never
+    # bare through exec (a bare probe always fails, forcing the copy branch
+    # even when the node image ships kubectl).
+    if docker exec "$NODE" sh -c 'command -v kubectl' >/dev/null 2>&1; then
         NODE_KUBECTL=$(docker exec "$NODE" kubectl version --client) \
             || { echo "node kubectl version failed" >&2; return 1; }
         fact "node-kubectl=$NODE_KUBECTL (node image)"
@@ -1068,7 +1110,7 @@ elif len(zero) == len(expected):
         raise SystemExit(f"late provider silently zero: 0 calls, {len(modules)} module(s), causes {sorted(causes)}")
     leg = "absent" if not modules else "attached-zero"
 else:
-    raise SystemExit(f"partial scan count: {counted} vs ledger {expected}")
+    raise SystemExit(f"partial scan count: {counted} vs ledger {expected} (causes {sorted(causes)})")
 print(json.dumps({"check": "scan-limit", "ok": True, "leg": leg,
                   "ledger": expected, "counted": counted,
                   "counted_calls": sum(counted.values()),
@@ -1096,6 +1138,27 @@ start_attach() {
         >"$WORK/$1.out" 2>"$WORK/$1.err" &
     CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
     STARTED_PID=$!
+}
+
+# start_scan_workload: exec the scan ledger inside the idle pod; the gate
+# stays closed until release_scan_gate opens it, so the burst never starts
+# on unarmed probes. The workload's stdout/stderr land in
+# WORK/k2-scan-exec.log; SCAN_EXEC_PID is the local kubectl, kept in
+# CAPTURE_PIDS for cleanup like every capture.
+start_scan_workload() {
+    kc -n "$WL_NS" exec idle -- sh -c "exec holder-entry ledger $ITERS_SCAN_DEFAULT" \
+        >"$WORK/k2-scan-exec.log" 2>&1 &
+    CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
+    SCAN_EXEC_PID=$!
+}
+
+# release_scan_gate: open the scan workload's gate from the controller, after
+# its READY plus the settle delay. holder-entry deletes any pre-created gate
+# at startup, so the touch must come after READY, never before the exec; the
+# touch exec's own runc stages are expected in this leg (the workload itself
+# is an exec) and excluded from the disclosure set.
+release_scan_gate() {
+    kc -n "$WL_NS" exec idle -- touch /tmp/gate
 }
 
 # finish_attach NAME NODE_OUT LOCAL PID: the capture must exit 0, then its
@@ -1270,15 +1333,17 @@ say "=== scan-limit twin: a ledger mapped after attach is never silently zero ==
 start_attach k2-scan idle "$SCAN_DURATION_DEFAULT" /tmp/k2-scan.json
 PID_SCAN=$STARTED_PID
 wait_ready k2-scan "$PID_SCAN" || fail_cell "scan capture never became ready"
-# The gate is released from inside the same exec (holder-entry deletes any
-# pre-created gate at startup); the exec is the workload, so its runc stages
-# are expected and excluded from the disclosure set.
-kc -n "$WL_NS" exec idle -- sh -c '(sleep 10; touch /tmp/gate) & exec holder-entry ledger 250' \
-    >"$WORK/k2-scan-exec.log" 2>&1 &
-EXEC_PID=$!
-CAPTURE_PIDS="$CAPTURE_PIDS $EXEC_PID"
+# The gate is released by the controller after READY plus the settle delay
+# (holder-entry deletes any pre-created gate at startup, so the touch must
+# come after READY); the workload and touch execs' runc stages are expected
+# and excluded from the disclosure set.
+start_scan_workload
+EXEC_PID=$SCAN_EXEC_PID
 wait_file_line "$WORK/k2-scan-exec.log" '^READY ' 120 \
     || fail_cell "scan ledger never became ready"
+sleep "$SCAN_SETTLE_DEFAULT"
+release_scan_gate >"$WORK/k2-scan-gate.log" 2>&1 \
+    || fail_cell "scan gate release failed"
 wait_file_line "$WORK/k2-scan-exec.log" '^LEDGER ' 120 \
     || fail_cell "scan ledger never completed"
 kill -0 "$PID_SCAN" 2>/dev/null || fail_cell "scan ledger completed outside the capture window"

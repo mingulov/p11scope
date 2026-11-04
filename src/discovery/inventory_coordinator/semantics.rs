@@ -3983,6 +3983,37 @@ mod binding_window_tests {
             !set.proves_unbound_caller(domain, image(99)),
             "a binding of another domain is another ticket space"
         );
+        // Admission history is part of the proof: a same-domain history
+        // with another cookie keeps the proof, one holding the call's
+        // cookie or one from another domain barriers.
+        let history = |domain, cookie| SemanticAdmissionHistory {
+            domain,
+            image: image(cookie),
+            incarnation: 1,
+            generation: crate::inspect_system::MemberGeneration {
+                start_time: None,
+                exe: None,
+            },
+            pin: Arc::new(PidPin::test_proc_only(1234)),
+            initial_scope_cut: false,
+            pending_gap: None,
+        };
+        set.admission_images.insert(CallerId(20), history(bound, 55));
+        assert!(
+            set.proves_unbound_caller(bound, image(99)),
+            "a different same-domain history keeps the proof"
+        );
+        set.admission_images.insert(CallerId(21), history(bound, 99));
+        assert!(
+            !set.proves_unbound_caller(bound, image(99)),
+            "a history entry holding the call's cookie could be that caller"
+        );
+        set.admission_images.remove(&CallerId(21));
+        set.admission_images.insert(CallerId(22), history(domain, 56));
+        assert!(
+            !set.proves_unbound_caller(bound, image(99)),
+            "a history entry of another domain is another ticket space"
+        );
     }
 }
 

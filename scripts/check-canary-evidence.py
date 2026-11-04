@@ -480,7 +480,7 @@ def assert_safe_profile(doc):
         for row in rows:
             assert set(row) == {"mechanism", "mechanism_hex", "registered",
                                 "calls", "errors"}, row
-            assert row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
+            assert isinstance(row["mechanism"], int) and row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
             if TARGET_BITS == 32:
                 if row["registered"] is False:
                     assert row["mechanism"] in (UNKNOWN, MAXIMUM), row
@@ -513,7 +513,7 @@ def assert_safe_trace(text):
             hits = [line for line in events if token in line]
             assert hits, f"unregistered {token} missing from trace"
             assert all(
-                re.search(rf" C_[A-Za-z0-9_]+ {token} → ", line) is not None
+                re.search(rf" C_[A-Za-z]+ {token} → ", line) is not None
                 and line.count(token) == 1
                 for line in hits
             ), hits
@@ -1446,22 +1446,22 @@ def assert_event_records(raw_records, lane, workload_pid):
                         found_at = raw.find(packed, start)
                         if found_at < 0:
                             break
-                        # An occurrence touching the mechanism field
-                        # (bytes 48-55) is the approved value or its
-                        # boundary artifact (MECH_NONE followed by
-                        # zeros spells packed MAXIMUM at 52); anything
-                        # else there would corrupt the mechanism value
-                        # the set assertion pins above. The three exact
-                        # (offset, value) pairs are the frozen
-                        # 0xFFFFFFFF constants abutting zeros:
-                        # SESSION_NONE beside a small slot_id (36,
-                        # session-less calls), FUNCTION_NONE target
-                        # beside a zero user_type (108, synthetic
-                        # zero-fields) and USER_TYPE_NONE beside zero
-                        # shape (112, live). A different value at those
+                        # The mechanism-set assertion above pins the value,
+                        # so UNKNOWN can only match at 48 and MAXIMUM only
+                        # at 48 or 52-55 (MECH_NONE followed by zeros spells
+                        # packed MAXIMUM at 52). Anything else there would
+                        # corrupt the pinned value. The three exact (offset,
+                        # value) pairs are the frozen 0xFFFFFFFF constants
+                        # abutting zeros: SESSION_NONE beside a slot_id with
+                        # a zero low half (0 for session-less calls) at 36,
+                        # FUNCTION_NONE target beside a zero user_type at 108
+                        # (synthetic zero-fields) and USER_TYPE_NONE beside
+                        # zero shape at 112 (live). A different value at those
                         # offsets, or anything elsewhere, is a leak.
-                        approved = (41 <= found_at < 56) or (
-                            value == MAXIMUM and found_at in (36, 108, 112))
+                        if value == UNKNOWN:
+                            approved = (found_at == 48)
+                        else:
+                            approved = found_at in (36, 48, 52, 53, 54, 55, 108, 112)
                         assert approved, (lane, hex(value), found_at)
                         start = found_at + 1
         else:
@@ -1915,10 +1915,11 @@ def assert_final_artifact_privacy(artifacts):
 
 # Safe profile/trace lanes whose own capture document legitimately
 # carries the narrow unknown ids on 32-bit targets (approved shape
-# only: registered:false rows in profile JSON, mechanism tokens in
-# trace text). Every other lane and every other artifact — observer
-# logs, map dumps, receipts, manifests, metrics, START and
-# object/journal lanes — gets no allowance.
+# only: id fields in profile JSON rows, mechanism tokens in trace
+# text, the same trace lines duplicated verbatim in observer logs,
+# and the mechanism field in retained EVENTS bytes). Every other lane
+# and every other artifact — map dumps, receipts, manifests, metrics,
+# START and object/journal lanes — gets no allowance.
 SAFE_PROFILE_TRACE_LANES = frozenset({
     "default-safe-profile", "feature-safe-profile",
     "default-safe-trace", "feature-safe-trace",
@@ -1955,6 +1956,7 @@ def strip_approved_unregistered_rows(content):
 
     def strip_row(row):
         if (isinstance(row, dict) and row.get("mechanism") in approved
+                and isinstance(row["mechanism"], int)
                 and row.get("registered") is False
                 and row.get("mechanism_hex") == f"0x{row['mechanism']:x}"):
             return {key: value for key, value in row.items()
@@ -1985,9 +1987,39 @@ def strip_approved_mechanism_tokens(content):
     stripped = content
     for value in (UNKNOWN, MAXIMUM):
         token = f"0x{value:x}".encode()
-        stripped = re.sub(rb" C_[A-Za-z0-9_]+ " + re.escape(token) + " → ".encode(),
+        stripped = re.sub(rb" C_[A-Za-z]+ " + re.escape(token) + " → ".encode(),
                           b" ", stripped)
     return stripped
+
+
+def strip_approved_events_raw(content):
+    """Zero the approved mechanism field in framed EVENTS bytes.
+
+    Re-frames the raw surface (8-byte headers plus 368/608-byte
+    records) and zeroes bytes [48,56) of each record whose u64 at
+    offset 48 is UNKNOWN. A framing failure scans the raw content.
+    """
+    try:
+        raw = bytes(content)
+        out = bytearray()
+        offset = 0
+        while offset < len(raw):
+            if len(raw) - offset < 8:
+                return content
+            length, flags = struct.unpack_from("<II", raw, offset)
+            if flags != 0 or length not in RING_RECORD_LENGTHS["EVENTS"]:
+                return content
+            if len(raw) - offset - 8 < length:
+                return content
+            record = bytearray(raw[offset + 8:offset + 8 + length])
+            if len(record) >= 56 and struct.unpack_from("<Q", record, 48)[0] == UNKNOWN:
+                record[48:56] = b"\x00" * 8
+            out += raw[offset:offset + 8]
+            out += record
+            offset += 8 + length
+        return bytes(out)
+    except (ValueError, struct.error, IndexError):
+        return content
 
 
 def assert_safe_lane_alias_privacy(lane, paths):
@@ -2002,22 +2034,41 @@ def assert_safe_lane_alias_privacy(lane, paths):
         elif (TARGET_BITS == 32 and lane in SAFE_TRACE_LANES
                 and path.name == f"{lane}.observer.log"):
             # The stopped-phase harness merges the observer's stdout
-            # and stderr into this log, so it duplicates the approved
-            # trace lines byte-for-byte; diagnostics without tokens
-            # pass through to the unchanged scan below.
-            content = strip_approved_mechanism_tokens(content)
+            # and stderr into this log, so it duplicates approved trace
+            # lines byte-for-byte. Strip only lines that also appear
+            # verbatim in the lane output; log-only lines are scanned
+            # whole, and a missing output strips nothing.
+            output_lines = set()
+            for candidate in map(Path, paths):
+                if candidate.name == f"{lane}.output":
+                    try:
+                        output_lines = set(candidate.read_bytes().splitlines())
+                    except OSError:
+                        output_lines = set()
+                    break
+            else:
+                try:
+                    output_lines = set(
+                        (path.parent / f"{lane}.output").read_bytes().splitlines())
+                except OSError:
+                    output_lines = set()
+            kept = []
+            for line in content.splitlines(keepends=True):
+                bare = line.rstrip(b"\r\n")
+                ending = line[len(bare):]
+                if bare in output_lines:
+                    bare = strip_approved_mechanism_tokens(bare)
+                kept.append(bare + ending)
+            content = b"".join(kept)
+        elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
+                and path.name == f"{lane}.EVENTS.raw"):
+            # The retained records legitimately carry UNKNOWN at the
+            # mechanism offset; re-frame here and zero only that field,
+            # so every other spelling still fails without relying on
+            # the stop-time oracle having run in this process.
+            content = strip_approved_events_raw(content)
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
-        if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
-                and path.name == f"{lane}.EVENTS.raw"):
-            # The retained records legitimately carry the narrow unknown
-            # ids at the mechanism offset; the stop-time raw oracle
-            # (assert_event_records) already pinned every packed
-            # occurrence to that offset with true record framing, and
-            # this scan only runs after every lane's oracle passed, so
-            # the packed spill here is the approved position — every
-            # other alias spelling still fails.
-            found.discard("mechanism")
         assert not found, f"{lane}: scalar aliases {found} in {path}"
 
 
@@ -2438,6 +2489,9 @@ def main(argv=None):
                lambda: assert_safe_trace(trace32.replace(
                    f"0x{UNKNOWN:x} → CKR_OK",
                    f"0x{UNKNOWN:x} → CKR_OK 0x{UNKNOWN:x}")))
+        reject("safe trace 32-bit digit in function name",
+               lambda: assert_safe_trace(trace32.replace(
+                   "C_EncryptInit", "C_Encrypt123")))
 
         # The lane-scan strip removes only the approved positions: a
         # parameter alias smuggled into a row, a misplaced token, or
@@ -2508,15 +2562,24 @@ def main(argv=None):
         assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
         packed = struct.pack("<Q", UNKNOWN)
         assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
+        digit_name = f"op C_Encrypt123 0x{UNKNOWN:x} → CKR_OK\n".encode()
+        assert alias_hits(strip_approved_mechanism_tokens(digit_name)) == {"mechanism"}
         with tempfile.TemporaryDirectory() as tmp:
+            lane_out = Path(tmp) / "default-safe-trace.output"
             lane_log = Path(tmp) / "default-safe-trace.observer.log"
+            lane_out.write_bytes(token_line)
             lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
-            assert_safe_lane_alias_privacy("default-safe-trace", [lane_log])
+            assert_safe_lane_alias_privacy("default-safe-trace", [lane_out, lane_log])
             lane_log.write_bytes(
                 token_line + f"leak 0x{UNKNOWN:x}\n".encode())
             reject("observer log misplaced mechanism value",
                    lambda: assert_safe_lane_alias_privacy(
-                       "default-safe-trace", [lane_log]))
+                       "default-safe-trace", [lane_out, lane_log]))
+            log_only = f"diagnostic C_EncryptInit 0x{UNKNOWN:x} → note\n".encode()
+            lane_log.write_bytes(token_line + log_only)
+            reject("observer log token on a log-only line",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_out, lane_log]))
         # The EVENTS.raw final scan zeroes only the approved mechanism
         # field: a packed parameter alias, or UNKNOWN outside [48,56),
         # still fails.

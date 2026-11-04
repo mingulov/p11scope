@@ -133,10 +133,11 @@ accepted explicit manifest attests only its exact object/name/offset claims.
 Every `mechanisms[]` entry carries `registered`: `true` for an id the
 BPF return path found in `MECH_SHAPE`, `false` for an unregistered
 publication. Unregistered ids are public constants, so v3 documents
-list each one as a bare hex number with its call/error counts
+list each 32-bit one as a bare hex number with its call/error counts
 (`params: null`, never decoded, never named) instead of only the
 `evidence.unregistered_mechanisms`
-total, which still counts every occurrence. Like `selected_detail`,
+total, which still counts every occurrence. Ids above `0xFFFFFFFF`
+count in the total only. Like `selected_detail`,
 this is a v3-additive disclosure that introduces no new schema
 revision; historical v2 documents list registered ids only and lack
 the `registered` key. `cgroups[].mechanisms[]` rows carry the same

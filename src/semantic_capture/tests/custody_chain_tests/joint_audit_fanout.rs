@@ -3139,6 +3139,55 @@ fn joint_machine_refused_other_caller_binding_later_stays_s1_named() {
     );
 }
 
+/// The same late binding as above, but through the production admission
+/// path (selection, H0 refresh, consume) instead of the test-only bind:
+/// a refused process still never enters Joint. It stays S1, named, and
+/// the existing bound feed is untouched. This test never calls the
+/// test-only bind, so only the production naming can satisfy it.
+#[test]
+fn joint_machine_refused_image_production_binding_stays_s1_named() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-refused", None);
+    let caller = super::super::sem1_feed::admit_mapped(&mut fixture.scene.real, foreign.id());
+    super::super::sem1_feed::production_bind(
+        &mut fixture.scene.real,
+        caller,
+        foreign.id(),
+        FOREIGN,
+    );
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("late-binding", None);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(
+        registry.joint_feeds(),
+        1,
+        "the refused process never gains a Joint feed"
+    );
+    assert!(
+        registry.gaps().iter().any(|gap| gap.caller == Some(caller)
+            && gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+            && gap.reason == "joint_image_refused"),
+        "the late binding names why it stays S1: {:?}",
+        registry.gaps()
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "the refusal is never lifted"
+    );
+}
+
 /// The real command installs the machine even when the journal is unlinked.
 /// Its retained publication must not stop servicing that Session's DISCOVERY.
 #[test]

@@ -2542,7 +2542,10 @@ impl CaptureFacts {
             // later shrinks never under-reports what was missed. That count
             // is a lower bound on the endpoints omitted over the capture.
             // Whole capacity refusals rank by what they needed the same way
-            // (PD-T6-1); any other whole refusal stays first-wins.
+            // (PD-T6-1); any other whole refusal stays first-wins, except an
+            // awaiting-publication gap, which any counted capacity refusal
+            // replaces: "nothing published yet" no longer describes a module
+            // whose published set names a demand.
             let rank = |reason: &str| {
                 (
                     !plan::is_growth_omission(reason),
@@ -2565,8 +2568,16 @@ impl CaptureFacts {
             // "not attached" while the prefix is counting calls.
             let prefix_replaces_whole = plan::is_closure_array_refusal(&known.reason)
                 && plan::is_closure_array_prefix(&refused.reason);
+            // An awaiting-publication record ranks below any counted capacity
+            // refusal for the same module: once its published set names a
+            // demand, the earlier "nothing published yet" is stale. Never the
+            // reverse: the counted refusal is the high-water mark.
+            let unpublished_replaced_by_counted =
+                plan::is_closure_awaiting_publication(&known.reason)
+                    && plan::whole_refusal_needed_count(&refused.reason).is_some();
             if larger_whole
                 || prefix_replaces_whole
+                || unpublished_replaced_by_counted
                 || (plan::is_growth_omission(&known.reason)
                     && rank(&refused.reason) >= rank(&known.reason))
             {

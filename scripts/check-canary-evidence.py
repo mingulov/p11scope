@@ -513,7 +513,7 @@ def assert_safe_trace(text):
             hits = [line for line in events if token in line]
             assert hits, f"unregistered {token} missing from trace"
             assert all(
-                re.search(rf" C_[A-Za-z0-9_]+ {token} → ", line) is not None
+                re.search(rf" C_[A-Za-z]+ {token} → ", line) is not None
                 and line.count(token) == 1
                 for line in hits
             ), hits
@@ -1915,10 +1915,11 @@ def assert_final_artifact_privacy(artifacts):
 
 # Safe profile/trace lanes whose own capture document legitimately
 # carries the narrow unknown ids on 32-bit targets (approved shape
-# only: registered:false rows in profile JSON, mechanism tokens in
-# trace text). Every other lane and every other artifact — observer
-# logs, map dumps, receipts, manifests, metrics, START and
-# object/journal lanes — gets no allowance.
+# only: id fields in profile JSON rows, mechanism tokens in trace
+# text, the same trace lines duplicated verbatim in observer logs,
+# and the mechanism field in retained EVENTS bytes). Every other lane
+# and every other artifact — map dumps, receipts, manifests, metrics,
+# START and object/journal lanes — gets no allowance.
 SAFE_PROFILE_TRACE_LANES = frozenset({
     "default-safe-profile", "feature-safe-profile",
     "default-safe-trace", "feature-safe-trace",
@@ -1985,7 +1986,7 @@ def strip_approved_mechanism_tokens(content):
     stripped = content
     for value in (UNKNOWN, MAXIMUM):
         token = f"0x{value:x}".encode()
-        stripped = re.sub(rb" C_[A-Za-z0-9_]+ " + re.escape(token) + " → ".encode(),
+        stripped = re.sub(rb" C_[A-Za-z]+ " + re.escape(token) + " → ".encode(),
                           b" ", stripped)
     return stripped
 
@@ -2032,10 +2033,32 @@ def assert_safe_lane_alias_privacy(lane, paths):
         elif (TARGET_BITS == 32 and lane in SAFE_TRACE_LANES
                 and path.name == f"{lane}.observer.log"):
             # The stopped-phase harness merges the observer's stdout
-            # and stderr into this log, so it duplicates the approved
-            # trace lines byte-for-byte; diagnostics without tokens
-            # pass through to the unchanged scan below.
-            content = strip_approved_mechanism_tokens(content)
+            # and stderr into this log, so it duplicates approved trace
+            # lines byte-for-byte. Strip only lines that also appear
+            # verbatim in the lane output; log-only lines are scanned
+            # whole, and a missing output strips nothing.
+            output_lines = set()
+            for candidate in map(Path, paths):
+                if candidate.name == f"{lane}.output":
+                    try:
+                        output_lines = set(candidate.read_bytes().splitlines())
+                    except OSError:
+                        output_lines = set()
+                    break
+            else:
+                try:
+                    output_lines = set(
+                        (path.parent / f"{lane}.output").read_bytes().splitlines())
+                except OSError:
+                    output_lines = set()
+            kept = []
+            for line in content.splitlines(keepends=True):
+                bare = line.rstrip(b"\r\n")
+                ending = line[len(bare):]
+                if bare in output_lines:
+                    bare = strip_approved_mechanism_tokens(bare)
+                kept.append(bare + ending)
+            content = b"".join(kept)
         elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
                 and path.name == f"{lane}.EVENTS.raw"):
             # The retained records legitimately carry UNKNOWN at the
@@ -2541,21 +2564,16 @@ def main(argv=None):
         digit_name = f"op C_Encrypt123 0x{UNKNOWN:x} → CKR_OK\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(digit_name)) == {"mechanism"}
         with tempfile.TemporaryDirectory() as tmp:
-            lane_log = Path(tmp) / "default-safe-trace.observer.log"
-            lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
-            assert_safe_lane_alias_privacy("default-safe-trace", [lane_log])
-            lane_log.write_bytes(
-                token_line + f"leak 0x{UNKNOWN:x}\n".encode())
-            reject("observer log misplaced mechanism value",
-                   lambda: assert_safe_lane_alias_privacy(
-                       "default-safe-trace", [lane_log]))
-        with tempfile.TemporaryDirectory() as tmp:
             lane_out = Path(tmp) / "default-safe-trace.output"
             lane_log = Path(tmp) / "default-safe-trace.observer.log"
             lane_out.write_bytes(token_line)
             lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
-            assert_safe_lane_alias_privacy(
-                "default-safe-trace", [lane_out, lane_log])
+            assert_safe_lane_alias_privacy("default-safe-trace", [lane_out, lane_log])
+            lane_log.write_bytes(
+                token_line + f"leak 0x{UNKNOWN:x}\n".encode())
+            reject("observer log misplaced mechanism value",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_out, lane_log]))
             log_only = f"diagnostic C_EncryptInit 0x{UNKNOWN:x} → note\n".encode()
             lane_log.write_bytes(token_line + log_only)
             reject("observer log token on a log-only line",

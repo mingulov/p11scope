@@ -2795,11 +2795,24 @@ impl LiveJointMachine {
                 // A Joint fault never stops S1: a linked stream broken
                 // while ingesting ends Joint for every existing key and
                 // re-syncs above a fence on this collect.
+                // The void returns no seal failure, so it names its own
+                // ending here; the break quantum's seal gap and the
+                // refused keys' later seals are disclosed separately.
                 if self.producers.journal_linked() {
-                    let _voided = retain_on_refusal!(
+                    let voided = retain_on_refusal!(
                         Phase::Idle,
                         coordinator.joint_capture_mut().void_ingest_break()
                     );
+                    if voided {
+                        coordinator.note_scope_gap(
+                            "Joint key operations unavailable; retained S1".to_string(),
+                            format!(
+                                "joint_void_{}_history_loss",
+                                crate::semantics_objects::journal::joint_driver::INGEST_BREAK_VOID_GAP
+                                    .label()
+                            ),
+                        );
+                    }
                 }
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(

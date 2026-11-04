@@ -296,7 +296,8 @@ impl JointCaptureOwner {
     /// re-syncs above a fence on the consumed history, like any
     /// unlocalized loss. The disposal's storage is prepaid from the
     /// ledger's reserver as in `dispose_without_ingest`; a refusal keeps
-    /// the fail-closed refusal. Returns whether the lane was voided.
+    /// the fail-closed refusal. Returns whether the lane was voided; the
+    /// caller then records the void's own gap ([`INGEST_BREAK_VOID_GAP`]).
     pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
         let adapter = &self.adapter;
         if !adapter.stream_broken
@@ -319,7 +320,7 @@ impl JointCaptureOwner {
             &mut self.model,
             std::iter::empty(),
             true,
-            JournalGap::AdapterInvalidated,
+            INGEST_BREAK_VOID_GAP,
         );
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
         Ok(true)
@@ -543,6 +544,11 @@ impl IngestedRaw {
         self.into_collection()
     }
 }
+
+/// The refusal an ingest-break void applies
+/// ([`JointCaptureOwner::void_ingest_break`]); the caller names it in the
+/// void's own gap, since the void returns no seal failure to deliver.
+pub(crate) const INGEST_BREAK_VOID_GAP: JournalGap = JournalGap::AdapterInvalidated;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RawDisposeReason {

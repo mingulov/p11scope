@@ -816,6 +816,7 @@ jobs:
           UNRUN: scripts/ci/soak-weekly.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/lifecycle-cli.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/scale-8192.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/ci/run-root-integration.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/qualify-real-providers.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           EOF
           cat "$RUNNER_TEMP/lanes.txt"
@@ -930,6 +931,7 @@ jobs:
       - run: scripts/matrix/verify-uretprobe-seccomp.sh --self-test
       - run: scripts/ci/build-counter-fixtures.sh --self-test
       - run: scripts/ci/joint-stall-live.sh --self-test
+      - run: scripts/ci/run-root-integration.sh --self-test
       - run: python3 -I scripts/check-bpf-map-defs.py --self-test
       - run: python3 -I scripts/check-canary-evidence.py --self-test
       - run: python3 -I scripts/check-capture-evidence.py --self-test

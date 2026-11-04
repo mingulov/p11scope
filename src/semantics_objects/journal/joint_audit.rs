@@ -1737,6 +1737,9 @@ impl IngestedJointQuantum {
                     ..
                 }
             );
+        // A retry replays this visit from the start next time, so what it
+        // spends here is refunded below: it delivers nothing.
+        let before = *remaining;
         let mut batch = FailureBatchDelivery {
             audited,
             cursor: &mut self.consumers[index].failure,
@@ -1787,6 +1790,10 @@ impl IngestedJointQuantum {
             FailureBatchProgress::Complete(FailureApplyOutcome::Retried) => {
                 self.active = None;
                 self.consumers[index].failure = FailureReplayCursor::default();
+                // Nothing was delivered and the next visit replays the
+                // same spans: no progress, so the running Audited bound
+                // can end a seal that only ever retries.
+                *remaining = before;
                 Ok(QuantumSealProgress::LocalPending)
             }
             FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness) => {

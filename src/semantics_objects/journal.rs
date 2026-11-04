@@ -1301,6 +1301,19 @@ impl JournalAdapter {
             .is_some_and(|held| held.same_producers(producers))
     }
 
+    /// Images with unconverted staging (open or refused) that no bound
+    /// key accounts for: the input `has_unbound_staging` refuses on.
+    #[cfg(test)]
+    pub(crate) fn unbound_staging_images_for_test(&self) -> BTreeSet<(u64, u64)> {
+        self.open
+            .values()
+            .filter(|entry| entry.converted_ticket.is_none())
+            .map(|entry| entry.image)
+            .chain(self.refused.iter().map(|refused| refused.image))
+            .filter(|image| !self.image_keys.contains_key(image))
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_starts_for_test(&self) -> Vec<(u64, u64, u64)> {
         self.open

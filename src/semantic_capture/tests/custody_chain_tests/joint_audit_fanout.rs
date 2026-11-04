@@ -2951,6 +2951,93 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
     }
 }
 
+/// Stage a finished call from a foreign process that never becomes a
+/// caller: its image (cookie 184) is known only while the call is
+/// encoded, so S1 sheds the call as unobserved and the journal keeps it
+/// as staging no bound key accounts for (the live step-3 shape).
+fn push_unbound_foreign_call(fixture: &mut MachineScene, sequence: u64) -> OwnedStoppedChild {
+    let foreign = OwnedStoppedChild::new();
+    let pin = fixture.scene.real.h0.0.borrow().io.targets[&std::process::id()]
+        .0
+        .clone();
+    fixture.scene.real.h0.0.borrow_mut().io.targets.insert(
+        foreign.id(),
+        (
+            pin,
+            ImageIdentity {
+                task_cookie: 184,
+                exec_id: 0,
+            },
+        ),
+    );
+    fixture
+        .scene
+        .push(foreign.id(), 0, "C_CreateObject", sequence);
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .remove(&foreign.id());
+    foreign
+}
+
+/// A seal that can only be retried, with nothing delivered, is no
+/// progress: the running Audited bound ends it with a named gap instead
+/// of spinning its retry budget until the run deadline.
+#[test]
+fn joint_machine_retry_without_delivery_trips_the_running_bound() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    // The foreign child starts well after the lane attached.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _foreign = push_unbound_foreign_call(&mut fixture, 2);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.reach_phase("Audited");
+    for n in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Pending) => {}
+            other => panic!("the blocked seal stays Pending (poll {n}): {other:?}"),
+        }
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .unbound_staging_images_for_test(),
+        std::collections::BTreeSet::from([(184, 0)]),
+        "the foreign finished call is the only unbound staging"
+    );
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    match fixture.service(1024) {
+        Err(SemanticRefusal::Unavailable) => {}
+        other => panic!("a retry-only seal past the bound must refuse: {other:?}"),
+    }
+    let gaps = audit_no_progress_gaps(&fixture);
+    assert_eq!(gaps.len(), 1, "the stall is named once: {gaps:?}");
+    assert!(
+        fixture.machine.audit_no_progress_trip_for_test().is_some(),
+        "the trip is recorded for the hold"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+}
+
 /// The real command installs the machine even when the journal is unlinked.
 /// Its retained publication must not stop servicing that Session's DISCOVERY.
 #[test]

@@ -2234,8 +2234,10 @@ pub(crate) fn standard_ordinal(name: &str) -> Option<u16> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ObjectExports<'a> {
     /// The object whose `.dynsym` was read. Only an entry that lands in this
-    /// same object can agree; a forwarded entry is never compared against a
-    /// dependency's symbols it was not read from.
+    /// same object can agree — except an interposed `C_GetFunctionList`
+    /// bootstrap (see [`export_agreement`]), which the linker resolved by
+    /// name; a forwarded entry is never compared against a dependency's
+    /// symbols it was not read from.
     pub(crate) object: ObjectKey,
     pub(crate) symbols: &'a [(String, u64)],
     /// A 3.x interface getter name appears among the object's dynamic
@@ -2286,10 +2288,12 @@ impl<'a> ObjectExports<'a> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ExportAgreement {
     /// Ordinals whose target is exactly every definition of their name, in
-    /// the exporting object.
+    /// the exporting object — plus an interposed `C_GetFunctionList`
+    /// bootstrap (see [`export_agreement`]).
     pub(crate) agreeing: usize,
     /// Ordinals whose name is defined somewhere other than their target —
-    /// including a target in another object.
+    /// including a target in another object, except an interposed
+    /// `C_GetFunctionList` bootstrap in an otherwise agreeing table.
     pub(crate) disagreeing: usize,
 }
 
@@ -2302,10 +2306,25 @@ impl ExportAgreement {
     }
 }
 
+/// Compares each retained entry against the module's own export witness.
+/// One cross-object forward is not a contradiction: the `C_GetFunctionList`
+/// bootstrap legitimately interposes in multi-provider processes (every
+/// provider exports it, so the first one loaded wins the relocation by
+/// name). When at least one other entry agrees in-object — proving the
+/// layout is a real function list — the forwarded bootstrap keeps its
+/// ABI-definitional name. A lone forward, or any other forwarded name,
+/// still contradicts: only the bootstrap interposes by construction.
 pub(crate) fn export_agreement(
     table: &ScannedTable,
     exports: &ObjectExports<'_>,
 ) -> ExportAgreement {
+    let layout_proven = table.entries.iter().any(|entry| {
+        let mut offsets = exports.offsets_of(entry.name).peekable();
+        if offsets.peek().is_none() {
+            return false;
+        }
+        entry.object == exports.object && offsets.all(|offset| offset == entry.file_offset)
+    });
     let mut agreement = ExportAgreement::default();
     for entry in &table.entries {
         let mut offsets = exports.offsets_of(entry.name).peekable();
@@ -2314,7 +2333,9 @@ pub(crate) fn export_agreement(
         }
         let same_target =
             entry.object == exports.object && offsets.all(|offset| offset == entry.file_offset);
-        if same_target {
+        let interposed_bootstrap =
+            entry.name == "C_GetFunctionList" && entry.object != exports.object && layout_proven;
+        if same_target || interposed_bootstrap {
             agreement.agreeing += 1;
         } else {
             agreement.disagreeing += 1;

@@ -737,13 +737,16 @@ pub struct TableSummary {
     /// an interface triple), "live_return" (returned by a live provider
     /// export), "manifest" (operator-authoritative), "exports" (every
     /// standard name the object itself exports sits exactly at its ordinal's
-    /// target), or "heuristic" (bare decode with no linkage — its names are
-    /// presented as `unknown`). Every non-heuristic linkage names the table;
-    /// none of them gives a scan target semantic authority.
+    /// target, except an interposed `C_GetFunctionList` bootstrap the
+    /// linker resolved by name), or "heuristic" (bare decode with no
+    /// linkage — its names are presented as `unknown`). Every
+    /// non-heuristic linkage names the table; none of them gives a scan
+    /// target semantic authority.
     pub linkage: &'static str,
     /// Ordinals whose target is exactly the same-named `.dynsym` definition
-    /// in the table's own object. `None` for manifest tables, which are not
-    /// compared.
+    /// in the table's own object, plus an interposed `C_GetFunctionList`
+    /// bootstrap the linker resolved by name. `None` for manifest tables,
+    /// which are not compared.
     pub exports_agreeing: Option<usize>,
 }
 

@@ -313,6 +313,9 @@ run_prearm() {
     output=$(product_output "run-prearm-$name.txt")
     rm -f -- "run-prearm-$name.txt" "run-prearm-$name.wl" "run-prearm-$name.stderr" "run-prearm-$name.stdout"
     [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+    # The owned child runs demoted to SUDO_UID and opens the ledger
+    # itself: pre-create it owned (same precedent as second-child.pid).
+    : > "$ledger" && chown "$RUNUID:$RUNGID" "$ledger" && chmod 600 "$ledger" || { result run-prearm 0 "$name ledger setup failed" prearm-exactness; return 1; }
     # shellcheck disable=SC2086
     SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --trace --pause "$policy" --prearm-module "$MODULE" -o "$output" -- "$PREARM_LOADER" "$MODULE" "$ledger" 3 1500 > "run-prearm-$name.stdout" 2> "run-prearm-$name.stderr" & pp=$!; register "$pp" || true
     if finish "$pp" "$EXIT_TICKS"; then rc=$LAST_EXIT; else rc=124; fi
@@ -323,7 +326,8 @@ run_prearm() {
 import json
 
 def load(name):
-    with open(f"run-prearm-{name}.stderr") as handle:
+    # EVIDENCE rides on the observer's stdout (diagnostics go to stderr).
+    with open(f"run-prearm-{name}.stdout") as handle:
         evidence = None
         for line in handle:
             if line.startswith("EVIDENCE "):

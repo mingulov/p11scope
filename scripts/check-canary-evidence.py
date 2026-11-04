@@ -1990,6 +1990,36 @@ def strip_approved_mechanism_tokens(content):
     return stripped
 
 
+def strip_approved_events_raw(content):
+    """Zero the approved mechanism field in framed EVENTS bytes.
+
+    Re-frames the raw surface (8-byte headers plus 368/608-byte
+    records) and zeroes bytes [48,56) of each record whose u64 at
+    offset 48 is UNKNOWN. A framing failure scans the raw content.
+    """
+    try:
+        raw = bytes(content)
+        out = bytearray()
+        offset = 0
+        while offset < len(raw):
+            if len(raw) - offset < 8:
+                return content
+            length, flags = struct.unpack_from("<II", raw, offset)
+            if flags != 0 or length not in RING_RECORD_LENGTHS["EVENTS"]:
+                return content
+            if len(raw) - offset - 8 < length:
+                return content
+            record = bytearray(raw[offset + 8:offset + 8 + length])
+            if len(record) >= 56 and struct.unpack_from("<Q", record, 48)[0] == UNKNOWN:
+                record[48:56] = b"\x00" * 8
+            out += raw[offset:offset + 8]
+            out += record
+            offset += 8 + length
+        return bytes(out)
+    except (ValueError, struct.error, IndexError):
+        return content
+
+
 def assert_safe_lane_alias_privacy(lane, paths):
     for path in map(Path, paths):
         content = path.read_bytes()
@@ -2006,18 +2036,15 @@ def assert_safe_lane_alias_privacy(lane, paths):
             # trace lines byte-for-byte; diagnostics without tokens
             # pass through to the unchanged scan below.
             content = strip_approved_mechanism_tokens(content)
+        elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
+                and path.name == f"{lane}.EVENTS.raw"):
+            # The retained records legitimately carry UNKNOWN at the
+            # mechanism offset; re-frame here and zero only that field,
+            # so every other spelling still fails without relying on
+            # the stop-time oracle having run in this process.
+            content = strip_approved_events_raw(content)
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
-        if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
-                and path.name == f"{lane}.EVENTS.raw"):
-            # The retained records legitimately carry the narrow unknown
-            # ids at the mechanism offset; the stop-time raw oracle
-            # (assert_event_records) already pinned every packed
-            # occurrence to that offset with true record framing, and
-            # this scan only runs after every lane's oracle passed, so
-            # the packed spill here is the approved position — every
-            # other alias spelling still fails.
-            found.discard("mechanism")
         assert not found, f"{lane}: scalar aliases {found} in {path}"
 
 

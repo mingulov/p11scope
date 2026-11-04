@@ -1909,7 +1909,9 @@ def strip_approved_unregistered_rows(content):
     """Drop approved registered:false rows from a profile document.
 
     Only rows whose mechanism is UNKNOWN or MAXIMUM and whose
-    registered flag is False are removed; anything else (a parameter
+    registered flag is False are removed, from the top-level
+    mechanisms[] breakdown and from each cgroups[] entry's own
+    breakdown (same approved shape); anything else (a parameter
     alias as a mechanism, a True flag, a corrupt document) is left
     for the unchanged alias scan. A removed row carries only the
     numeric id, counts, null params and fixed strings, so no other
@@ -1919,16 +1921,27 @@ def strip_approved_unregistered_rows(content):
         doc = json.loads(content)
     except ValueError:
         return content
+    approved = {UNKNOWN, MAXIMUM}
+
+    def drop_approved(rows):
+        return [row for row in rows
+                if not (isinstance(row, dict) and row.get("mechanism") in approved
+                        and row.get("registered") is False)]
+
     mechanisms = doc.get("mechanisms")
     if not isinstance(mechanisms, list):
         return content
-    approved = {UNKNOWN, MAXIMUM}
-    kept = [row for row in mechanisms
-            if not (isinstance(row, dict) and row.get("mechanism") in approved
-                    and row.get("registered") is False)]
-    if len(kept) == len(mechanisms):
-        return content
-    return json.dumps({**doc, "mechanisms": kept}).encode()
+    stripped = dict(doc)
+    stripped["mechanisms"] = drop_approved(mechanisms)
+    cgroups = stripped.get("cgroups")
+    if isinstance(cgroups, list):
+        stripped["cgroups"] = [
+            {**entry, "mechanisms": drop_approved(entry["mechanisms"])}
+            if isinstance(entry, dict) and isinstance(entry.get("mechanisms"), list)
+            else entry
+            for entry in cgroups
+        ]
+    return json.dumps(stripped).encode()
 
 
 def strip_approved_mechanism_tokens(content):
@@ -2337,6 +2350,18 @@ def main(argv=None):
              "params_omitted": "policy", "registered": False, "calls": 1})
         assert alias_hits(strip_approved_unregistered_rows(
             json.dumps(smuggled).encode())) == {"pss_hash"}
+        cgrouped = json.loads(json.dumps(safe32))
+        cgrouped["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+                {"mechanism": ALIASES["pss_hash"], "params": None,
+                 "params_omitted": "policy", "registered": False, "calls": 1},
+            ],
+        }]
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(cgrouped).encode())) == {"pss_hash"}
         token_line = f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(token_line)) == set()
         misplaced = token_line + f"note 0x{UNKNOWN:x}\n".encode()

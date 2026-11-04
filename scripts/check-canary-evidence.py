@@ -1408,7 +1408,7 @@ def assert_event_records(raw_records, lane, workload_pid):
         if TARGET_BITS == 32:
             # The narrow unknown ids publish as event mechanisms; the
             # packed bytes may touch only the mechanism field and the
-            # two frozen-constant artifact offsets below — the final
+            # three frozen-constant artifact offsets below — the final
             # alias scan exempts this approved spill on 32-bit
             # safe-lane EVENTS dumps (see
             # assert_safe_lane_alias_privacy), so this oracle pins
@@ -1431,16 +1431,17 @@ def assert_event_records(raw_records, lane, workload_pid):
                         # boundary artifact (MECH_NONE followed by
                         # zeros spells packed MAXIMUM at 52); anything
                         # else there would corrupt the mechanism value
-                        # the set assertion pins above. The two exact
+                        # the set assertion pins above. The three exact
                         # (offset, value) pairs are the frozen
                         # 0xFFFFFFFF constants abutting zeros:
-                        # FUNCTION_NONE target beside a zero user_type
-                        # (108, synthetic zero-fields) and
-                        # USER_TYPE_NONE beside zero shape (112,
-                        # live). A different value at those offsets,
-                        # or anything elsewhere, is a leak.
+                        # SESSION_NONE beside a small slot_id (36,
+                        # session-less calls), FUNCTION_NONE target
+                        # beside a zero user_type (108, synthetic
+                        # zero-fields) and USER_TYPE_NONE beside zero
+                        # shape (112, live). A different value at those
+                        # offsets, or anything elsewhere, is a leak.
                         approved = (41 <= found_at < 56) or (
-                            value == MAXIMUM and found_at in (108, 112))
+                            value == MAXIMUM and found_at in (36, 108, 112))
                         assert approved, (lane, hex(value), found_at)
                         start = found_at + 1
         else:
@@ -2753,7 +2754,7 @@ def main(argv=None):
                    assert_event_records(mutated, "default-safe-profile", 0x555))
         # 32-bit safe lanes publish the narrow ids as event mechanisms;
         # their packed bytes may touch only the mechanism field and
-        # two frozen-constant artifact offsets (see the oracle rule).
+        # three frozen-constant artifact offsets (see the oracle rule).
         initialize(32)
         safe32_events = [event_bytes(index) for index in range(28)]
         safe32_events[0] = event_bytes(0, root_affiliation=1)
@@ -2762,6 +2763,9 @@ def main(argv=None):
         live_user_type = bytearray(safe32_events[6])
         struct.pack_into("<I", live_user_type, 112, 0xFFFFFFFF)
         safe32_events[6] = bytes(live_user_type)
+        no_session = bytearray(safe32_events[9])
+        struct.pack_into("<Q", no_session, 32, 0xFFFFFFFFFFFFFFFF)
+        safe32_events[9] = bytes(no_session)
         assert_event_records(safe32_events, "default-safe-profile", 0x555)
         reject("raw 32-bit safe events without published ids",
                lambda: assert_event_records(
@@ -2780,6 +2784,13 @@ def main(argv=None):
         reject("raw 32-bit wrong value at an artifact offset",
                lambda mistyped=mistyped: assert_event_records(
                    mistyped, "default-safe-profile", 0x555))
+        forged_session = list(safe32_events)
+        record = bytearray(forged_session[10])
+        struct.pack_into("<Q", record, 32, (UNKNOWN & 0xFFFFFFFF) << 32 | 0x101)
+        forged_session[10] = bytes(record)
+        reject("raw 32-bit wrong value at the session artifact offset",
+               lambda forged_session=forged_session: assert_event_records(
+                   forged_session, "default-safe-profile", 0x555))
         initialize(entry_bits)
         print("raw policy oracle self-test: OK")
 

@@ -1243,6 +1243,20 @@ impl ScanJob {
     }
 }
 
+/// Whether a fault move between two audits came only from hook-miss
+/// raises: the raises counted (each won its own compare-and-swap) moved
+/// the fault by exactly their number. Any other fault in the same window
+/// (a BPF record overflow, a coverage raise) makes it an ordinary era.
+fn moved_only_by_miss_raises(
+    raises_before: u64,
+    raises: u64,
+    fault_before: u64,
+    fault: u64,
+) -> bool {
+    let won = raises.saturating_sub(raises_before);
+    won != 0 && fault.checked_sub(fault_before) == Some(won)
+}
+
 /// Only I/O is substituted in tests; all decisions use the same tick below.
 trait CaptureIo {
     fn domain(&self) -> Option<NativeDomainId>;
@@ -3282,9 +3296,9 @@ impl SemanticCapture {
         };
         let (misses, raises) = io.hook_miss_totals();
         self.hook_misses = misses;
-        if raises != self.miss_raises && health.fault != self.fault {
-            // The fault moved for hook misses: unchanged loads re-prove
-            // onto their previous instances (continuity uncertain).
+        if moved_only_by_miss_raises(self.miss_raises, raises, self.fault, health.fault) {
+            // The fault moved for hook misses only: unchanged loads
+            // re-prove onto their previous instances (continuity uncertain).
             self.router.note_hook_miss_era();
         }
         self.miss_raises = raises;

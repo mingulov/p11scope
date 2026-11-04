@@ -7708,3 +7708,20 @@ mod b17_wire_projection {
         );
     }
 }
+
+/// A miss era needs the fault to move by exactly the raises the misses
+/// won: another fault in the same audit window (a BPF record overflow,
+/// a coverage raise) or a raise lost to another raiser makes it an
+/// ordinary era, which never carries observations.
+#[test]
+fn a_miss_era_is_named_only_when_won_miss_raises_moved_the_fault() {
+    use super::moved_only_by_miss_raises as miss_era;
+    assert!(miss_era(3, 4, 10, 11), "one won raise, fault +1");
+    assert!(miss_era(3, 5, 10, 12), "two won raises, fault +2");
+    assert!(
+        !miss_era(3, 4, 10, 12),
+        "an extra non-miss fault in the window"
+    );
+    assert!(!miss_era(3, 3, 10, 11), "no won raise: an ordinary era");
+    assert!(!miss_era(3, 4, 10, 10), "no fault move");
+}

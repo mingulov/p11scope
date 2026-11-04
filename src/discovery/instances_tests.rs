@@ -2445,3 +2445,123 @@ fn hook_miss_era_carry_survives_unproven_eras_but_not_retirement() {
         ObserveOutcome::Retired
     );
 }
+
+/// A scan of `cookie` in fault era `fault` (local 2, global `global`).
+fn miss_era_observation(
+    r: &InstanceRouter,
+    cookie: u64,
+    global: u64,
+    fault: u64,
+    base: u64,
+) -> StableObservation {
+    let mut observation = observation_at(cookie, FILE, 2, global, load(base));
+    observation.reading.fault = fault;
+    fresh(r, observation)
+}
+
+/// The hook-miss carry counts against the same retained-key and private
+/// range limits as live observations, and gives way first: after a miss
+/// era, new loads evict carried entries before any live one, and a
+/// carried re-proof never pushes either total past its limit.
+#[test]
+fn hook_miss_carry_counts_against_the_key_and_range_limits() {
+    let limits = RouterLimits {
+        observed_keys: 2,
+        ranges: 6,
+        ..RouterLimits::default()
+    };
+    let mut r = InstanceRouter::new(domain(), limits);
+    let within = |r: &InstanceRouter, step: &str| {
+        let (keys, carry_keys, carry_ranges) = r.retained_keys_and_carry();
+        assert!(
+            keys + carry_keys <= limits.observed_keys,
+            "{step}: {keys} observed + {carry_keys} carried keys"
+        );
+        assert!(
+            r.ranges_retained() + carry_ranges <= limits.ranges,
+            "{step}: {} live + {carry_ranges} carried ranges",
+            r.ranges_retained()
+        );
+    };
+    for cookie in [0x51, 0x52] {
+        assert_eq!(
+            r.observe_legacy(miss_era_observation(&r, cookie, 0, 0, BASE_A))
+                .0,
+            ObserveOutcome::New
+        );
+    }
+    within(&r, "two live keys");
+    r.note_hook_miss_era();
+    r.audit(1, 0, 0);
+    within(&r, "both carried");
+    assert_eq!(
+        r.observe_legacy(miss_era_observation(&r, 0x53, 0, 1, BASE_A))
+            .0,
+        ObserveOutcome::New,
+        "a new load evicts a carried entry, never refuses"
+    );
+    within(&r, "a new key beside the carry");
+    assert_eq!(
+        r.observe_legacy(miss_era_observation(&r, 0x52, 0, 1, BASE_A))
+            .0,
+        ObserveOutcome::Continued,
+        "the surviving carried key still reuses its instance"
+    );
+    within(&r, "a carried re-proof");
+    assert_eq!(
+        r.observe_legacy(miss_era_observation(&r, 0x51, 0, 1, BASE_A))
+            .0,
+        ObserveOutcome::RangeCapacity,
+        "the evicted carry is a new load; live ranges are full, so it is \
+         refused as any new load is (live state is never evicted for ranges)"
+    );
+    within(&r, "an evicted carry re-proven");
+    assert_eq!(r.instances_minted(), 3);
+}
+
+/// A storage_null move since the carried observation hides an
+/// unattributed hook event (a reload the kernel could not record), not
+/// only the miss: the re-proof mints, as within one era.
+#[test]
+fn hook_miss_era_reuse_needs_an_unmoved_storage_null_counter() {
+    for (later, expected) in [
+        (Some(9), ObserveOutcome::New),
+        (Some(7), ObserveOutcome::Continued),
+    ] {
+        let mut r = router();
+        r.note_storage_null(Some(7));
+        r.observe_legacy(miss_era_observation(&r, COOKIE, 0, 0, BASE_A));
+        r.note_hook_miss_era();
+        r.audit(1, 0, 0);
+        r.note_storage_null(later);
+        assert_eq!(
+            r.observe_legacy(miss_era_observation(&r, COOKIE, 0, 1, BASE_A))
+                .0,
+            expected,
+            "storage_null 7 -> {later:?}"
+        );
+    }
+}
+
+/// A reuse that also crosses a global-epoch move inherits the global
+/// taint, so calls joined through it count as joined across global.
+#[test]
+fn hook_miss_era_reuse_across_a_global_move_is_global_tainted() {
+    for (global, tainted) in [(5u64, 1u64), (0, 0)] {
+        let mut r = router();
+        r.observe_legacy(miss_era_observation(&r, COOKIE, 0, 0, BASE_A));
+        r.note_hook_miss_era();
+        r.audit(1, 0, 0);
+        assert_eq!(
+            r.observe_legacy(miss_era_observation(&r, COOKIE, global, 1, BASE_A))
+                .0,
+            ObserveOutcome::Continued
+        );
+        joined(r.route(call(1, stamp(2, global as u32, 1), ip_in(BASE_A))));
+        assert_eq!(
+            r.counters().joined_across_global,
+            tainted,
+            "global 0 -> {global}"
+        );
+    }
+}

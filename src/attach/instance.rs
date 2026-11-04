@@ -567,9 +567,14 @@ impl InstanceTracking {
             },
             &mut misses,
             || {
-                let raised = InstanceMaps { ebpf }.raise_fault()?;
-                self.miss_raises
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (raised, won) = InstanceMaps { ebpf }.raise_fault_won()?;
+                // Only a raise that moved the cell itself counts: the capture
+                // names a miss era only when the fault moved by exactly the
+                // raises the misses won.
+                if won {
+                    self.miss_raises
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 Ok(raised)
             },
         )
@@ -1931,6 +1936,12 @@ impl InstanceMaps<'_> {
     /// every later stamp carries the new value, so no call stamped before
     /// the miss can join an observation taken after it.
     pub(crate) fn raise_fault(&self) -> Result<u64> {
+        self.raise_fault_won().map(|(raised, _)| raised)
+    }
+
+    /// [`Self::raise_fault`] reporting whether this raise moved the cell
+    /// itself (won its compare-and-swap).
+    pub(crate) fn raise_fault_won(&self) -> Result<(u64, bool)> {
         let data = match self.ebpf.map("INSTANCE_GEN").context("INSTANCE_GEN map")? {
             aya::maps::Map::Array(data) => data,
             other => bail!("unexpected INSTANCE_GEN variant {other:?}"),
@@ -1981,7 +1992,7 @@ impl InstanceMaps<'_> {
 
 /// Bounded checked CAS on the mmapable fault cell, the only userspace writer
 /// path that cannot lose a concurrent native compare-exchange raise.
-fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<u64> {
+fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<(u64, bool)> {
     // SAFETY: a shared mapping of the BPF_F_MMAPABLE array's first page.
     let address = unsafe {
         libc::mmap(
@@ -2001,15 +2012,22 @@ fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<u64> {
     // SAFETY: cell 0 is an aligned u64 inside the mapped page; the kernel
     // side uses compare-exchange on the same cell.
     let cell = unsafe { &*(address as *const std::sync::atomic::AtomicU64) };
-    let raised = raise_fault_cell(cell);
+    let raised = raise_fault_cell_won(cell);
     // SAFETY: exactly the mapping created above.
     unsafe { libc::munmap(address, 4096) };
     raised
 }
 
 pub(super) fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
+    raise_fault_cell_won(cell).map(|(raised, _)| raised)
+}
+
+/// [`raise_fault_cell`] that also reports whether this raise won its own
+/// compare-and-swap (moved the cell itself) rather than finding it already
+/// moved by another raiser.
+pub(super) fn raise_fault_cell_won(cell: &std::sync::atomic::AtomicU64) -> Result<(u64, bool)> {
     use std::sync::atomic::Ordering;
-    raise_fault_with(cell.load(Ordering::SeqCst), |seen, next| {
+    raise_fault_with_won(cell.load(Ordering::SeqCst), |seen, next| {
         cell.compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst)
     })
 }
@@ -2017,9 +2035,16 @@ pub(super) fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u6
 /// The bounded raise over one compare-and-swap seam (the real atomic cell
 /// in production; a scripted swap in the contention twins).
 fn raise_fault_with(
+    seen: u64,
+    swap: impl FnMut(u64, u64) -> std::result::Result<u64, u64>,
+) -> Result<u64> {
+    raise_fault_with_won(seen, swap).map(|(raised, _)| raised)
+}
+
+fn raise_fault_with_won(
     mut seen: u64,
     mut swap: impl FnMut(u64, u64) -> std::result::Result<u64, u64>,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     for _ in 0..8 {
         ensure!(
             seen <= u64::from(u32::MAX),
@@ -2032,7 +2057,7 @@ fn raise_fault_with(
                     next <= u64::from(u32::MAX),
                     "instance fault generation exhausted"
                 );
-                return Ok(next);
+                return Ok((next, true));
             }
             // A lost swap means another raiser (BPF or userspace) already
             // moved the cell past the value read: that is all a raise needs.
@@ -2041,7 +2066,7 @@ fn raise_fault_with(
                     current <= u64::from(u32::MAX),
                     "instance fault generation exhausted"
                 );
-                return Ok(current);
+                return Ok((current, false));
             }
             Err(current) => seen = current,
         }
@@ -2108,6 +2133,24 @@ mod fault_raise_tests {
     /// A lost swap means another raiser already moved the cell past the
     /// value read, which is all a raise needs: no retry storm can latch
     /// coverage, and the exhaustion checks still hold.
+    #[test]
+    fn a_raise_reports_whether_it_moved_the_cell_itself() {
+        assert_eq!(
+            super::raise_fault_with_won(41, |seen, next| {
+                assert_eq!((seen, next), (41, 42));
+                Ok(seen)
+            })
+            .unwrap(),
+            (42, true),
+            "a won swap moved the cell"
+        );
+        assert_eq!(
+            super::raise_fault_with_won(41, |_, _| Err(43)).unwrap(),
+            (43, false),
+            "a swap lost to another raiser did not"
+        );
+    }
+
     #[test]
     fn a_raise_lost_to_other_raisers_still_succeeds() {
         let mut cell = 41u64;

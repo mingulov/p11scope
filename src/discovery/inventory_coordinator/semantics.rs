@@ -949,6 +949,34 @@ impl SemanticBindingSet {
             .find(|binding| binding.domain() == domain && binding.image() == image)
     }
 
+    /// Whether an unrouted call's record proves a caller other than every
+    /// bound Joint caller of its domain, so its lost position need not
+    /// barrier their history. Fails closed: an unknown image (zero
+    /// cookie), no bindings, any binding or admission history of another
+    /// domain (a different ticket space), or a cookie equal to any bound
+    /// or historically admitted image all keep the barrier. Tickets are
+    /// per thread group and never reused within a domain, so a different
+    /// nonzero cookie of the same domain is a different process; an exec
+    /// keeps its cookie and therefore still matches.
+    pub(crate) fn proves_unbound_caller(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+    ) -> bool {
+        let cookie = image.task_cookie;
+        cookie != 0
+            && !self.bindings.is_empty()
+            && self.bindings.iter().all(|binding| {
+                binding.domain() == domain
+                    && binding.image().task_cookie != 0
+                    && binding.image().task_cookie != cookie
+            })
+            && self
+                .admission_images
+                .values()
+                .all(|history| history.domain == domain && history.image.task_cookie != cookie)
+    }
+
     /// Whether a bound caller holds this Detailed ticket: proven-image
     /// retention keys on it, so the map never outgrows the binding cap.
     fn has_ticket(&self, domain: NativeDomainId, ticket: u64) -> bool {
@@ -3326,6 +3354,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Unrouted sheds by finite reason label, for the aggregate gap
         // below. A Vec scan avoids new derives on the reason enums.
         let mut shed_reasons: Vec<(&'static str, u64)> = Vec::new();
+        // Unrouted sheds whose records prove a caller other than every
+        // bound Joint caller: disclosed under their own subject, and
+        // attributed to that caller when exactly one live caller owns
+        // them all.
+        let mut other_shed_reasons: Vec<(&'static str, u64)> = Vec::new();
+        // The one pid owning every such shed, or `Some(None)` once two
+        // differ (no allocation: attribution is a label, never a proof).
+        let mut other_pid: Option<Option<u32>> = None;
         // H3 disposition inputs collected across staging: every outcome
         // position this finalization disposes, the minimum shed
         // position, and whether any outcome lacked a position.
@@ -3345,6 +3381,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         Route::Unknown(reason) => Some(reason.label()),
                         Route::Pending => Some("pending"),
                     };
+                    // Only consulted for unjoined calls below: a record
+                    // proving another caller than every bound Joint
+                    // caller disposes its position instead of barriering
+                    // their history. It stays shed and disclosed.
+                    let other_caller = (shed_reason.is_some()
+                        && call.domain() == domain
+                        && self
+                            .semantic_bindings
+                            .proves_unbound_caller(domain, call.image()))
+                    .then(|| (call.record().event.pid_tgid >> 32) as u32);
                     match CallEvidence::from_routed(call) {
                         Some(evidence) => {
                             if calls.len() < MAX_INSTANCES {
@@ -3359,17 +3405,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         // Unjoined routes never stage: their positions
                         // are undisposable, so they shed.
                         None => {
+                            let reasons = if other_caller.is_some() {
+                                &mut other_shed_reasons
+                            } else {
+                                &mut shed_reasons
+                            };
                             if let Some(label) = shed_reason {
-                                match shed_reasons.iter_mut().find(|(known, _)| *known == label) {
+                                match reasons.iter_mut().find(|(known, _)| *known == label) {
                                     Some((_, count)) => *count += 1,
-                                    None => shed_reasons.push((label, 1u64)),
+                                    None => reasons.push((label, 1u64)),
                                 }
                             }
-                            match token {
-                                Some(at) => {
+                            match (token, other_caller) {
+                                // Another caller's lost call is disposed
+                                // for the bound callers' history.
+                                (Some(at), Some(pid)) => {
+                                    staged_positions.push(Some(at));
+                                    other_pid = match other_pid {
+                                        None => Some(Some(pid)),
+                                        Some(Some(seen)) if seen == pid => Some(Some(pid)),
+                                        Some(_) => Some(None),
+                                    };
+                                }
+                                (Some(at), None) => {
                                     shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
                                 }
-                                None => unpositioned = true,
+                                (None, _) => unpositioned = true,
                             }
                         }
                     }
@@ -3447,6 +3508,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 subject: "semantic calls unrouted".into(),
                 reason: format!(
                     "{total} calls shed without a route ({}) with {} bindings",
+                    parts.join(" "),
+                    self.semantic_bindings.len()
+                ),
+                budget: None,
+            });
+            lane.note_shed_calls(total);
+        }
+        if !other_shed_reasons.is_empty() {
+            let total: u64 = other_shed_reasons.iter().map(|(_, count)| count).sum();
+            let mut parts: Vec<String> = other_shed_reasons
+                .iter()
+                .map(|(label, count)| format!("{label}={count}"))
+                .collect();
+            parts.sort();
+            // Attribute to the other caller when one live, unbound caller
+            // owns every such call; otherwise the gap stays lane-wide.
+            let caller = other_pid
+                .flatten()
+                .and_then(|pid| self.adapter.live_id(pid))
+                .filter(|caller| self.semantic_bindings.get(*caller).is_none());
+            self.registry.record_gap(RegistryGap {
+                caller,
+                module: None,
+                pid: None,
+                subject: "semantic calls unrouted from other callers".into(),
+                reason: format!(
+                    "{total} calls shed without a route ({}) from callers other than the {} bound callers",
                     parts.join(" "),
                     self.semantic_bindings.len()
                 ),
@@ -3734,6 +3822,60 @@ mod binding_window_tests {
             window_callers(&mut set, 2),
             vec![CallerId(2), CallerId(3)],
             "rotation continues where it left off: the full window stole no turn"
+        );
+    }
+
+    #[test]
+    fn only_a_different_cookie_of_the_bound_domain_proves_another_caller() {
+        let domain = NativeDomainId::mint();
+        let image = |task_cookie| ImageIdentity {
+            task_cookie,
+            exec_id: 1,
+        };
+        let empty = SemanticBindingSet::new();
+        assert!(
+            !empty.proves_unbound_caller(domain, image(5)),
+            "no bound caller: nothing to prove against, keep the barrier"
+        );
+        let unknown_bound = windowed_set(3);
+        let bound = unknown_bound.bindings[0].domain();
+        assert!(
+            !unknown_bound.proves_unbound_caller(bound, image(99)),
+            "a bound caller without a known image could own any call"
+        );
+        let mut set = SemanticBindingSet::new();
+        for cookie in 1..=3u64 {
+            set.insert(SemanticCallerBinding::scripted(
+                CallerId(cookie as u32),
+                ModuleKey::physical(7, 7, 777, None, "/window/provider.so"),
+                bound,
+                image(cookie),
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+        }
+        assert!(set.proves_unbound_caller(bound, image(99)));
+        assert!(
+            !set.proves_unbound_caller(bound, image(0)),
+            "an unknown image could be the bound caller"
+        );
+        assert!(
+            !set.proves_unbound_caller(bound, image(2)),
+            "the bound caller's own image barriers"
+        );
+        assert!(
+            !set.proves_unbound_caller(
+                bound,
+                ImageIdentity {
+                    task_cookie: 2,
+                    exec_id: 9,
+                }
+            ),
+            "an exec keeps the cookie and still matches"
+        );
+        assert!(
+            !set.proves_unbound_caller(domain, image(99)),
+            "a binding of another domain is another ticket space"
         );
     }
 }
@@ -4939,6 +5081,124 @@ mod finalizer_history_tests {
             ),
             "foreign dropped work must not insert numeric loss into A's finalizer namespace: {fresh:?}"
         );
+    }
+
+    /// One unrouted call whose record carries `cookie` as its image.
+    fn unrouted_call(domain: NativeDomainId, cookie: u64, position: u64) -> TickOutcome {
+        use crate::discovery::instances::UnknownReason;
+        let event = Event {
+            pid_tgid: (4242u64 << 32) | 4242,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 3,
+            },
+            ..Event::default()
+        };
+        TickOutcome::Call(RoutedCall::scripted(
+            domain,
+            crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0x2200,
+                ),
+                object: None,
+            },
+            Route::Unknown(UnknownReason::Unobserved),
+            None,
+            Some(position),
+        ))
+    }
+
+    /// Calls disclosed by every unrouted gap, whatever its subject.
+    fn unrouted_gap_calls(coordinator: &InventoryCoordinator<OsProcessSource>) -> u64 {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject.starts_with("semantic calls unrouted"))
+            .map(|(gap, repeats)| {
+                let count: u64 = gap
+                    .reason
+                    .split_whitespace()
+                    .next()
+                    .and_then(|first| first.parse().ok())
+                    .expect("unrouted gaps lead with their call count");
+                count * repeats
+            })
+            .sum()
+    }
+
+    #[test]
+    fn unrouted_calls_of_a_provably_other_caller_keep_the_bound_history() {
+        use crate::semantic_capture::Invalidation;
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // A bound Joint caller holds image cookie 41. Unrouted calls whose
+        // record proves another caller (a different nonzero cookie of the
+        // same domain) are still shed and disclosed, but no longer stand
+        // as an H3 loss barrier for the bound caller. An unknown image
+        // (cookie 0) or the bound caller's own image still barriers.
+        const BOUND: u64 = 41;
+        for (cookie, other) in [(77u64, true), (0, false), (BOUND, false)] {
+            let (mut coordinator, mut lane, domain) = drop_test_lanes();
+            coordinator
+                .semantic_bindings
+                .insert(SemanticCallerBinding::scripted(
+                    CallerId(9),
+                    ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                    domain,
+                    ImageIdentity {
+                        task_cookie: BOUND,
+                        exec_id: 1,
+                    },
+                    Arc::new(PidPin::test_proc_only(1234)),
+                ))
+                .unwrap();
+            let report = TickReport::scripted_with_disposition(
+                vec![
+                    TickOutcome::Invalidation(Invalidation::scripted(
+                        domain,
+                        crate::semantic_capture::InvalidationScope::CoverageFailed,
+                        Some(1),
+                    )),
+                    unrouted_call(domain, cookie, 2),
+                    unrouted_call(domain, cookie, 3),
+                ],
+                Vec::new(),
+                None,
+                None,
+                false,
+            );
+            let batch = SemanticBatch::from_tick_report(domain, report, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .commit_batch_with_semantics(false, Some(&mut lane))
+                .unwrap();
+            let evidence = coordinator.take_h3_disposition();
+            if other {
+                assert!(
+                    matches!(
+                        evidence,
+                        H3DispositionEvidence::Clean {
+                            staged_max: 3,
+                            pending_floor: None
+                        }
+                    ),
+                    "another caller's unrouted calls leave the bound history whole: {evidence:?}"
+                );
+            } else {
+                assert!(
+                    matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+                    "an unknown or bound image still barriers (cookie {cookie}): {evidence:?}"
+                );
+            }
+            // The published loss is the same either way: both calls are
+            // shed and disclosed.
+            assert_eq!(lane.shed_calls_disclosed(), 2, "cookie {cookie}");
+            assert_eq!(unrouted_gap_calls(&coordinator), 2, "cookie {cookie}");
+        }
     }
 }
 

@@ -339,6 +339,16 @@ while their caller is still waiting to be admitted, and are reported in
 the same gap (`pending_capacity=N`). Every other
 `semantic admission refused` reason still marks a loss.
 
+Under `--key-operations`, such a shed call ends a caller's key-operation
+tracking (`joint_seal_h3_loss_history_loss`) only when p11scope cannot prove
+it came from a different process. A call whose kernel-assigned process
+identity differs from every caller being tracked is reported under its own
+`semantic calls unrouted from other callers` gap (attributed to that caller
+when exactly one live caller made them) and still counts in the stop line's
+shed count, but it no longer ends tracking for the other callers. A call
+without that identity, or from a tracked caller (including after its exec),
+still ends tracking as before.
+
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
 missed, with no marker in the output; restarting such processes is the

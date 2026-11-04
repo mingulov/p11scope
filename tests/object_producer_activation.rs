@@ -3201,6 +3201,15 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// in the exit hook, and the `p11_instance_exit_summary` declaration):
 /// 147609 B, measured with this same lexer on the integrated source;
 /// the previous pin matches its parent.
+/// Re-baselined for unregistered mechanism id publication (the only BPF
+/// source change: `capture_return_facts` publishes a non-member id with
+/// its call/error counts flagged `MECHANISM_UNREGISTERED` outside the
+/// journal lane when the value fits the portable 32-bit mechanism
+/// space, the unsafe-diagnostic entry flags membership misses the same
+/// way, and every non-member occurrence bumps
+/// `EVIDENCE_UNREGISTERED_MECHANISMS`; plus their comment lines):
+/// 148571 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3210,8 +3219,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            147609,
-            "4f4424e357cf9075aa034c8931db39ae6db728b7ad04b4395096bde5662d61c7"
+            148571,
+            "5ac6d6d74915a4f2b5675ca00693179eeed7ba523dda9e39642f24c5928cf87b"
         ),
         "stripped BPF dump must stay byte-identical"
     );

@@ -35,6 +35,7 @@ fn finish(engine: &mut Engine, session: &ScriptedSession, owned_run: bool) {
         0,
         None,
         owned_run,
+        None,
     );
 }
 
@@ -102,6 +103,7 @@ fn discover_prearm_never_mapped(
         track_short_lived: false,
         kind: crate::cli::Kind::Profile,
         modules: Vec::new(),
+        exclude_modules: Vec::new(),
         manifests: Vec::new(),
         prearm_modules: paths.to_vec(),
         hooks: crate::discovery::hooks::HookRegistry::builtin(),

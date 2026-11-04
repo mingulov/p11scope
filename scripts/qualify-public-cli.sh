@@ -589,6 +589,9 @@ run_prearm() {
   # Owned-run pre-arm exactness (packet 6.13, R2-D1-6): the pause-held
   # twin publishes unobserved_windows [] with exact ledger/trace counts;
   # the passive twin (--pause never) keeps its single pre_attach window.
+  # On kernels before 6.8 the overlayfs scan/pre-arm split joins live
+  # across an id change the exactness proof cannot span (W8B-66), so both
+  # twins disclose exactly [late_discovery, mapped_unattached] instead.
   local name policy ledger output rc pp detail
   for name in held passive; do
     policy=auto; [ "$name" = passive ] && policy=never
@@ -607,6 +610,30 @@ run_prearm() {
   done
   detail=$(python3 - <<'PY' 2>&1
 import json
+import platform
+
+def kernel_is_pre_68():
+    release = platform.release()
+    parts = release.split(".")
+    try:
+        major = int(parts[0])
+        minor = int("".join(ch for ch in parts[1] if ch.isdigit()) or "0")
+    except (IndexError, ValueError):
+        raise SystemExit(f"unparseable kernel release {release!r}")
+    return (major, minor) < (6, 8)
+
+def assert_handoff_pair(module):
+    # The exact W8B-66 live-handoff disclosure: the live join lands
+    # across an id change, so the late discovery reads late_discovery
+    # up to the declared attach and the out-of-declared-set mapping
+    # reads mapped_unattached from the same start. Nothing else passes.
+    windows = module["unobserved_windows"]
+    reasons = [w["reason"] for w in windows]
+    assert reasons == ["late_discovery", "mapped_unattached"], windows
+    late, unattached = windows
+    assert late["end_ns"] == module["attached_at_ns"], windows
+    assert unattached["start_ns"] == late["start_ns"], windows
+    assert unattached["end_ns"] < module["attached_at_ns"], windows
 
 def load(name):
     # EVIDENCE rides on the observer's stdout (diagnostics go to stderr).
@@ -632,9 +659,13 @@ def completed_calls(text, function):
     return sum(1 for line in text.splitlines()
                if f" {function} " in line and " \u2192 " in line)
 
+pre_68 = kernel_is_pre_68()
 held_evidence, held_ledger, held_text = load("held")
 held = prearmed_module(held_evidence)
-assert held["unobserved_windows"] == [], held["unobserved_windows"]
+if pre_68:
+    assert_handoff_pair(held)
+else:
+    assert held["unobserved_windows"] == [], held["unobserved_windows"]
 assert "scan" in held["sources"], held["sources"]
 summary = held_ledger[-1]
 assert (summary["initializes"], summary["finalizes"]) == (3, 3), summary
@@ -643,10 +674,16 @@ counts = tuple(completed_calls(held_text, name)
 assert counts == (3, 3, 1), counts
 passive = prearmed_module(load("passive")[0])
 assert "scan" in passive["sources"], passive["sources"]
-windows = passive["unobserved_windows"]
-assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
-assert windows[0]["end_ns"] == passive["attached_at_ns"], windows
-print("held [] with 3/3 ledger and 3/3/1 trace; passive keeps single pre_attach")
+if pre_68:
+    assert_handoff_pair(passive)
+else:
+    windows = passive["unobserved_windows"]
+    assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows
+    assert windows[0]["end_ns"] == passive["attached_at_ns"], windows
+if pre_68:
+    print("held/passive disclose the exact handoff pair with 3/3 ledger and 3/3/1 trace")
+else:
+    print("held [] with 3/3 ledger and 3/3/1 trace; passive keeps single pre_attach")
 PY
 ) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
   result run-prearm 1 "$detail" prearm-exactness

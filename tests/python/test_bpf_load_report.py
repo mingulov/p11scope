@@ -30,7 +30,7 @@ OBSERVER = "ab" * 32
 # plus the 7.0 guest the budgets also cover. Variant-group members
 # split this set instead of carrying it whole (see below). Each
 # budget-key namespace (prefix before "/") pins its own kernel set;
-# all four namespaces currently cover the same measured 5-kernel set.
+# all five namespaces currently cover the same measured 5-kernel set.
 EXPECTED_BUDGET_KERNELS = frozenset({
     "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
 })
@@ -42,6 +42,7 @@ EXPECTED_BUDGET_KERNELS_BY_NAMESPACE = {
     "inventory": EXPECTED_BUDGET_KERNELS,
     "detailed-gate1": EXPECTED_GATE1_BUDGET_KERNELS,
     "journal-gate1": EXPECTED_GATE1_BUDGET_KERNELS,
+    "prearm-witness": EXPECTED_BUDGET_KERNELS,
 }
 # Hook slots whose program loads only on some kernels: each kernel budgets
 # exactly one member of each group, and a missing row for the other member

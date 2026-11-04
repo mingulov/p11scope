@@ -304,6 +304,101 @@ mod tests {
         );
     }
 
+    /// (d3) Twelve modules disclosed in reverse ledger order still
+    /// render in numeric module order: multi-module ordering follows
+    /// the minted module sequence, not disclosure order — and with
+    /// `m10`/`m11` present a label-string sort would observably differ.
+    #[test]
+    fn twelve_modules_disclosed_in_reverse_render_in_numeric_order() {
+        const COUNT: u32 = 12;
+        let domain = NativeDomainId::try_mint().expect("a fresh test domain");
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(std::process::id(), ImageAuthority::ScanPinned, 1000)
+            .expect("self admission pins /proc");
+        let mut minted = Vec::new();
+        let mut reports = Vec::new();
+        for i in 0..COUNT {
+            let key = module_key(3001 + u64::from(i));
+            minted.push(
+                coordinator
+                    .registry_mut()
+                    .scripted_module_edge(key.clone(), caller)
+                    .label(),
+            );
+            let image = ImageIdentity {
+                task_cookie: 6071429000 + u64::from(i),
+                exec_id: 825000 + u64::from(i),
+            };
+            let router = 746000 + u64::from(i);
+            let instance =
+                InstanceKey::scripted(domain, image, InstanceId::from_raw(router), key.clone());
+            coordinator
+                .registry_mut()
+                .note_instance(AdmittedInstance::scripted(instance, caller));
+            reports.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image,
+                file_slot: 919000 + i,
+                ids: vec![InstanceId::from_raw(router)],
+            });
+        }
+        coordinator.registry_mut().publish();
+        reports.reverse();
+        coordinator.drain_reload_disclosures_into_ledger(
+            domain,
+            reports,
+            u64::from(COUNT),
+            u64::from(COUNT),
+            0,
+        );
+        let seam = Seam {
+            coordinator,
+            domain,
+            caller,
+            module_a: minted[0].clone(),
+            module_b: minted[1].clone(),
+        };
+        let document = document(&seam);
+        let identities = document["instance_reload_not_excluded"]["identities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let rendered: Vec<String> = identities
+            .iter()
+            .map(|identity| identity["module"].as_str().unwrap_or("!?").to_string())
+            .collect();
+        assert_eq!(rendered, minted, "disclosure follows minted module order");
+        let numeric: Vec<u32> = rendered
+            .iter()
+            .map(|label| label.trim_start_matches('m').parse().expect("mN label"))
+            .collect();
+        let mut sorted = numeric.clone();
+        sorted.sort_unstable();
+        assert_eq!(numeric, sorted, "the pinned order is numeric: {rendered:?}");
+        let mut lexicographic = rendered.clone();
+        lexicographic.sort();
+        assert_ne!(
+            rendered, lexicographic,
+            "the fixture must separate numeric from label order"
+        );
+        for (identity, i) in identities.iter().zip(0..COUNT) {
+            assert_eq!(
+                identity["instances"],
+                serde_json::json!([RegistryInstanceId::from_raw(i).label()]),
+                "each module names only its own instance"
+            );
+        }
+    }
+
     /// An unregistered router ID is omitted from its identity rather than
     /// invented: only the registered instance is named.
     #[test]

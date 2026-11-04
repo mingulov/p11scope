@@ -502,7 +502,27 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 873adf5c4, the round-9 integration tip, on top of cf46fc5e:
+      # Pin 3681a1ab7, the integrated keygen pick (last BPF input change),
+      # on top of 873adf5c4:
+      # the round-10 inventory lifecycle ring raise (805a596ae, 2 MiB to
+      # 8 MiB) changes one word in each Inventory object's `maps` (the
+      # DISCOVERY ring size); both Inventory objects keep byte-identical
+      # code, symbols and .maps (keygen compiles out of the Inventory
+      # flavors), with unchanged file sizes. The keygen return-path
+      # publication gate (991e36dd5, f3cab1ce2) grows the default
+      # Detailed .text by 128 B (ordinary_return and
+      # object_return_ordinary, +64 B each, where capture_return_facts
+      # inlines); every other Detailed code section differs only in
+      # subprogram call offsets, .rel.text moves with the calls, the
+      # symbol set is unchanged, .maps is unchanged, and no map or
+      # program is added. The unsafe entry flag compiles out of default
+      # builds (unsafe-unvalidated-metadata cfg). The journal object,
+      # which this gate does not compare, reshapes two .text
+      # subprograms only (register allocation from the gate
+      # restructure); its membership gate, return-code gate and flag
+      # sets are identical and it keeps withholding unregistered ids.
+      # No other BPF input changed since 873adf5c4.
+      # Earlier pin 873adf5c4, the round-9 integration tip, on top of cf46fc5e:
       # the 6.14 Option A exit-time mapping summaries (3107325eb) add a
       # Detailed-only kind-7 arm to emit_lifecycle, a kind selection to
       # the exit hook, and link the native exit-summary reader. The
@@ -632,7 +652,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=873adf5c4af8726129c0e95ee5dfa22a498c5155
+          BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

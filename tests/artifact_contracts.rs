@@ -646,19 +646,14 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline cf46fc5e: the gate-1 loader frame and bank series
-        // (gate-1 regions only; default objects move only debug data) on
-        // top of b200e06f, the PID-scope birth witness on top of
-        // the verifier-cost series (d0bfdfcf: 7.4-rc1 load fix, outlined
-        // GetID facts, bpf_loop directory scan and cleanup sweep), the 7.3
-        // exec-release and 6/7-argument copy_vma hooks (8b7ee11a), the
-        // journal READY writer (55101d3c), the
-        // async control value flags (6641123f), the default journal and birth
-        // marker (16a7bd53), the exec-witness
-        // health-counter fix, the PID-scope EXEC ticket fix,
-        // the reviewed loader + bank + journal delta since ba92b4e2 and the
-        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b",
+        // Pinned baseline 3681a1ab7: the keygen return-path gate
+        // (Detailed .text +128 B in the two inlined return functions;
+        // the unsafe entry flag compiles out of default builds) and the
+        // round-10 inventory ring raise (one `maps` word per Inventory
+        // object; code byte-identical), on top of 873adf5c4 (6.14
+        // exit-time mapping summaries); all enumerated in the ci.yml
+        // comment.
+        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
@@ -9934,19 +9929,14 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline cf46fc5e: the gate-1 loader frame and bank series
-        // (gate-1 regions only; default objects move only debug data) on
-        // top of b200e06f, the PID-scope birth witness on top of
-        // the verifier-cost series (d0bfdfcf: 7.4-rc1 load fix, outlined
-        // GetID facts, bpf_loop directory scan and cleanup sweep), the 7.3
-        // exec-release and 6/7-argument copy_vma hooks (8b7ee11a), the
-        // journal READY writer (55101d3c), the
-        // async control value flags (6641123f), the default journal and birth
-        // marker (16a7bd53), the exec-witness
-        // health-counter fix, the PID-scope EXEC ticket fix,
-        // the reviewed loader + bank + journal delta since ba92b4e2 and the
-        // loader-gate wiring since 90b8cf9f; all enumerated in the ci.yml comment.
-        "BASELINE=cf46fc5edc705f0f337f418d92db8214dc0f8f4b",
+        // Pinned baseline 3681a1ab7: the keygen return-path gate
+        // (Detailed .text +128 B in the two inlined return functions;
+        // the unsafe entry flag compiles out of default builds) and the
+        // round-10 inventory ring raise (one `maps` word per Inventory
+        // object; code byte-identical), on top of 873adf5c4 (6.14
+        // exit-time mapping summaries); all enumerated in the ci.yml
+        // comment.
+        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

@@ -8846,6 +8846,579 @@ fn joint_machine_break_void_carries_pre_break_session_ends() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
+/// The void's own slot with the raw slot occupied: after the first break
+/// ends the bound feed, the bound caller's next call is admitted S1-only
+/// and its journal original is refused into the audit frame's raw slot.
+/// A second break's void still rides the next frame in its own slot —
+/// never left pending — and the pre-break key use keeps its lost join.
+/// S1 joins both follow-up calls.
+#[test]
+fn joint_machine_second_break_void_delivers_with_s1only_raw_occupied() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("pre-break-use", None);
+    let join_lost = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 1, "the primed key holds one live session");
+    // First break: the void takes the free raw slot and ends the feed,
+    // so the next call stages S1-only.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut carried = None;
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        if carried.is_none()
+            && let Some(failure) = owner.pending_void_for_test()
+        {
+            carried = Some(failure.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session,
+                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                    } if *session == live[0]
+                )
+            }));
+        }
+        let adapter = owner.adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert_eq!(
+        carried,
+        Some(true),
+        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+    );
+    fixture.published_labeled("first-void", None);
+    assert_eq!(
+        join_lost(&fixture),
+        1,
+        "the first void ends the pre-break key use"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the first audit frame took the void"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the pre-break key never resumes Joint"
+    );
+    // Second break: the driver's call re-syncs the stream; the marked
+    // call is pushed only after the re-sync so its journal BEGIN is
+    // ingested (a BEGIN collected while broken is refused) and stages
+    // S1-only into the same frame that takes the second void.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    let mut resynced_second = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the second follow-up collect never refuses");
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced_second = true;
+            break;
+        }
+    }
+    assert!(
+        resynced_second,
+        "the second collect re-syncs the linked stream"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the second void awaits its audit frame"
+    );
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("second-void-with-s1only", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1,
+        "one publication takes the second void"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the audit frame took the second void despite the occupied raw slot"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        1,
+        "the pre-break key use keeps its lost join"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "no new Joint feed is born from the S1-only calls"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum::<u64>(),
+        before + 2,
+        "S1 joins both follow-up calls"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// A disposed publish with a void already pending completes sanely: the
+/// counted negative publishes, the feed ends with its named gaps, no
+/// void is left pending, and a follow-up proves S1 continues past the
+/// break. The frame twin below pins the disposed take itself: inside
+/// the machine an ingested frame can also take a still-pending void,
+/// so only a single-acquire frame proves which slot took it.
+#[test]
+fn joint_machine_disposed_publish_with_pending_void_completes() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("pre-break-use", None);
+    let join_lost = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 1, "the primed key holds one live session");
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    // No driver call: the empty loop still voids and re-syncs, and leaves
+    // no leftover record behind for a pre-disposal ingested audit.
+    let mut carried = None;
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        if carried.is_none()
+            && let Some(failure) = owner.pending_void_for_test()
+        {
+            carried = Some(failure.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session,
+                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                    } if *session == live[0]
+                )
+            }));
+        }
+        let adapter = owner.adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert_eq!(
+        carried,
+        Some(true),
+        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the void awaits the malformed publish"
+    );
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("break-with-void-pending", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1,
+        "the break quantum publishes its counted negative"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the break ends the Joint feed"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "no void is left pending across the disposed publish"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        0,
+        "nothing is staged to retire: the break publish carries no S1 call"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .stream_broken_for_test()
+            || fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .invalidated_for_test(),
+        "the malformed disposal ran"
+    );
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        gaps.contains(&(
+            "semantic receipt refused".to_string(),
+            "partition".to_string()
+        )),
+        "the malformed negative stays disclosed: {gaps:?}"
+    );
+    let before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut resynced_followup = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced_followup = true;
+            break;
+        }
+    }
+    assert!(
+        resynced_followup,
+        "the follow-up collect re-syncs past the break"
+    );
+    fixture.published_labeled("disposed-break-followup", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum::<u64>(),
+        before + 1,
+        "S1 joins the follow-up call"
+    );
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_seal_malformed_history_loss".to_string()
+        )),
+        "Joint ends with its named gap: {gaps:?}"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        0,
+        "no delayed retirement: the void's session end had no open association"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// The disposed frame's void slot, precisely: with a pending ingest-break
+/// void and an occupied raw slot, the single disposed audit takes the
+/// void into its own slot ahead of the raw failure. (A disposal on an
+/// invalidated lane reports the invalidation rather than the malformed
+/// content, so the raw marker here is occupancy plus order, not the
+/// Malformed label; only a resync — which the machine twin above
+/// covers — clears the lane first.) Old code never took the void on a
+/// disposed frame, so it stays pending there.
+#[test]
+fn joint_disposed_audit_takes_pending_void_with_raw_occupied() {
+    use crate::semantics_objects::journal::JournalGap;
+    use crate::semantics_objects::journal::joint_driver::RawDisposeReason;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let fault = DisposedNativeFault(fixture.scene.real.h0.clone());
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    let raw = fixture.scene.prepare(0);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break()
+            .expect("the idle tick voids the broken lane"),
+        "the void pends before the disposed audit"
+    );
+    let disposed = raw
+        .dispose_without_ingest(
+            fixture.scene.real.scene.coordinator.joint_capture_mut(),
+            &fixture.scene.producers,
+            RawDisposeReason::TerminalLoss,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("malformed raw disposal: {reason:?}"));
+    assert!(
+        disposed.failure().is_some(),
+        "the disposed frame's raw slot is occupied"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .dispose_prepared_claims_s1();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.scene.real.lane)
+    );
+    let frame = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .audit_disposed_quantum(
+            disposed,
+            &fixture.scene.producers,
+            &fixture.attached,
+            &fault,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("disposed audit with pending void: {reason:?}"));
+    let failures: Vec<_> = frame.original_failures_for_test().collect();
+    assert_eq!(
+        failures.len(),
+        3,
+        "void, raw and collected failures all ride the frame"
+    );
+    assert!(
+        !failures[0].effects.effects.is_empty(),
+        "the first slot carries the void's abandonment"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.gap == JournalGap::AdapterInvalidated),
+        "disposal and collection on the invalidated lane report the invalidation"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the disposed audit took the pending void"
+    );
+}
+
 /// A void the pool cannot pay for is all-or-nothing and retried: the
 /// lane stays broken and un-voided (no key refused, no custody dropped)
 /// while the pool is short, every Idle tick yields instead of refusing,

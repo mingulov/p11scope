@@ -698,6 +698,7 @@ def joint_hot_last_t1(ledger_paths):
 
 
 OTHER_UNROUTED = "semantic calls unrouted from other callers"
+PREBINDING_NOTE = "pre-binding unrouted calls resolved to other callers"
 
 
 class HealthyTwin(unittest.TestCase):
@@ -2921,6 +2922,36 @@ class JointConservationGate(unittest.TestCase):
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "loss gap"):
                 self.run_joint(Path(tmp), mutate)
+
+    def prebinding_gaps(self, shed, noted):
+        def mutate(doc):
+            doc["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "semantic calls unrouted",
+                 "reason": f"{shed} calls shed without a route "
+                           f"(unobserved={shed}) with 0 bindings",
+                 "budget": None, "repeats": 1})
+            if noted:
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": PREBINDING_NOTE,
+                     "reason": f"{noted} calls shed before the first binding "
+                               "came from callers other than the 1 bound "
+                               "callers; their history is kept",
+                     "budget": None, "repeats": 1})
+        return mutate
+
+    def test_prebinding_sheds_resolved_to_other_callers_are_reported(self):
+        with tempfile.TemporaryDirectory(prefix="joint-pre-") as tmp:
+            result = self.run_joint(Path(tmp), self.prebinding_gaps(6, 6))
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["other_caller_unrouted"], 6)
+
+    def test_prebinding_sheds_not_all_resolved_fail(self):
+        with tempfile.TemporaryDirectory(prefix="joint-pre2-") as tmp:
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), self.prebinding_gaps(6, 5))
 
     def test_slot_refused_setup_conserved(self):
         # The live keyed shape: the two COUNT_ONLY slot probes are

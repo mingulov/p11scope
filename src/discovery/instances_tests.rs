@@ -2519,6 +2519,59 @@ fn hook_miss_carry_counts_against_the_key_and_range_limits() {
     assert_eq!(r.instances_minted(), 3);
 }
 
+/// At the key limit with live and carried keys both present (and ranges
+/// to spare), a new key evicts a carried entry, never the live one.
+#[test]
+fn hook_miss_carry_gives_way_before_a_live_key_at_the_key_limit() {
+    let limits = RouterLimits {
+        observed_keys: 3,
+        ranges: 100,
+        ..RouterLimits::default()
+    };
+    let mut r = InstanceRouter::new(domain(), limits);
+    for cookie in [0x51, 0x52] {
+        assert_eq!(
+            r.observe_legacy(miss_era_observation(&r, cookie, 0, 0, BASE_A))
+                .0,
+            ObserveOutcome::New
+        );
+    }
+    r.note_hook_miss_era();
+    r.audit(1, 0, 0);
+    assert_eq!(
+        r.observe_legacy(miss_era_observation(&r, 0x53, 0, 1, BASE_A))
+            .0,
+        ObserveOutcome::New
+    );
+    let (keys, carry_keys, _) = r.retained_keys_and_carry();
+    assert_eq!((keys, carry_keys), (1, 2), "one live key beside two carried");
+    assert_eq!(
+        r.observe_legacy(miss_era_observation(&r, 0x54, 0, 1, BASE_A))
+            .0,
+        ObserveOutcome::New,
+        "a new key at the limit evicts, never refuses"
+    );
+    let (keys, carry_keys, carry_ranges) = r.retained_keys_and_carry();
+    assert_eq!(
+        (keys, carry_keys),
+        (2, 1),
+        "one carried entry gave way; the live key stayed"
+    );
+    assert_eq!(r.counters().observed_evictions, 0, "no live key was evicted");
+    assert!(keys + carry_keys <= limits.observed_keys);
+    assert!(r.ranges_retained() + carry_ranges <= limits.ranges);
+    assert_eq!(
+        r.observe_legacy(miss_era_observation(&r, 0x52, 0, 1, BASE_A))
+            .0,
+        ObserveOutcome::Continued,
+        "the surviving carried key still reuses its instance"
+    );
+    let (keys, carry_keys, carry_ranges) = r.retained_keys_and_carry();
+    assert!(keys + carry_keys <= limits.observed_keys);
+    assert!(r.ranges_retained() + carry_ranges <= limits.ranges);
+    assert_eq!(r.instances_minted(), 4);
+}
+
 /// A storage_null move since the carried observation hides an
 /// unattributed hook event (a reload the kernel could not record), not
 /// only the miss: the re-proof mints, as within one era.

@@ -1289,6 +1289,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         edges: vec![edge],
         instances: Vec::new(),
         semantic_edges: Vec::new(),
+        instance_reload_not_excluded: None,
         render_index: Default::default(),
         gaps: Vec::new(),
         gaps_suppressed: 0,

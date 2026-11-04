@@ -28,6 +28,7 @@ use crate::discovery::caller_registry::{
     ModuleRecord, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
 };
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
+use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::render::escape_controls;
 use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};
@@ -526,6 +527,11 @@ pub(crate) struct Presentation {
     pub edges: Vec<EdgeView>,
     pub instances: Vec<InstanceView>,
     pub semantic_edges: Vec<InstanceSemanticView>,
+    /// The staged reload disclosure, if the capture produced one: exact
+    /// router counts plus the affected modules with their registered
+    /// instances. Renders as the top-level
+    /// `instance_reload_not_excluded` object; absent when `None`.
+    pub instance_reload_not_excluded: Option<InventoryReloadDisclosure>,
     /// Offsets into these immutable rows. A test fixture replacing rows must
     /// rebuild this cache or reset it to the lossless linear default.
     pub(crate) render_index: PresentationRenderIndex,
@@ -868,6 +874,7 @@ impl Presentation {
             edges,
             instances,
             semantic_edges,
+            instance_reload_not_excluded: coordinator.reload_disclosure_for_inventory(),
             render_index,
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),

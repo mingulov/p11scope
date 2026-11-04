@@ -6,6 +6,33 @@
 //! plus the exact router count snapshots. Unregistered IDs are omitted and
 //! identities with nothing nameable are dropped; the counts stay exact.
 
+/// Insert the staged reload disclosure as the top-level
+/// `instance_reload_not_excluded` object: exact router counts plus one
+/// entry per affected module with its disclosed `iN` references. The key
+/// stays absent (never null) when the capture produced no disclosure.
+pub(crate) fn insert_reload_disclosure_json(
+    document: &mut serde_json::Value,
+    presentation: &super::Presentation,
+) {
+    let Some(view) = presentation.instance_reload_not_excluded.as_ref() else {
+        return;
+    };
+    let Some(object) = document.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "instance_reload_not_excluded".to_string(),
+        serde_json::json!({
+            "continued_across_global": view.continued_across_global,
+            "joined_across_global": view.joined_across_global,
+            "identities": view.identities.iter().map(|identity| serde_json::json!({
+                "module": identity.module.label(),
+                "instances": identity.instances.iter().map(|id| id.label()).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use crate::attach::Scope;
@@ -83,16 +110,8 @@ mod tests {
             .registry_mut()
             .scripted_module_edge(key_b.clone(), caller)
             .label();
-        for (image, router, module) in [
-            (IMAGE_A, ROUTER_A, key_a),
-            (IMAGE_B, ROUTER_B, key_b),
-        ] {
-            let key = InstanceKey::scripted(
-                domain,
-                image,
-                InstanceId::from_raw(router),
-                module,
-            );
+        for (image, router, module) in [(IMAGE_A, ROUTER_A, key_a), (IMAGE_B, ROUTER_B, key_b)] {
+            let key = InstanceKey::scripted(domain, image, InstanceId::from_raw(router), module);
             coordinator
                 .registry_mut()
                 .note_instance(AdmittedInstance::scripted(key, caller));
@@ -116,19 +135,18 @@ mod tests {
         continued: u64,
         joined: u64,
     ) {
-        seam.coordinator
-            .drain_reload_disclosures_into_ledger(
-                seam.domain,
-                vec![ReloadNotExcludedReport {
-                    label: RELOAD_NOT_EXCLUDED_LABEL,
-                    image,
-                    file_slot: slot,
-                    ids: ids.into_iter().map(InstanceId::from_raw).collect(),
-                }],
-                continued,
-                joined,
-                0,
-            );
+        seam.coordinator.drain_reload_disclosures_into_ledger(
+            seam.domain,
+            vec![ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image,
+                file_slot: slot,
+                ids: ids.into_iter().map(InstanceId::from_raw).collect(),
+            }],
+            continued,
+            joined,
+            0,
+        );
     }
 
     fn document(seam: &Seam) -> serde_json::Value {
@@ -149,7 +167,10 @@ mod tests {
         let document = document(&seam);
         // The fixture itself is a live two-instance capture: both rows
         // render under the admitted caller before the disclosure does.
-        let rows = document["instances"].as_array().cloned().unwrap_or_default();
+        let rows = document["instances"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         assert_eq!(rows.len(), 2, "both instances render: {rows:?}");
         assert!(
             rows.iter().any(|row| row["module"] == seam.module_a
@@ -245,21 +266,14 @@ mod tests {
             .scripted_module_edge(key.clone(), caller)
             .label();
         for (image, router) in [(IMAGE_A, ROUTER_A), (IMAGE_B, ROUTER_B)] {
-            let instance = InstanceKey::scripted(
-                domain,
-                image,
-                InstanceId::from_raw(router),
-                key.clone(),
-            );
+            let instance =
+                InstanceKey::scripted(domain, image, InstanceId::from_raw(router), key.clone());
             coordinator
                 .registry_mut()
                 .note_instance(AdmittedInstance::scripted(instance, caller));
         }
         coordinator.registry_mut().publish();
-        for (image, slot, router) in [
-            (IMAGE_A, SLOT_A, ROUTER_A),
-            (IMAGE_B, SLOT_B, ROUTER_B),
-        ] {
+        for (image, slot, router) in [(IMAGE_A, SLOT_A, ROUTER_A), (IMAGE_B, SLOT_B, ROUTER_B)] {
             coordinator.drain_reload_disclosures_into_ledger(
                 domain,
                 vec![ReloadNotExcludedReport {

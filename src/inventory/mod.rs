@@ -8236,6 +8236,12 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         document["unmatched_excludes"] =
             serde_json::to_value(&presentation.unmatched_excludes).unwrap_or_default();
     }
+    // Additive (B17 leg 2): the staged reload disclosure, absent without
+    // a producer. One call site; the helper owns the shape.
+    crate::inventory_present::reload_disclosure::insert_reload_disclosure_json(
+        &mut document,
+        presentation,
+    );
     document
 }
 

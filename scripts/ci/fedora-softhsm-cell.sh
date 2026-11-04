@@ -32,6 +32,16 @@
 # Exit 2: harness error. Exit 77: prerequisite missing (no container
 # runtime, or no prebuilt workload on Fedora).
 #
+# Scan-flip note (porter): the scan lane task/v060-scan-legacy32
+# (8 commits c50029324..8d491f187) teaches render to report a proven
+# 68-slot prefix as a full walk with exact observation. When it lands,
+# the fedora27-pid oracle judgment passes, so judge_exact below emits
+# an UNEXPECTED PASS row and exits 1 by design. Port both lanes
+# together, or flip judge_exact's arms at that time (pass becomes a
+# qualified row with rc 0, fail becomes a failed row with rc 1), and
+# the two wrap_cell arms in scripts/ci/legacy32-shape.sh likewise
+# (expected-failure to control).
+#
 # Apt prerequisites (Ubuntu 26.04 runner): gcc jq procps python3
 # util-linux, plus docker.io (or podman) for container mode. The dnf
 # prerequisites inside the container are: softhsm gcc.

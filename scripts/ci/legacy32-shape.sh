@@ -29,13 +29,29 @@
 # Test seams (documented, not CI paths):
 #   --shape-only OUTDIR [extra cc flags...]
 #     build the fixture and judge its shape only; honors LEGACY32_CFLAGS
-#     (extra cc flags, e.g. -DLEGACY32_MINOR=0 for the {3,0} variant),
+#     (extra cc flags, e.g. -DLEGACY32_MINOR=0 for the {3,0} variant and
+#     the gate-suite knobs documented in tests/fixtures/legacy32-provider/legacy32.c),
 #     LEGACY32_EXPECT_MAJOR/MINOR/SLOTS (default 3/2/68) and
 #     LEGACY32_EXPECT_TAIL (default 0x1). Exit 0 on match, 2 otherwise.
+#   LEGACY32_QUALIFY=STUB
+#     run STUB (argv: P11SCOPE DESTDIR) instead of
+#     scripts/qualify-public-cli.sh; STUB must write DESTDIR/results.jsonl
+#     oracle rows. For wrap/flip checks only; never set in CI. It never
+#     bypasses the root requirement, and a missing STUB is a harness error.
+#
+# Scan-flip note (porter): the scan lane task/v060-scan-legacy32
+# (8 commits c50029324..8d491f187) teaches render to report a proven
+# 68-slot prefix as a full walk with exact observation. When it lands,
+# the legacy32-pid and legacy32-system oracle cells pass, so the two
+# wrap_cell expected-failure arms below emit UNEXPECTED PASS rows and
+# exit 1 by design. Port both lanes together, or flip those two arms
+# from expected-failure to control at that time (and judge_exact in
+# scripts/ci/fedora-softhsm-cell.sh likewise: pass becomes qualified,
+# fail becomes failed).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ROOT=$(cd "$HERE/../.." && pwd) || exit 64
-QUALIFY=$ROOT/scripts/qualify-public-cli.sh
+QUALIFY=${LEGACY32_QUALIFY:-$ROOT/scripts/qualify-public-cli.sh}
 FIXSRC=$ROOT/tests/fixtures/legacy32-provider
 REASON='SoftHSM 2.7 table shape; exec-scan-legacy32'
 

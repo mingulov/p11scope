@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::discovery::engine::inventory_coordinator::semantics::{
-    SemanticInputs, engine_for_test, prepare_attested_subset,
+    SemanticInputs, SemanticRefreshAttempt, engine_for_test, prepare_attested_subset,
 };
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
@@ -6452,6 +6452,239 @@ fn native_semantic_refresh_picks_share_one_registry_scan() {
         visits as usize <= ceiling,
         "one shared scan visits each pair once: {visits} <= {ceiling} \
          ({records} records x {objects} objects x {modules} modules)"
+    );
+}
+
+/// Shared-scan scene for the replay-charging and exhausted-scan twins:
+/// two attested providers, six callers alternating between them (the same
+/// shape as `native_semantic_refresh_picks_share_one_registry_scan`).
+/// Owns the fixtures and stopped children so pins stay live for the call.
+struct SharedScanScene {
+    _fixtures: (ProviderFixture, ProviderFixture),
+    _children: Vec<OwnedStoppedChild>,
+    scene: BindingScene,
+    lane: AttestedSemanticLane,
+    providers: Vec<(PinnedObjectId, String, ModuleKey, u32)>,
+    admitted: Vec<(CallerId, PinnedObjectId)>,
+}
+
+impl SharedScanScene {
+    /// Charge schedule, pinned by the tests below (caller ids ascend in
+    /// admit order; even-index callers map the first-minted module):
+    /// - pick 1 scans live: entry 5 + 6 record + 12 object + 21 module
+    ///   charges (even records visit 1 + 2, odd records 2 + 2) = 44.
+    /// - picks resolve the four smallest candidates with visit counts
+    ///   1, 2, 1, 2, so replays cost 20, 18, 17: full call = 153.
+    /// - the last (record, object) pair is never selected and always
+    ///   visits both modules, live or replayed.
+    fn build() -> Self {
+        let (first, second, subset) = dual_provider_subset();
+        let mut scene = BindingScene::new();
+        let lane =
+            AttestedSemanticLane::start(subset, &Scope::System, BackendSelection::Auto).unwrap();
+        let providers: Vec<(PinnedObjectId, String, ModuleKey, u32)> = lane
+            .subset()
+            .required()
+            .keys()
+            .map(|object| {
+                let pin = lane
+                    .subset()
+                    .pins()
+                    .pinned()
+                    .find(|pin| pin.id == *object)
+                    .expect("each provider has an original held target");
+                let slot = lane.subset().required()[object]
+                    .first()
+                    .copied()
+                    .expect("each provider requires a slot");
+                (
+                    *object,
+                    pin.path.to_owned(),
+                    ModuleKey::physical(
+                        pin.key.device.major,
+                        pin.key.device.minor,
+                        pin.key.inode,
+                        Some(pin.sha256.to_owned()),
+                        pin.path,
+                    ),
+                    slot,
+                )
+            })
+            .collect();
+        assert_eq!(providers.len(), 2);
+        let children: Vec<_> = (0..6).map(|_| OwnedStoppedChild::new()).collect();
+        let mut admitted = Vec::new();
+        for (index, child) in children.iter().enumerate() {
+            let caller = scene.admit(child.id(), 100 + index as u64);
+            let (object, path, module, _) = &providers[index % 2];
+            scene.map_module(caller, child.id(), module, path, 200 + index as u64);
+            admitted.push((caller, *object));
+        }
+        let built = Self {
+            _fixtures: (first, second),
+            _children: children,
+            scene,
+            lane,
+            providers,
+            admitted,
+        };
+        let records = built.scene.coordinator.adapter().records().count();
+        let objects = built.lane.subset().required().len();
+        let modules = built.scene.coordinator.registry().modules().count();
+        assert_eq!(
+            (records, objects, modules),
+            (6, 2, 2),
+            "the charge schedule below needs this exact scene shape"
+        );
+        built
+    }
+
+    /// Matching (caller, object) pairs in service order.
+    fn candidates(&self) -> Vec<(CallerId, PinnedObjectId)> {
+        let mut candidates = self.admitted.clone();
+        candidates.sort();
+        candidates
+    }
+
+    /// The expected module and slot for one matching pair.
+    fn expect(&self, object: PinnedObjectId) -> (ModuleKey, u32) {
+        let (_, _, module, slot) = self
+            .providers
+            .iter()
+            .find(|(candidate, _, _, _)| *candidate == object)
+            .unwrap();
+        (module.clone(), *slot)
+    }
+
+    /// One pick must match the candidate (caller, module, slot) exactly.
+    fn check_pick(&self, attempt: &SemanticRefreshAttempt, candidate: (CallerId, PinnedObjectId)) {
+        assert_eq!(attempt.caller, candidate.0);
+        let (module, slot) = self.expect(candidate.1);
+        assert_eq!(attempt.module.as_ref(), Some(&module));
+        assert_eq!(attempt.slot, slot);
+    }
+}
+
+#[test]
+fn native_semantic_refresh_replay_charges_match_unshared_scan() {
+    // Full budget: the memoised call must pay exactly the unshared-scan
+    // schedule — entry 5 + 4 picks x (6 record + 12 object) + module
+    // visits 21 + 20 + 18 + 17 = 153 — with 21 live registry visits
+    // (pick 1 only; later picks replay). A replay that skipped its
+    // charges, or charged the wrong count, pays a different total.
+    let mut scene = SharedScanScene::build();
+    let mut charged = 0;
+    let attempts = scene
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&scene.lane, None, |units| {
+            charged += units;
+            true
+        });
+    let candidates = scene.candidates();
+    assert_eq!(attempts.len(), 4, "the service cap still dispatches four");
+    for (attempt, candidate) in attempts.iter().zip(candidates.iter().take(4)) {
+        scene.check_pick(attempt, *candidate);
+    }
+    assert_eq!(charged, 153, "replay charges every stored visit");
+    assert_eq!(
+        scene.scene.coordinator.semantic_refresh_find_visits(),
+        21,
+        "one live scan; picks 2-4 replay without registry visits"
+    );
+}
+
+#[test]
+fn native_semantic_refresh_replay_exhaustion_returns_prefix() {
+    // Budget fails on the last charge of pick 2's scan — a replayed
+    // module visit of the last pair (pick-2 end: 44 + 18 + 20 = 82) —
+    // so exactly pick 1 survives, with the same pick and charges as the
+    // unshared scan. A replay that skipped or under-counted its
+    // charges would complete pick 2 and return more than one pick.
+    // Budgeted scene first: a mutant that under-charges replay must
+    // fail on the picks below (it completes pick 2), not on calibration.
+    let mut scene = SharedScanScene::build();
+    let mut charged = 0;
+    let attempts = scene
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&scene.lane, None, |units| {
+            charged += units;
+            charged <= 81
+        });
+    assert_eq!(
+        attempts.len(),
+        1,
+        "only pick 1 survives a pick-2 replay exhaustion"
+    );
+    scene.check_pick(&attempts[0], scene.candidates()[0]);
+    assert_eq!(
+        charged, 82,
+        "every charge through the failing replay visit is paid"
+    );
+    let mut full = SharedScanScene::build();
+    let mut full_charged = 0;
+    let full_attempts =
+        full.scene
+            .coordinator
+            .semantic_refresh_attempts(&full.lane, None, |units| {
+                full_charged += units;
+                true
+            });
+    assert_eq!(full_attempts.len(), 4);
+    assert_eq!(
+        full_charged, 153,
+        "calibration scene pays the full schedule"
+    );
+}
+
+#[test]
+fn native_semantic_refresh_exhausted_scan_is_not_memoised() {
+    // Budget fails on the first module visit of the last pair in pick 1
+    // (charges before it: 44 - 2 = 42): the exhausted scan returns
+    // before memoising, so nothing is picked and the wrong `Some`
+    // sentinel from the find closure is never stored. A fresh budget
+    // then re-scans live and resolves all four picks correctly.
+    let mut scene = SharedScanScene::build();
+    let mut charged = 0;
+    let attempts = scene
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&scene.lane, None, |units| {
+            charged += units;
+            charged <= 42
+        });
+    assert!(
+        attempts.is_empty(),
+        "an exhausted pick-1 scan picks nothing"
+    );
+    assert_eq!(charged, 43, "the failing module visit is still charged");
+    assert_eq!(
+        scene.scene.coordinator.semantic_refresh_find_visits(),
+        20,
+        "19 earlier visits plus the exhausted one"
+    );
+    // No pick means the cursor never advanced, so a fresh budget serves
+    // the whole selection from the start: 21 more live visits (nothing
+    // was memoised) and the same four picks as a fresh scene.
+    let mut fresh = 0;
+    let attempts = scene
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&scene.lane, None, |units| {
+            fresh += units;
+            true
+        });
+    let candidates = scene.candidates();
+    assert_eq!(attempts.len(), 4);
+    for (attempt, candidate) in attempts.iter().zip(candidates.iter().take(4)) {
+        scene.check_pick(attempt, *candidate);
+    }
+    assert_eq!(fresh, 153, "the re-run pays the full schedule again");
+    assert_eq!(
+        scene.scene.coordinator.semantic_refresh_find_visits(),
+        41,
+        "the re-run re-scans every pair live"
     );
 }
 

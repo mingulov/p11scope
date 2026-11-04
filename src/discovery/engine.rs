@@ -6975,8 +6975,9 @@ fn build_current_plan(
             identity_mismatches + manifest_fallbacks
         );
     }
-    // A named capture that can attach nothing has nothing to observe. A
-    // shared-scope capture still starts: its refusals are published and
+    // A named capture that a capacity refusal left with nothing to attach
+    // has nothing to observe (an unpublished closure alone is not one, see
+    // `refusal_error`). A shared-scope capture still starts: its refusals are published and
     // printed, and a provider that loads, or is corroborated, later in the
     // capture can still be admitted into the reserve.
     if plan.admission_scope() == plan::AdmissionScope::Named
@@ -7090,8 +7091,16 @@ fn scan_gap_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skippe
 /// than aborting. It stays an error only when it leaves nothing to attach: an
 /// empty capture whose emptiness was caused by a refusal is not the "no modules
 /// discovered" case (spec §4.10) and must not read like it.
+///
+/// A proxy closure array waiting for a published table is not a capacity
+/// refusal: it attaches nothing yet whatever the free capacity, and the
+/// providers it forwards to attach as they load. A capture whose only gaps
+/// are such closures starts, PARTIAL, like one with nothing mapped yet.
 fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
-    let refused = plan.modules_skipped.first()?;
+    let refused = plan
+        .modules_skipped
+        .iter()
+        .find(|skipped| !plan::is_closure_awaiting_publication(&skipped.reason))?;
     plan.slots.is_empty().then(|| {
         format!(
             "every module discovery found was refused at the {} attach-slot ceiling, \

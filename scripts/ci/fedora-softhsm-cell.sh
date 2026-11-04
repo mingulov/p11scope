@@ -4,10 +4,9 @@
 #
 # Cell (b) of the S2 package: the gated workload runs against the real
 # Fedora SoftHSM 2.7 provider and the host observer runs profile --pid
-# with the unchanged exact oracle. Until the scan fix lane
-# (exec-scan-legacy32) lands, the 68-slot table labelled {3,2} walks as
-# known_prefix and the cell fails; it is reported as expected-failure,
-# and an unexpected pass flips the exit code so the change is noticed.
+# with the unchanged exact oracle. The scan lane (task/v060-scan-legacy32,
+# on this tree) teaches render to report a proven 68-slot prefix as a
+# full walk with exact observation, so the exact cell qualifies.
 #
 # Two modes:
 #   container (default off Fedora): a fedora:44 container on the host
@@ -26,21 +25,16 @@
 #
 # Rows in OUTDIR/results.jsonl: fedora27-shape (qualified: the provider
 # really is the {3,2} 68-slot shape with no interface exports),
-# fedora27-pid (expected-failure exact cell).
-# Exit 0: shape held and the exact cell failed as expected.
-# Exit 1: shape mismatch, or the exact cell unexpectedly passed.
+# fedora27-pid (qualified exact cell).
+# Exit 0: shape held and the exact cell qualified.
+# Exit 1: shape mismatch, or the exact cell failed.
 # Exit 2: harness error. Exit 77: prerequisite missing (no container
 # runtime, or no prebuilt workload on Fedora).
 #
-# Scan-flip note (porter): the scan lane task/v060-scan-legacy32
-# (8 commits c50029324..8d491f187) teaches render to report a proven
-# 68-slot prefix as a full walk with exact observation. When it lands,
-# the fedora27-pid oracle judgment passes, so judge_exact below emits
-# an UNEXPECTED PASS row and exits 1 by design. Port both lanes
-# together, or flip judge_exact's arms at that time (pass becomes a
-# qualified row with rc 0, fail becomes a failed row with rc 1), and
-# the two wrap_cell arms in scripts/ci/legacy32-shape.sh likewise
-# (expected-failure to control).
+# Scan flip applied at port: task/v060-scan-legacy32
+# (c50029324..8d491f187) is on this tree, so judge_exact maps pass to
+# a qualified row (rc 0) and fail to a failed row (rc 1), and the two
+# wrap_cell arms in scripts/ci/legacy32-shape.sh run as controls.
 #
 # Apt prerequisites (Ubuntu 26.04 runner): gcc jq procps python3
 # util-linux, plus docker.io (or podman) for container mode. The dnf
@@ -56,7 +50,6 @@ PIN=$ROOT/scripts/mapped-provider-pin.py
 SELECT=$ROOT/scripts/release-matrix-contract.py
 GATED_SRC=$ROOT/tests/fixtures/public-cli/gated.c
 PROBE_SRC=$ROOT/tests/fixtures/legacy32-provider/shape-probe.c
-REASON='SoftHSM 2.7 table shape; exec-scan-legacy32'
 IMAGE=fedora:44
 ITERS=${ITERS:-500}; SLEEPS=${SLEEPS:-200}; DURATION=${DURATION:-12}
 
@@ -159,7 +152,7 @@ PY
 }
 
 # Run the oracle under its own cell name, then map the row onto fedora27-pid.
-# Returns 3 on unexpected pass (mapped to exit 1 by the caller).
+# Scan flip applied at port: pass is qualified (rc 0), fail is failed (rc 1).
 judge_exact() {
   local row pass qual detail
   row=$(python3 -I "$ORACLE" --report "$cell.json" --ledger "$cell.wl" --receipt "$cell.receipt.json" --cell "$cell") || true
@@ -170,11 +163,11 @@ judge_exact() {
   qual=$(printf '%s' "$row" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qualification"])')
   detail=$(printf '%s' "$row" | python3 -c 'import json,sys; print(json.load(sys.stdin)["detail"])')
   if [ "$pass" = 1 ]; then
-    result fedora27-pid 1 "UNEXPECTED PASS ($REASON may have landed): [$qual] $detail" expected-failure
-    return 3
+    result fedora27-pid 1 "[$qual] $detail" qualified
+    return 0
   fi
-  result fedora27-pid 0 "$REASON: [$qual] $detail" expected-failure
-  return 0
+  result fedora27-pid 0 "[$qual] $detail" failed
+  return 1
 }
 # A lifecycle that never reached LEDGER with both exits 0 is a broken
 # harness, not the expected observation failure. Fail without writing a
@@ -350,7 +343,6 @@ native_cell() {
 started=$(date +%s)
 if [ "$NATIVE" = 1 ]; then native_cell; else container_cell; fi
 rc=$?
-if [ "$rc" = 3 ]; then rc=1; fi
 ended=$(date +%s)
 echo "fedora-softhsm-cell: elapsed $((ended - started))s"
 exit "$rc"

@@ -7,17 +7,15 @@
 # existing public-CLI exact cells (profile-pid, system) through
 # scripts/qualify-public-cli.sh's MODULE= override and its
 # P11SCOPE_PUBLIC_CLI_CELLS filter, so each leg runs two cells instead of
-# the full campaign. Until the scan fix lane (exec-scan-legacy32) lands,
-# p11scope walks the mislabelled table as known_prefix and render marks
-# observation lossy, so both cells fail; they are reported as
-# expected-failure, and an unexpected pass flips the exit code so the
-# change is noticed. The same two cells against the stock module are a
-# passing control.
+# the full campaign. The scan lane (task/v060-scan-legacy32, on this
+# tree) teaches render to report a proven 68-slot prefix as a full walk
+# with exact observation, so both legacy32 cells qualify. The same two
+# cells against the stock module are a passing control.
 #
-# Rows in OUTDIR/results.jsonl: legacy32-pid, legacy32-system
-# (expected-failure), stock-pid, stock-system (qualified control).
-# Exit 0: shape held, legacy32 failed as expected, controls passed.
-# Exit 1: a control failed, or a legacy32 cell unexpectedly passed.
+# Rows in OUTDIR/results.jsonl: legacy32-pid, legacy32-system,
+# stock-pid, stock-system (all qualified on a healthy tree).
+# Exit 0: shape held, all four rows qualified.
+# Exit 1: any cell failed.
 # Exit 2: harness error (shape mismatch, missing row, unusable tool).
 #
 # Apt prerequisites (Ubuntu 26.04 runner, plus qualify-public-cli.sh's):
@@ -50,15 +48,12 @@
 #     harness error. On tests-only hosts also set
 #     P11SCOPE_QUALIFY_GATED_BIN/_MT_BIN (see qualify-public-cli.sh).
 #
-# Scan-flip note (porter): the scan lane task/v060-scan-legacy32
-# (8 commits c50029324..8d491f187) teaches render to report a proven
-# 68-slot prefix as a full walk with exact observation. When it lands,
-# the legacy32-pid and legacy32-system oracle cells pass, so the two
-# wrap_cell expected-failure arms below emit UNEXPECTED PASS rows and
-# exit 1 by design. Port both lanes together, or flip those two arms
-# from expected-failure to control at that time (and judge_exact in
-# scripts/ci/fedora-softhsm-cell.sh likewise: pass becomes qualified,
-# fail becomes failed).
+# Scan flip applied at port: task/v060-scan-legacy32
+# (c50029324..8d491f187) is on this tree, so the two legacy32 arms run
+# as controls (qualified passes), and judge_exact in
+# scripts/ci/fedora-softhsm-cell.sh maps pass to qualified, fail to
+# failed. The wrap_cell expected-failure arm below is retained for a
+# future return to expected-failure only.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ROOT=$(cd "$HERE/../.." && pwd) || exit 64
@@ -217,11 +212,11 @@ PY
 
 failed=0; changed=0; harness=0
 if run_qualify "$SO" "$OUT/legacy32"; then
-  wrap_cell "$OUT/legacy32/results.jsonl" profile-pid legacy32-pid expected-failure || {
-    rc=$?; [ "$rc" = 3 ] && changed=1 || harness=1
+  wrap_cell "$OUT/legacy32/results.jsonl" profile-pid legacy32-pid control || {
+    rc=$?; [ "$rc" = 1 ] && failed=1 || harness=1
   }
-  wrap_cell "$OUT/legacy32/results.jsonl" system legacy32-system expected-failure || {
-    rc=$?; [ "$rc" = 3 ] && changed=1 || harness=1
+  wrap_cell "$OUT/legacy32/results.jsonl" system legacy32-system control || {
+    rc=$?; [ "$rc" = 1 ] && failed=1 || harness=1
   }
 else
   harness=1

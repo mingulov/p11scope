@@ -111,13 +111,13 @@ def write_fake_id(bin_dir):
 
 
 def write_stock_stub(stub_path, log_path):
-    """Qualify stub: logs MODULE, writes fail rows for legacy32, pass for stock."""
+    """Qualify stub: logs MODULE, writes pass rows for both legs (post-scan)."""
     stub_path.write_text(
         '#!/bin/bash\nset -u\ndest=$2\n'
         'if [ -z "${MODULE+x}" ]; then mod="UNSET"; else mod="$MODULE"; fi\n'
         f'echo "$dest $mod" >> "{log_path}"\n'
         'mkdir -p "$dest"\n'
-        'if [ "${dest##*/}" = legacy32 ]; then p=0; q=failed; d="stub legacy32 fail"; '
+        'if [ "${dest##*/}" = legacy32 ]; then p=1; q=qualified; d="stub legacy32 pass"; '
         'else p=1; q=qualified; d="stub stock pass"; fi\n'
         'python3 - "$dest/results.jsonl" "$p" "$q" "$d" <<\'PY\'\n'
         'import json,sys\n'
@@ -394,6 +394,8 @@ class StockModuleSeamTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             rows = read_rows(out)
             self.assertEqual(len(rows), 4, rows)
+            self.assertTrue(all(row["pass"] and row["qualification"] == "qualified"
+                               for row in rows), rows)
             logged = log.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(logged), 2, logged)
             by_dest = {Path(line.split()[0]).name: line.split(None, 1)[1]
@@ -415,6 +417,8 @@ class StockModuleSeamTests(unittest.TestCase):
                 sorted(r["cell"] for r in rows),
                 ["legacy32-pid", "legacy32-system", "stock-pid", "stock-system"],
                 rows)
+            self.assertTrue(all(row["pass"] and row["qualification"] == "qualified"
+                               for row in rows), rows)
             logged = log.read_text(encoding="utf-8").splitlines()
             by_dest = {Path(line.split()[0]).name: line.split(None, 1)[1]
                        for line in logged}

@@ -12465,6 +12465,123 @@ mod tests {
     }
 
     #[test]
+    fn scanned_rebind_cursor_refuses_unverified_forward_like_original_binding() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        const VERIFIED_OFFSET: u64 = 0xebe0;
+        const MISDIRECTED_OFFSET: u64 = 0x20;
+        let (_dir, mut source, mut raw) = conservative_cursor_fixture();
+        // The pinned target's own exports define the bootstrap at the
+        // verified offset only; the misdirected offset is unproven.
+        let target = source
+            .id_for_scanned(&raw[1], raw[1].key, &raw[1].path)
+            .expect("the second provider is pinned");
+        source.by_id.get_mut(&target).unwrap().exports =
+            Arc::from(vec![("C_GetFunctionList".to_string(), VERIFIED_OFFSET)]);
+        // A cross-object forward pair out of the first module: one
+        // genuine interposition (binds), one wrong offset (refused).
+        let forward_key = raw[1].key;
+        let forward_path = raw[1].path.clone();
+        assert_ne!(forward_key, raw[0].key);
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetFunctionList",
+            object: forward_key,
+            object_path: forward_path.clone(),
+            file_offset: VERIFIED_OFFSET,
+        });
+        raw[0].tables[0].entries.push(ScannedEntry {
+            name: "C_GetFunctionList",
+            object: forward_key,
+            object_path: forward_path,
+            file_offset: MISDIRECTED_OFFSET,
+        });
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let baseline = pool.snapshot().charged_bytes;
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        // Both paths start from the same copied pins.
+        let mut expected = pins.pinned().unwrap().clone();
+        expected.reset_derived_claims();
+        let (expected_modules, expected_skips) = bind_scanned_modules(&raw, &mut expected);
+        // The original binding proves the pair: verified binds, wrong offset
+        // refuses with the shared reason.
+        let expected_entries = &expected_modules[0].scanned.tables[0].entries;
+        assert!(
+            expected_entries.iter().any(|entry| {
+                entry.name == "C_GetFunctionList" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the verified forward binds: {expected_entries:?}"
+        );
+        assert!(
+            !expected_entries.iter().any(|entry| {
+                entry.name == "C_GetFunctionList" && entry.file_offset == MISDIRECTED_OFFSET
+            }),
+            "the misdirected forward never binds: {expected_entries:?}"
+        );
+        assert!(
+            expected_skips.iter().any(|skip| {
+                skip.subject == "C_GetFunctionList"
+                    && skip.reason.contains(UNVERIFIED_FORWARD_REFUSAL)
+            }),
+            "the wrong offset refuses with the shared reason: {expected_skips:?}"
+        );
+        // The cursor must reach the same binding over finite credits.
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let held = pool.snapshot().charged_bytes;
+        let mut rebind = ScannedRebindCursor::new();
+        let ((), peak) = crate::test_alloc::requested_peak_during(|| {
+            finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        });
+        assert!(!peak.incomplete);
+        let actual_modules = rebind
+            .modules()
+            .expect("the forward pair rebinds to structural readiness");
+        assert_eq!(actual_modules, expected_modules);
+        assert_eq!(rebind.skipped().unwrap(), expected_skips);
+        // The cursor's own branch ran: same verified bind, same refusal text.
+        let actual_entries = &actual_modules[0].scanned.tables[0].entries;
+        assert!(
+            actual_entries.iter().any(|entry| {
+                entry.name == "C_GetFunctionList" && entry.file_offset == VERIFIED_OFFSET
+            }),
+            "the cursor binds the verified forward: {actual_entries:?}"
+        );
+        assert!(
+            rebind.skipped().unwrap().iter().any(|skip| {
+                skip.subject == "C_GetFunctionList"
+                    && skip.reason.contains(UNVERIFIED_FORWARD_REFUSAL)
+            }),
+            "the cursor refuses the wrong offset: {:?}",
+            rebind.skipped().unwrap()
+        );
+        // Byte accounting covers the new refusal suffix.
+        assert!(
+            rebind.required_bytes().unwrap() >= peak.peak_bytes.max(peak.realloc_overlap_bytes)
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            held + rebind.required_bytes().unwrap()
+        );
+        for _ in 0..4096 {
+            if rebind.reclaim(Some(&mut pins), &reserve, 1).unwrap() == GraphStep::Ready {
+                break;
+            }
+        }
+        assert!(rebind.modules().is_none());
+        for _ in 0..4096 {
+            if pins
+                .reclaim(Some(&source), &selection, &reserve, 1)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
     fn scanned_rebind_cursor_keeps_claim_growth_paid() {
         use crate::semantics_edge::resources::SemanticResourcePool;
         for exit in 0..3 {

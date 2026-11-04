@@ -6,6 +6,7 @@ use crate::attach::inventory::capture::{
     MULTI_LINK_MIN_SITES, ReadWindow, RetiredCapture, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::CallerBudget;
+use crate::discovery::engine::tests::copy_executable_via_waited_child;
 use crate::discovery::identity::{bind_scanned_modules, pin_scanned_view_objects};
 use crate::discovery::inventory_attach_set::tests as inventory_fx;
 use crate::discovery::inventory_attach_set::{AbsorbOutcome, AttachVerdict, InventoryAttachSet};
@@ -517,7 +518,10 @@ impl Task4IdentityFixture {
             .file_offset;
         ensure!(original_offset == alias_offset && snapshot.is_executable_offset(original_offset));
         let copy_path = directory.path().join("owned-provider-copy");
-        std::fs::copy(&path, &copy_path)?;
+        // Through the shared waited-child writer: an in-process copy would
+        // hold the destination open for writing across concurrent forks, and
+        // the copy is exec'd below.
+        copy_executable_via_waited_child(&path, &copy_path);
         let copy_elf = open_object(&copy_path).map_err(anyhow::Error::msg)?;
         let copy_snapshot = ElfSnapshot::read(&copy_elf).map_err(anyhow::Error::msg)?;
         let copy_offset = copy_snapshot

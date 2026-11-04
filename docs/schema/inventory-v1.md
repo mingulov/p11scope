@@ -835,8 +835,8 @@ object. The key is absent when the capture produced no disclosure
 An empty `identities` list with nonzero counts means the router
 observed continuations that project to no nameable identity: mint
 exhaustion, an identity whose every router ID is unregistered, or
-identities shed past the ledger cap. The counts stay exact either
-way. Router IDs that never registered (refused or unconverted
+identities shed past the ledger cap. The counts stay exact in each
+case. Router IDs that never registered (refused or unconverted
 coverages) are omitted from their identity, and identities with
 nothing nameable are dropped. Registration refusals are disclosed
 under the existing `instance semantics refused` gap, conversion

@@ -2101,6 +2101,7 @@ fn double_load_transition_keeps_its_hit_unresolved() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = |double_loaded| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         view,
         mount_namespace,
@@ -2146,6 +2147,7 @@ fn same_file_load_count_change_keeps_its_hit_unresolved() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = |double_loaded, same_file_loads| ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         view,
         mount_namespace,
@@ -2191,6 +2193,7 @@ fn stable_same_file_load_count_resolves_benignly() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         view,
         mount_namespace,
@@ -2233,6 +2236,7 @@ fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
     let view = engine.views[0].id();
     let mount_namespace = engine.views[0].mount_namespace();
     let module = ScannedModule {
+        module_hint: None,
         mapped_identity: None,
         view,
         mount_namespace,
@@ -20642,7 +20646,7 @@ fn loader_scan_loss_routes_do_not_count_exit_only() {
                     view: ProcessViewId(0),
                     context: LoaderContextId::from_case_id(case as u8),
                 },
-                0,
+                (0, 0),
             );
         }
         let before = engine.capture_facts().discovery_losses()[3];
@@ -20651,6 +20655,7 @@ fn loader_scan_loss_routes_do_not_count_exit_only() {
                 view: ProcessViewId(1),
                 context: LoaderContextId::from_case_id(0),
             },
+            0,
             0,
         );
         assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);

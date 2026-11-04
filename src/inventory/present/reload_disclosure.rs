@@ -52,7 +52,6 @@ mod tests {
     use p11scope_ebpf_common::ImageIdentity;
 
     const SLOT_A: u32 = 918273;
-    const SLOT_B: u32 = 918274;
     const ROUTER_A: u64 = 745021;
     const ROUTER_B: u64 = 745022;
     const IMAGE_A: ImageIdentity = ImageIdentity {
@@ -245,10 +244,14 @@ mod tests {
         );
     }
 
-    /// (d2) Two ledger entries under one module merge into one entry with
-    /// the sorted union of instances.
+    /// (d2) Twelve ledger entries under one module merge into one entry
+    /// with the sorted union of instances, disclosed in reverse ledger
+    /// order: instance ordering follows the minted instance sequence,
+    /// not disclosure order — and with `i10`/`i11` present a
+    /// label-string sort would observably differ.
     #[test]
     fn same_module_identities_merge_sorted() {
+        const COUNT: u32 = 12;
         let domain = NativeDomainId::try_mint().expect("a fresh test domain");
         let mut coordinator = InventoryCoordinator::new(
             Scope::Pid(std::process::id()),
@@ -268,28 +271,34 @@ mod tests {
             .registry_mut()
             .scripted_module_edge(key.clone(), caller)
             .label();
-        for (image, router) in [(IMAGE_A, ROUTER_A), (IMAGE_B, ROUTER_B)] {
+        let mut reports = Vec::new();
+        for i in 0..COUNT {
+            let image = ImageIdentity {
+                task_cookie: 6071429100 + u64::from(i),
+                exec_id: 824700 + u64::from(i),
+            };
+            let router = 745100 + u64::from(i);
             let instance =
                 InstanceKey::scripted(domain, image, InstanceId::from_raw(router), key.clone());
             coordinator
                 .registry_mut()
                 .note_instance(AdmittedInstance::scripted(instance, caller));
+            reports.push(ReloadNotExcludedReport {
+                label: RELOAD_NOT_EXCLUDED_LABEL,
+                image,
+                file_slot: 918300 + i,
+                ids: vec![InstanceId::from_raw(router)],
+            });
         }
         coordinator.registry_mut().publish();
-        for (image, slot, router) in [(IMAGE_A, SLOT_A, ROUTER_A), (IMAGE_B, SLOT_B, ROUTER_B)] {
-            coordinator.drain_reload_disclosures_into_ledger(
-                domain,
-                vec![ReloadNotExcludedReport {
-                    label: RELOAD_NOT_EXCLUDED_LABEL,
-                    image,
-                    file_slot: slot,
-                    ids: vec![InstanceId::from_raw(router)],
-                }],
-                2,
-                2,
-                0,
-            );
-        }
+        reports.reverse();
+        coordinator.drain_reload_disclosures_into_ledger(
+            domain,
+            reports,
+            u64::from(COUNT),
+            u64::from(COUNT),
+            0,
+        );
         let seam = Seam {
             coordinator,
             domain,
@@ -298,11 +307,35 @@ mod tests {
             module_b: module.clone(),
         };
         let document = document(&seam);
-        assert_eq!(
-            document["instance_reload_not_excluded"]["identities"],
-            serde_json::json!([
-                {"module": module, "instances": [instance0(), RegistryInstanceId::from_raw(1).label()]}
-            ]),
+        let identities = document["instance_reload_not_excluded"]["identities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(identities.len(), 1, "one module merges: {identities:?}");
+        assert_eq!(identities[0]["module"], module);
+        let rendered: Vec<String> = identities[0]["instances"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|id| id.as_str().unwrap_or("!?").to_string())
+            .collect();
+        let minted: Vec<String> = (0..COUNT)
+            .map(|i| RegistryInstanceId::from_raw(i).label())
+            .collect();
+        assert_eq!(rendered, minted, "disclosure follows minted instance order");
+        let numeric: Vec<u32> = rendered
+            .iter()
+            .map(|label| label.trim_start_matches('i').parse().expect("iN label"))
+            .collect();
+        let mut sorted = numeric.clone();
+        sorted.sort_unstable();
+        assert_eq!(numeric, sorted, "the pinned order is numeric: {rendered:?}");
+        let mut lexicographic = rendered.clone();
+        lexicographic.sort();
+        assert_ne!(
+            rendered, lexicographic,
+            "the fixture must separate numeric from label order"
         );
     }
 

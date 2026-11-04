@@ -19564,6 +19564,7 @@ mod tests {
                 render::SchedulingEvidence::default(),
                 None,
                 None,
+                None,
             );
             assert_eq!(
                 evidence.unprotected_live_windows, unprotected,

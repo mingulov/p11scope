@@ -7,7 +7,7 @@
 //! any proof; rejected records and speculative tails drop before fresh reads.
 
 use crate::discovery::identity::PinnedObjects;
-use crate::discovery::overlay_witness::SweepWitness;
+use crate::discovery::overlay_witness::{OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS, SweepWitness};
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, ConfirmMark, MapsReadBudget, MapsReadBuffers, MapsReadLimits,
@@ -96,16 +96,26 @@ pub(crate) trait SegmentProof {
     ) -> crate::discovery::kernel_identity::ProofDecision<'r>;
 }
 
-/// Rotation offset for one witness pass over the whole sweep: the
-/// per-pass budget covers a different candidate window each pass, so
-/// callers past the budget prove within a few passes instead of
-/// starving every pass.
-fn rotated_start(candidates: usize, witness_start: u64) -> usize {
-    if candidates == 0 {
-        0
+/// Whether refused candidate `index` (counted across the whole pass,
+/// in segment order) falls in this pass's witness window: the
+/// per-pass budget covers 8 consecutive candidates starting at
+/// `start`, modulo the previous pass's refused count. The window
+/// walks over refused candidates rather than sweep positions, so
+/// sparse refused sets still rotate instead of pinning one tail
+/// caller every pass.
+fn witness_window_member(index: usize, start: u64, denominator: usize) -> bool {
+    let candidates = denominator.max(1) as u64;
+    // Distance forward from `start` to `index` modulo the count (a
+    // wrapping subtraction would skew past `u64::MAX`, since 2^64 is
+    // not a multiple of the count); members sit within one budget.
+    let position = (index as u64) % candidates;
+    let start = start % candidates;
+    let distance = if position >= start {
+        position - start
     } else {
-        (witness_start % candidates as u64) as usize
-    }
+        candidates - (start - position)
+    };
+    distance < u64::from(OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS)
 }
 
 /// Prove overlay-refused ranges via the private witness session (K1-R2,
@@ -113,8 +123,10 @@ fn rotated_start(candidates: usize, witness_start: u64) -> usize {
 /// refused range of the key; SameFile replaces all that key's refused
 /// ranges with [`RangeProof::Witnessed`] (join), anything else keeps
 /// refused (named loss, never a userspace join). Ranges under no entry,
-/// non-overlay keys, keys without a pinned file, and budget exhaustion
-/// all keep refused (fail-closed).
+/// non-overlay keys, keys without a pinned file, candidates outside
+/// this pass's window, and budget exhaustion all keep refused
+/// (fail-closed). Every grouped key counts into `refused_counter`
+/// (the pass-wide candidate index), whether or not it is queried.
 #[allow(clippy::too_many_arguments)]
 fn witness_overlay_refused(
     pid: u32,
@@ -124,7 +136,9 @@ fn witness_overlay_refused(
     pins: &PinnedObjects,
     witness: &mut dyn SweepWitness,
     budget: &mut CaptureWorkBudget,
-    witness_start: u64,
+    window_start: u64,
+    window_denominator: usize,
+    refused_counter: &mut usize,
 ) {
     use crate::discovery::identity::MappedFile;
     use crate::discovery::overlay_witness::WitnessVerdict;
@@ -147,10 +161,15 @@ fn witness_overlay_refused(
         }
         by_key.entry(*key).or_default().push(*range);
     }
-    let mut keys: Vec<(ObjectKey, Vec<(u64, u64)>)> = by_key.into_iter().collect();
-    let offset = rotated_start(keys.len(), witness_start);
-    keys.rotate_left(offset);
+    // Stable key order: the pass-wide window (not a local rotation)
+    // decides which candidates prove this pass.
+    let keys: Vec<(ObjectKey, Vec<(u64, u64)>)> = by_key.into_iter().collect();
     for (key, ranges) in keys {
+        let member = witness_window_member(*refused_counter, window_start, window_denominator);
+        *refused_counter += 1;
+        if !member {
+            continue;
+        }
         let Some((object, expected)) = index.match_pin(key) else {
             continue;
         };
@@ -202,7 +221,20 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
 ) -> Confirmation {
-    prove_and_finish_prepared_with_witness(io, pid, prepared, hook, resources, budget, None, 0)
+    // No witness: the window never runs, so the counter is a dummy.
+    let mut refused = 0usize;
+    prove_and_finish_prepared_with_witness(
+        io,
+        pid,
+        prepared,
+        hook,
+        resources,
+        budget,
+        None,
+        0,
+        0,
+        &mut refused,
+    )
 }
 
 /// Scalar confirm with an optional sweep witness for overlay refusals
@@ -218,7 +250,9 @@ pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
     witness: Option<(&KnownKeyIndex, &PinnedObjects, &mut dyn SweepWitness)>,
-    witness_start: u64,
+    window_start: u64,
+    window_denominator: usize,
+    refused_counter: &mut usize,
 ) -> Confirmation {
     let batch = AcceptedBatch {
         requests: vec![AcceptedRequest {
@@ -248,7 +282,9 @@ pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
             pins,
             runner,
             budget,
-            witness_start,
+            window_start,
+            window_denominator,
+            refused_counter,
         );
     }
     // A complete kernel answer needs no userspace reads; otherwise the
@@ -1226,13 +1262,18 @@ where
         Some(hook),
         None,
         0,
+        0,
     )
+    .0
 }
 
 /// Kernel sweep with an optional private witness for overlay refusals
 /// with no sweep route (live capture watched providers). `None` keeps
 /// today's named loss; `Some` proves each refused overlay key through
-/// the private session under the D-P1 per-pass budget.
+/// the private session under the D-P1 per-pass budget. The window
+/// (`start`, previous refused count) walks the budget over refused
+/// candidates across passes; the returned count is this pass's
+/// refused total, the next pass's denominator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attribute_unselected_with_segment_proof_with_witness<Io, F>(
     sweep: &[(u32, Vec<MapEntry>)],
@@ -1247,8 +1288,9 @@ pub(crate) fn attribute_unselected_with_segment_proof_with_witness<Io, F>(
     hook: &mut impl SegmentProof,
     pins: &PinnedObjects,
     witness: &mut dyn SweepWitness,
-    witness_start: u64,
-) -> SweepAttribution
+    window_start: u64,
+    window_denominator: usize,
+) -> (SweepAttribution, usize)
 where
     Io: ShardableIo,
     Io::Pin: Send,
@@ -1266,7 +1308,8 @@ where
         make_io,
         Some(hook),
         Some((pins, witness)),
-        witness_start,
+        window_start,
+        window_denominator,
     )
 }
 
@@ -1277,6 +1320,8 @@ where
 /// non-overlay ranges read from userspace exactly like the plain
 /// path. Production and the privileged sweep cell share this
 /// function, so the tested route cannot drift from the shipped one.
+/// The returned count is this pass's refused total, the next pass's
+/// window denominator.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attribute_unselected_capture_excluded_with_witness<Io, F>(
     sweep: &[(u32, Vec<MapEntry>)],
@@ -1290,8 +1335,9 @@ pub(crate) fn attribute_unselected_capture_excluded_with_witness<Io, F>(
     make_io: &F,
     pins: &PinnedObjects,
     witness: &mut dyn SweepWitness,
-    witness_start: u64,
-) -> SweepAttribution
+    window_start: u64,
+    window_denominator: usize,
+) -> (SweepAttribution, usize)
 where
     Io: ShardableIo,
     Io::Pin: Send,
@@ -1311,8 +1357,78 @@ where
         &mut hook,
         pins,
         witness,
-        witness_start,
+        window_start,
+        window_denominator,
     )
+}
+
+/// Failed-install sweep dispatch: a pass whose anchors never installed
+/// because every anchor is capture-watched proves its refused overlay
+/// keys through the private witness session (no sweep kernel run
+/// exists); any other failed install reads from userspace exactly like
+/// the plain path. The returned count is this pass's refused total on
+/// the witness route (`None` on the plain route, which runs no
+/// witness), the next pass's window denominator.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attribute_failed_install_sweep<Io, F>(
+    capture_excluded: bool,
+    sweep: &[(u32, Vec<MapEntry>)],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+    budget: &mut CaptureWorkBudget,
+    policy: SegmentPolicy,
+    owner: &ReservationOwner,
+    threads: usize,
+    make_io: &F,
+    pins: &PinnedObjects,
+    witness: &mut dyn SweepWitness,
+    window_start: u64,
+    window_denominator: usize,
+) -> (SweepAttribution, Option<usize>)
+where
+    Io: ShardableIo,
+    Io::Pin: Send,
+    F: Fn() -> Io + Sync,
+{
+    if capture_excluded {
+        // Every anchor is capture-watched: no sweep kernel run exists,
+        // but the refused overlay keys still prove through the private
+        // witness session (the refused hook manufactures no kernel
+        // proofs; non-overlay ranges read from userspace exactly as on
+        // the plain route below).
+        let (out, refused) = attribute_unselected_capture_excluded_with_witness(
+            sweep,
+            unavailable,
+            selected,
+            index,
+            budget,
+            policy,
+            owner,
+            threads,
+            make_io,
+            pins,
+            witness,
+            window_start,
+            window_denominator,
+        );
+        (out, Some(refused))
+    } else {
+        (
+            attribute_unselected_with_policy(
+                sweep,
+                unavailable,
+                selected,
+                index,
+                budget,
+                policy,
+                owner,
+                threads,
+                make_io,
+            ),
+            None,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1345,7 +1461,9 @@ where
         None,
         None,
         0,
+        0,
     )
+    .0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1361,31 +1479,22 @@ fn attribute_unselected_with_optional_proof<Io, F>(
     make_io: &F,
     mut hook: Option<&mut dyn SegmentProof>,
     mut witness: Option<(&PinnedObjects, &mut dyn SweepWitness)>,
-    witness_start: u64,
-) -> SweepAttribution
+    window_start: u64,
+    window_denominator: usize,
+) -> (SweepAttribution, usize)
 where
     Io: ShardableIo,
     Io::Pin: Send,
     F: Fn() -> Io + Sync,
 {
-    // The witness budget covers one window across the whole pass, not
-    // one prefix per segment: rotate the sweep once, so a later
-    // segment's callers prove as soon as the window reaches them
-    // instead of starving behind an earlier segment's wrap-around.
-    // Skipped without a witness (no rotation) and at offset zero.
-    let offset = if witness.is_some() {
-        rotated_start(sweep.len(), witness_start)
-    } else {
-        0
-    };
-    let rotated = if offset == 0 {
-        None
-    } else {
-        let mut order = sweep.to_vec();
-        order.rotate_left(offset);
-        Some(order)
-    };
-    let sweep: &[(u32, Vec<MapEntry>)] = rotated.as_deref().unwrap_or(sweep);
+    // The witness budget covers one window across the whole pass over
+    // refused candidates (not sweep positions, which starve sparse
+    // refused sets, and not one prefix per segment, which starves
+    // later segments): candidates count up in segment order, and only
+    // window members take a query. The returned count is this pass's
+    // refused total (0 without a witness), the next pass's window
+    // denominator.
+    let mut refused_counter = 0usize;
     let prove = index.map_files_keys();
     let mut out = SweepAttribution::default();
     let batch = owner.batch();
@@ -1536,9 +1645,9 @@ where
             && let Some((pins, runner)) = witness.as_mut()
         {
             let pins = *pins;
-            // Stable segment order: the sweep input already carries
-            // the pass-wide rotation, so this prefix continues where
-            // the previous segment left off.
+            // Stable segment order: candidates count into the
+            // pass-wide window in this order, so the budget covers
+            // one refused window across segments.
             let order: Vec<usize> = prepared
                 .iter()
                 .enumerate()
@@ -1566,7 +1675,9 @@ where
                     pins,
                     &mut **runner,
                     budget,
-                    witness_start,
+                    window_start,
+                    window_denominator,
+                    &mut refused_counter,
                 );
             }
         }
@@ -1657,7 +1768,9 @@ where
                                 &immediate,
                                 budget,
                                 w,
-                                witness_start,
+                                window_start,
+                                window_denominator,
+                                &mut refused_counter,
                             )
                         }
                         Err(confirmation) => confirmation,
@@ -1683,7 +1796,7 @@ where
         }
         position = next;
     }
-    out
+    (out, refused_counter)
 }
 
 #[allow(clippy::too_many_arguments)]

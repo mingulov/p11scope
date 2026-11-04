@@ -3702,6 +3702,7 @@ pub(crate) struct IdentityRunShared {
     session: Option<crate::discovery::kernel_identity::IdentitySession>,
     checks: Box<dyn IdentityChecks>,
     sweep_witness_rotation: u64,
+    sweep_witness_denominator: usize,
 }
 
 pub(crate) type IdentityShared = std::sync::Arc<std::sync::Mutex<IdentityRunShared>>;
@@ -3741,6 +3742,7 @@ impl IdentityRunShared {
             session: None,
             checks,
             sweep_witness_rotation: 0,
+            sweep_witness_denominator: 0,
         }
     }
 
@@ -3757,17 +3759,26 @@ impl IdentityRunShared {
         shared
     }
 
-    /// First witness candidate offset for this pass over the whole
-    /// sweep. The pass advances it by the queries it actually spends.
-    fn witness_start(&self) -> u64 {
-        self.sweep_witness_rotation
+    /// This pass's witness window over refused candidates: the
+    /// start offset plus the previous pass's refused count (the
+    /// modulo; 0 bootstraps to an order window on the first pass).
+    fn witness_window(&self) -> (u64, usize) {
+        (self.sweep_witness_rotation, self.sweep_witness_denominator)
     }
 
-    /// Advance the witness rotation by this pass's spent queries (0
-    /// when no witness ran, so the next pass restarts from the same
-    /// offset instead of skipping a candidate it never proved).
-    fn advance_witness_rotation(&mut self, spent: u32) {
+    /// Advance the witness window by this pass's spent queries, and
+    /// record this pass's refused count as the next denominator
+    /// (`None` when no witness scan ran, or a zero refused count, keeps
+    /// the previous denominator: a pass that counts no candidates spends
+    /// no queries, so the next pass continues past the spent queries
+    /// instead of rebootstrapping; 0 spent leaves the start alone, so
+    /// the next pass restarts from the same offset instead of skipping a
+    /// candidate it never proved).
+    fn advance_witness_rotation(&mut self, spent: u32, refused: Option<usize>) {
         self.sweep_witness_rotation = self.sweep_witness_rotation.wrapping_add(u64::from(spent));
+        if let Some(refused) = refused.filter(|refused| *refused > 0) {
+            self.sweep_witness_denominator = refused;
+        }
     }
 
     #[cfg(test)]
@@ -4322,10 +4333,11 @@ fn attribute_pass_with_kernel(
     // The witness budget covers a different candidate window each
     // kernel pass, so callers past the per-pass budget still prove
     // within a few passes instead of starving every pass. The pass
-    // advances the window by the queries it actually spends.
-    let witness_start = {
+    // advances the window by the queries it actually spends and
+    // reports its refused count as the next denominator.
+    let (window_start, window_denominator) = {
         let shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        shared.witness_start()
+        shared.witness_window()
     };
     let Some(takeout) = takeout else {
         let out = attribute_sweep_with(
@@ -4346,10 +4358,10 @@ fn attribute_pass_with_kernel(
                 )
             },
         );
-        // No witness runs on the plain path: the rotation stays.
+        // No witness runs on the plain path: the window stays.
         {
             let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-            shared.advance_witness_rotation(0);
+            shared.advance_witness_rotation(0, None);
         }
         return out;
     };
@@ -4386,25 +4398,27 @@ fn attribute_pass_with_kernel(
             if let Some(threshold) = threshold {
                 probe = probe.with_auto_threshold(threshold);
             }
-            let (attributed, observed, witness_spent) = attribute_sweep_with_kernel(
-                collection,
-                bound,
-                segment_policy,
-                reservations,
-                shards,
-                &|| OsConfirmIo::with_pools(pools),
-                &mut probe,
-                witness_start,
-            );
+            let (attributed, observed, witness_spent, witness_refused) =
+                attribute_sweep_with_kernel(
+                    collection,
+                    bound,
+                    segment_policy,
+                    reservations,
+                    shards,
+                    &|| OsConfirmIo::with_pools(pools),
+                    &mut probe,
+                    window_start,
+                    window_denominator,
+                );
             drop(probe);
             drop(installed);
-            Some((attributed, observed, witness_spent))
+            Some((attributed, observed, witness_spent, witness_refused))
         } else {
             None
         }
     };
-    let (out, spent) = match proved {
-        Some((attributed, observed, witness_spent)) => {
+    let (out, spent, refused) = match proved {
+        Some((attributed, observed, witness_spent, witness_refused)) => {
             // A fully proved pass adds zero to the totals.
             let ledger_first = session.fallback_totals().first_reason;
             {
@@ -4448,7 +4462,7 @@ fn attribute_pass_with_kernel(
                     )
                 }
             };
-            (out, witness_spent)
+            (out, witness_spent, witness_refused)
         }
         None => {
             // The install failed but the session stays valid: return it
@@ -4458,22 +4472,16 @@ fn attribute_pass_with_kernel(
                 note_anchor_setup_fallback(&mut shared, capture_excluded);
                 shared.session = Some(session);
             }
-            let mut capture_excluded_spent = 0u32;
+            let mut capture_excluded_window = (0u32, None);
             let out = attribute_sweep_with(
                 collection,
                 bound,
                 &bound.aggregate,
                 |sweep, unavailable, selected, index, budget| {
-                    if capture_excluded {
-                        // Every anchor is capture-watched: no sweep kernel
-                        // run exists, but the refused overlay keys still
-                        // prove through the private witness session (the
-                        // refused hook manufactures no kernel proofs;
-                        // non-overlay ranges read from userspace exactly
-                        // as below).
-                        let mut witness =
-                            crate::discovery::overlay_witness::KernelSweepWitness::new();
-                        let out = crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
+                    let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
+                    let (out, refused) =
+                        crate::discovery::confirm_shards::attribute_failed_install_sweep(
+                            capture_excluded,
                             sweep,
                             unavailable,
                             selected,
@@ -4485,31 +4493,20 @@ fn attribute_pass_with_kernel(
                             &|| OsConfirmIo::with_pools(pools),
                             &bound.aggregate,
                             &mut witness,
-                            witness_start,
+                            window_start,
+                            window_denominator,
                         );
-                        capture_excluded_spent = witness.used();
-                        out
-                    } else {
-                        crate::discovery::confirm_shards::attribute_unselected_with_policy(
-                            sweep,
-                            unavailable,
-                            selected,
-                            index,
-                            budget,
-                            segment_policy,
-                            reservations,
-                            shards,
-                            &|| OsConfirmIo::with_pools(pools),
-                        )
-                    }
+                    capture_excluded_window = (witness.used(), refused);
+                    out
                 },
             );
-            (out, capture_excluded_spent)
+            let (spent, refused) = capture_excluded_window;
+            (out, spent, refused)
         }
     };
     {
         let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        shared.advance_witness_rotation(spent);
+        shared.advance_witness_rotation(spent, refused);
     }
     out
 }
@@ -4518,8 +4515,9 @@ fn attribute_pass_with_kernel(
 /// (index, selection, refused filtering) plus kernel slot
 /// expectations and the segment-proof hook. Setup failures return
 /// `None` so the caller runs the same-pin userspace fallback. The
-/// third return is the witness queries this sweep spent, so the
-/// caller can advance the pass-wide rotation past them.
+/// last returns are the witness queries this sweep spent and its
+/// refused total (`None` when no sweep ran), so the caller can
+/// advance the pass-wide window past them.
 #[allow(clippy::too_many_arguments)]
 fn attribute_sweep_with_kernel<Io, F>(
     collection: &mut Collection,
@@ -4529,11 +4527,13 @@ fn attribute_sweep_with_kernel<Io, F>(
     threads: usize,
     make_io: &F,
     probe: &mut crate::discovery::kernel_identity::KernelMemberProbe<'_, '_, '_, Io>,
-    witness_start: u64,
+    window_start: u64,
+    window_denominator: usize,
 ) -> (
     Option<Attributed>,
     Option<crate::discovery::kernel_identity::KernelFallbackReason>,
     u32,
+    Option<usize>,
 )
 where
     Io: crate::discovery::confirm_shards::ShardableIo,
@@ -4541,7 +4541,7 @@ where
     F: Fn() -> Io + Sync,
 {
     if !collection.cap_hit {
-        return (None, None, 0);
+        return (None, None, 0, None);
     }
     let (mut index, selected, refused) = sweep_proof_prefix(collection, bound, &bound.aggregate);
     progress!(
@@ -4549,7 +4549,7 @@ where
         collection.sweep.len().saturating_sub(selected.len())
     );
     if probe.install_expectations(&mut index).is_err() {
-        return (None, None, 0);
+        return (None, None, 0, None);
     }
     let mut observing = FallbackObservingProof {
         inner: probe.segment_proof(),
@@ -4559,7 +4559,7 @@ where
     // attach-set exclusions) prove via the private witness session
     // under the D-P1 per-pass budget; exhaustion keeps the named loss.
     let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
-    let mut attribution =
+    let (mut attribution, refused_total) =
         crate::discovery::confirm_shards::attribute_unselected_with_segment_proof_with_witness(
             &collection.sweep,
             &collection.sweep_unavailable,
@@ -4573,7 +4573,8 @@ where
             &mut observing,
             &bound.aggregate,
             &mut witness,
-            witness_start,
+            window_start,
+            window_denominator,
         );
     let changed = retain_unchanged(&mut attribution, &bound.aggregate);
     let observed = observing.observed();
@@ -4586,6 +4587,7 @@ where
         }),
         observed,
         spent,
+        Some(refused_total),
     )
 }
 
@@ -5325,9 +5327,11 @@ mod tests {
         }
     }
 
-    /// The witness rotation advances by the queries a pass actually
+    /// The witness window advances by the queries a pass actually
     /// spends (a full 8-query budget moves the window by 8, not 1; a
-    /// pass with no witness leaves it), wrapping at `u64::MAX`.
+    /// pass with no witness leaves it), wrapping at `u64::MAX`, and
+    /// records the pass's refused count as the next denominator
+    /// (`None` keeps the previous one).
     #[test]
     fn witness_rotation_advances_by_queries_spent() {
         let (shared, _) = shared_with(
@@ -5335,14 +5339,32 @@ mod tests {
             ScriptedIdentityChecks::session_fails(IdentityUnavailable::LoadFailed),
         );
         let mut guard = shared.lock().unwrap();
-        assert_eq!(guard.witness_start(), 0);
-        guard.advance_witness_rotation(8);
-        assert_eq!(guard.witness_start(), 8);
-        guard.advance_witness_rotation(0);
-        assert_eq!(guard.witness_start(), 8);
+        assert_eq!(guard.witness_window(), (0, 0));
+        guard.advance_witness_rotation(8, Some(10));
+        assert_eq!(guard.witness_window(), (8, 10));
+        guard.advance_witness_rotation(0, None);
+        assert_eq!(guard.witness_window(), (8, 10));
         guard.sweep_witness_rotation = u64::MAX;
-        guard.advance_witness_rotation(1);
-        assert_eq!(guard.witness_start(), 0);
+        guard.advance_witness_rotation(1, Some(9));
+        assert_eq!(guard.witness_window(), (0, 9));
+    }
+
+    /// A completed sweep that counts zero refused candidates leaves the
+    /// denominator alone, like a pass with no witness run: it spends no
+    /// queries, so the next pass continues past the spent queries
+    /// instead of rebootstrapping to the first window and starving the
+    /// tail whenever zero-count passes interleave with counted ones.
+    #[test]
+    fn witness_rotation_keeps_denominator_on_zero_count_pass() {
+        let (shared, _) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::session_fails(IdentityUnavailable::LoadFailed),
+        );
+        let mut guard = shared.lock().unwrap();
+        guard.advance_witness_rotation(8, Some(10));
+        assert_eq!(guard.witness_window(), (8, 10));
+        guard.advance_witness_rotation(0, Some(0));
+        assert_eq!(guard.witness_window(), (8, 10));
     }
 
     /// A pass with no witness run (sticky setup failure: no takeout,

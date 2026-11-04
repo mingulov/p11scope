@@ -3669,7 +3669,9 @@ fn k1_witness_round(
                 pins,
                 &mut witness,
                 0,
+                0,
             )
+            .0
         }
         false => crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
             &sweep,
@@ -3899,7 +3901,7 @@ fn k1_sweep_witness_fresh_row(
         // GREEN: the production witness route joins the fresh row.
         let mut budget = CaptureWorkBudget::default();
         let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
-        let out =
+        let (out, _) =
             crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
                 &sweep,
                 &BTreeSet::new(),
@@ -3912,6 +3914,7 @@ fn k1_sweep_witness_fresh_row(
                 &|| OsConfirmIo::with_pool(None),
                 &pins,
                 &mut witness,
+                0,
                 0,
             );
         let used = witness.used();
@@ -4159,7 +4162,7 @@ fn k1_sweep_witness_stale_row(
         let sweep = vec![(pid, stale.maps())];
         let mut budget = CaptureWorkBudget::default();
         let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::new();
-        let out =
+        let (out, _) =
             crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
                 &sweep,
                 &BTreeSet::new(),
@@ -4172,6 +4175,7 @@ fn k1_sweep_witness_stale_row(
                 &|| OsConfirmIo::with_pool(None),
                 &pins,
                 &mut witness,
+                0,
                 0,
             );
         let used = witness.used();

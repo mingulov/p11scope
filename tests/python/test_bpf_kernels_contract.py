@@ -217,6 +217,18 @@ class BpfKernelsContractTests(unittest.TestCase):
         job = self.bpf[match.start():self.bpf.index("bpf-load-host:")]
         self.assertIn("gcc", job)
 
+    def test_lib_cells_job_installs_the_provider_toolchain(self):
+        # The guest shares the runner rootfs, so the provider cells see
+        # only what this job installs: SoftHSM plus the p11-kit headers
+        # the privileged test shards install.
+        match = re.search(r"lib-cells-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",
+                          self.bpf, re.S)
+        self.assertTrue(match, "lib-cells-kernels names no matrix kernels")
+        job = self.bpf[match.start():self.bpf.index("bpf-load-host:")]
+        for package in ("softhsm2", "libp11-kit-dev"):
+            with self.subTest(package=package):
+                self.assertIn(package, job)
+
     def test_only_515_runs_the_denial_cell_for_its_denied_branch(self):
         branches = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true\n(?:\s+#.*\n)*\s+denial_branch: (\w+)",
                               self.bpf)

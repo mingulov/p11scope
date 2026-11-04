@@ -2271,6 +2271,33 @@ def main(argv=None):
         bad_safe = json.loads(json.dumps(safe))
         bad_safe["evidence"]["semantic_capture_failures"] = 4
         reject("safe profile failure total", lambda: assert_safe_profile(bad_safe))
+        # 64-bit targets publish no unregistered row at all.
+        extra_unreg = json.loads(json.dumps(safe))
+        extra_unreg["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        reject("safe profile 64-bit extra unregistered row",
+               lambda: assert_safe_profile(extra_unreg))
+        cgroup_unreg64 = json.loads(json.dumps(safe))
+        cgroup_unreg64["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+            ],
+        }]
+        reject("safe profile 64-bit cgroup unregistered row",
+               lambda: assert_safe_profile(cgroup_unreg64))
+        cgroup_extra64 = json.loads(json.dumps(safe))
+        cgroup_extra64["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
+            "mechanisms": [
+                {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
+                 "registered": True, "calls": 1, "errors": 0, "note": "x"},
+            ],
+        }]
+        reject("safe profile 64-bit cgroup extra key",
+               lambda: assert_safe_profile(cgroup_extra64))
 
         # 32-bit targets publish the narrow unknown ids as approved
         # registered:false rows; 64-bit targets keep them absent (the
@@ -2304,6 +2331,36 @@ def main(argv=None):
         }]
         reject("safe profile parameter value inside a registered:false row",
                lambda: assert_safe_profile(param_leak))
+        # The 32-bit unregistered set is exactly {UNKNOWN, MAXIMUM}.
+        extra32 = json.loads(json.dumps(safe32))
+        extra32["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        reject("safe profile 32-bit extra unregistered row",
+               lambda: assert_safe_profile(extra32))
+        wrong_hex = json.loads(json.dumps(safe32))
+        wrong_hex["mechanisms"][1]["mechanism_hex"] = "0x0"
+        reject("safe profile 32-bit unregistered hex mismatch",
+               lambda: assert_safe_profile(wrong_hex))
+        cgood = json.loads(json.dumps(safe32))
+        cgood["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+                {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
+                 "registered": True, "calls": 1, "errors": 0},
+            ],
+        }]
+        assert_safe_profile(cgood)
+        cextra = json.loads(json.dumps(cgood))
+        cextra["cgroups"][0]["mechanisms"][0]["note"] = "x"
+        reject("safe profile 32-bit cgroup extra key",
+               lambda: assert_safe_profile(cextra))
+        cwrong = json.loads(json.dumps(cgood))
+        cwrong["cgroups"][0]["mechanisms"][0]["mechanism"] = ALIASES["pss_hash"]
+        reject("safe profile 32-bit cgroup unregistered id",
+               lambda: assert_safe_profile(cwrong))
         initialize(64)
 
         initialize(64)
@@ -2372,6 +2429,46 @@ def main(argv=None):
         }]
         assert alias_hits(strip_approved_unregistered_rows(
             json.dumps(cgrouped).encode())) == {"pss_hash"}
+        # A leak inside an approved row survives the strip: only the id
+        # fields are removed, never the whole row.
+        for label, mutate in (
+            ("top-level calls", lambda doc: doc["mechanisms"][1].update(
+                calls=ALIASES["pss_hash"])),
+            ("top-level extra key", lambda doc: doc["mechanisms"][1].update(
+                note=f"0x{ALIASES['pss_hash']:x}")),
+        ):
+            leaky = json.loads(json.dumps(safe32))
+            mutate(leaky)
+            assert alias_hits(strip_approved_unregistered_rows(
+                json.dumps(leaky).encode())) == {"pss_hash"}, label
+        for label, mutate in (
+            ("cgroup calls", lambda row: row.update(calls=ALIASES["pss_hash"])),
+            ("cgroup extra key", lambda row: row.update(
+                note=f"0x{ALIASES['pss_hash']:x}")),
+        ):
+            cleaky = json.loads(json.dumps(safe32))
+            cleaky["cgroups"] = [{
+                "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+                "mechanisms": [
+                    {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                     "registered": False, "calls": 1, "errors": 0},
+                ],
+            }]
+            mutate(cleaky["cgroups"][0]["mechanisms"][0])
+            assert alias_hits(strip_approved_unregistered_rows(
+                json.dumps(cleaky).encode())) == {"pss_hash"}, label
+        # A wrong hex spelling is not the approved shape: the row stays
+        # whole, so the mechanism decimal still fails the scan.
+        bad_hex = json.loads(json.dumps(safe32))
+        bad_hex["mechanisms"][1]["mechanism_hex"] = "0x0"
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(bad_hex).encode())) == {"mechanism"}
+        # A duplicated JSON key refuses the strip: the raw bytes are
+        # scanned, so the approved decimal still fails.
+        dup = ('{"mechanisms": [{"mechanism": %d, "mechanism": %d, '
+               '"mechanism_hex": "0x%x", "registered": false, "calls": 1}]}'
+               % (UNKNOWN, UNKNOWN, UNKNOWN)).encode()
+        assert alias_hits(strip_approved_unregistered_rows(dup)) == {"mechanism"}
         token_line = f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(token_line)) == set()
         misplaced = token_line + f"note 0x{UNKNOWN:x}\n".encode()

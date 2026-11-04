@@ -601,10 +601,46 @@ fn joint_linked_broken_stream_resyncs_above_a_fenced_loss() {
         !(owner.adapter.invalidated || owner.adapter.stream_broken),
         "the re-sync clears the broken stream"
     );
+    assert_eq!(
+        owner.adapter.voided_through, lost_through,
+        "the fence lands exactly on the consumed history, never above it"
+    );
+}
+
+#[test]
+fn joint_linked_invalidated_stream_at_ordinal_exhaustion_keeps_gap_refusal() {
+    // The ordinal-exhaustion guard: an invalidated linked stream whose
+    // consumption ordinal is spent has no frontier to fence, so it keeps
+    // the fail-closed Gap refusal instead of re-syncing.
+    let events = EventsDomain::test_standin(0x61ab);
+    let retained = producers(&events);
+    assert!(retained.journal_linked());
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    owner.adapter.stream_broken = true;
+    owner.adapter.invalidated = true;
+    owner.adapter.consumed_through = u64::MAX;
+    let mut drain =
+        EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+    let next = RawJointQuantum::collect_bounded_with_adapter(
+        &mut drain,
+        &publish_object_descriptors(),
+        4,
+        None,
+        &SteadyFault(Cell::new(None)),
+        &retained,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    );
+    let err = next.err();
     assert!(
-        owner.adapter.voided_through >= lost_through,
-        "the lost window is voided: {} < {lost_through}",
-        owner.adapter.voided_through
+        matches!(
+            err,
+            Some(RawQuantumRefusal::Cut(
+                crate::semantics_objects::journal::BirthCutRefusal::Gap
+            ))
+        ),
+        "an exhausted ordinal stays fail-closed: {err:?}"
     );
 }
 

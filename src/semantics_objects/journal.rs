@@ -1256,18 +1256,24 @@ impl JournalAdapter {
         self.consumed_through
     }
 
-    /// Test-only read of the stream break flag: the re-sync
-    /// positives pin the broken stream after the malformed quantum
-    /// and its clearing on the next unlinked collect. Production
-    /// resolves and clears this only through `resolve_birth_cut`.
-    #[cfg(test)]
     /// Whether history through `ordinal` is voided: births naming a cut
-    /// at or below the voided ordinal refuse.
+    /// strictly below the voided ordinal refuse (`BelowVoidFence`).
     #[cfg(test)]
     pub(crate) fn voids_through_for_test(&self, ordinal: ConsumptionOrdinal) -> bool {
         self.voided_through >= ordinal.0
     }
 
+    /// Test-only read of the exact void fence.
+    #[cfg(test)]
+    pub(crate) fn voided_through_for_test(&self) -> u64 {
+        self.voided_through
+    }
+
+    /// Test-only read of the stream break flag: the re-sync
+    /// positives pin the broken stream after the malformed quantum
+    /// and its clearing on the next unlinked collect. Production
+    /// resolves and clears this only through `resolve_birth_cut`.
+    #[cfg(test)]
     pub(crate) fn stream_broken_for_test(&self) -> bool {
         self.stream_broken
     }
@@ -3501,15 +3507,19 @@ impl JournalAdapter {
             // stream instead.
             //
             // A linked lane re-syncs only after an unlocalized raw
-            // disposal (`invalidated`): that disposal already refused
-            // every key (their Joint output stays lossy, never
-            // recovered), voided all staged custody and disclosed the
-            // named gap. Fencing the consumed interval makes every
-            // later birth name a cut above it, so nothing in the lost
-            // window is ever certified. A break without that disposal
-            // (staged custody still held across the hole), an
-            // exhausted ordinal space and a stopped adapter keep the
-            // fail-closed refusal.
+            // disposal (`invalidated`), whatever its cause: a malformed
+            // record, a changed or unreadable fault counter, a
+            // non-contiguous cut, a failed collection or an image-0
+            // record. That disposal already refused every key (their
+            // Joint output stays lossy, never recovered), voided all
+            // staged custody and disclosed its named gap. Fencing the
+            // consumed interval makes every later birth name a cut at
+            // or above it (births strictly below refuse), so nothing in
+            // the lost window is ever certified. A break without that
+            // disposal (staged custody still held across the hole), a
+            // spent consumption ordinal (`consumed_through == MAX`,
+            // which leaves no frontier to fence) and a stopped adapter
+            // keep the fail-closed refusal.
             let linked = producers.journal_linked();
             let resyncs = !self.stopped
                 && (!linked || (self.invalidated && self.consumed_through != u64::MAX));
@@ -12067,6 +12077,108 @@ pub(crate) mod tests {
         .expect("absence at the fence attests");
         let success = scene.seal(&resume).expect("absence at the fence seals");
         assert_eq!(success.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_linked_resync_fence_admits_only_post_fence_births() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // A linked lane re-syncs after an unlocalized raw disposal only
+        // above a fence on the consumed history. Pre-loss keys stay
+        // refused; a new key's birth at the fence attests and seals,
+        // and a birth strictly below the fence refuses.
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let lost_through = scene.adapter.consumed_through;
+        assert!(lost_through >= 2, "the pre-loss history was consumed");
+        let failure = scene.adapter.refuse_disposed_raw(
+            &mut scene.model,
+            std::iter::empty(),
+            true,
+            JournalGap::Malformed,
+        );
+        assert_eq!(failure.gap, JournalGap::Malformed);
+        assert!(scene.adapter.invalidated);
+        assert!(scene.adapter.proof_refused_for_test(y_proof));
+
+        // The real re-sync on the linked producers fences exactly the
+        // consumed history.
+        let producers = scene.producers();
+        assert!(producers.journal_linked());
+        assert!(scene.adapter.bind_resource_producers(&producers));
+        let cut = crate::events::EventDrain::over_domain(
+            crate::events::ScriptedRecords::records(Vec::<Vec<u8>>::new(), 1),
+            scene.retained_events.clone(),
+        )
+        .consumption_cut()
+        .expect("an idle drain names its cut");
+        let resolved = scene.adapter.resolve_birth_cut(&cut, &producers);
+        assert!(
+            resolved.is_ok(),
+            "the linked lane re-syncs: {:?}",
+            resolved.err()
+        );
+        assert!(!(scene.adapter.invalidated || scene.adapter.stream_broken));
+        assert_eq!(
+            scene.adapter.voided_through, lost_through,
+            "the fence is exactly the consumed history"
+        );
+
+        // A new key's history above the fence.
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let x_begin = begin_bytes_image(2, 1, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest(&x_begin);
+        let x_end = end_bytes(&x_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&x_end), JournalDisposition::EndStaged);
+        let mut x_fixture = AttestationFixture::new(x_image);
+        let x_proof = scene.admit_other_end(&mut x_fixture, "C_CreateObject", &x_end);
+        assert!(!scene.adapter.proof_refused_for_test(x_proof));
+        // Strictly below the fence refuses.
+        assert_eq!(
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(
+                    x_proof,
+                    BirthKind::ExecMarker,
+                    lost_through - 1,
+                    scene.closure_generation()
+                )
+            ),
+            Err(BirthRefusal::BelowVoidFence)
+        );
+        // Exactly at the fence, an exec birth (first seen above the
+        // cut) attests and seals the new history.
+        let resume = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(
+                x_proof,
+                BirthKind::ExecMarker,
+                lost_through,
+                scene.closure_generation(),
+            ),
+        )
+        .expect("a post-fence birth attests");
+        let success = scene.seal(&resume).expect("a post-fence birth seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+
+        // The pre-loss key stays refused at the seal.
+        let y_bootstrap = BootstrapReceipt::scripted(
+            y_proof,
+            BirthKind::AbsenceAppearance,
+            lost_through,
+            scene.closure_generation(),
+        );
+        let refused = scene
+            .seal(&y_bootstrap)
+            .expect_err("a pre-loss key never seals after the re-sync");
+        assert_eq!(refused.gap, JournalGap::DomainTainted);
     }
 
     #[test]

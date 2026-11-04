@@ -25,7 +25,7 @@ use crate::discovery::identity::{
     PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
-    open_view_executable_cached, open_view_rooted_object_cached,
+    open_view_executable_cached, open_view_rooted_object_cached, opened_file_matches_maps,
     pin_manifest_objects_deferred_in_views_with_budget, pin_of,
     pin_prearm_objects_in_views_with_budget, pin_scanned_view_objects, preexec_object_key,
     retained_object_key_cached, self_mapped_fallback_key, target_paths_equal,
@@ -9458,6 +9458,24 @@ fn loader_snapshot_for_fd(
     }
 }
 
+/// Whether a pinned loader key agrees with a freshly opened locator key
+/// across the pre-6.8 overlayfs maps-identity split. The pre-exec pin
+/// carries the kernel maps identity on overlayfs while the locator key
+/// comes from the opened fd, so a plain comparison refuses the same
+/// loader on split kernels. Equal keys accept without consulting the
+/// probe; a split accepts only when the kernel renders this exact fd at
+/// the pinned maps key, and anything else — including a probe that
+/// cannot decide — refuses.
+fn loader_pin_matches_locator(
+    pin_key: ObjectKey,
+    locator_key: ObjectKey,
+    file: &std::fs::File,
+    budget: &mut CaptureWorkBudget,
+    probe: &impl SelfMappingProbe,
+) -> bool {
+    opened_file_matches_maps(file, locator_key, pin_key, budget, probe)
+}
+
 fn unique_mapping_for_offset(
     mappings: &[MapEntry],
     offset: u64,
@@ -16305,13 +16323,26 @@ impl Engine {
         let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
             return Ok(None);
         };
+        let pin_key = self.pinned.summary(spec.loader).map(|loader| loader.key);
         let loader_file = self.pinned.file_for(spec.loader);
-        let valid =
-            self.pinned.summary(spec.loader).is_some_and(|loader| {
-                loader.key == ObjectKey::of(mapping) && loader.key == locator.authority.loader_key
-            }) && loader_file.is_some_and(|file| {
+        let keys_agree = match (pin_key, loader_file) {
+            (Some(pin_key), Some(file)) => {
+                pin_key == ObjectKey::of(mapping)
+                    && loader_pin_matches_locator(
+                        pin_key,
+                        locator.authority.loader_key,
+                        file,
+                        &mut self.budget,
+                        &KernelSelfMappingProbe,
+                    )
+            }
+            _ => false,
+        };
+        let valid = keys_agree
+            && loader_file.is_some_and(|file| {
                 FileSnapshot::read(file).ok().as_ref() == Some(&locator.authority.interpreter_file)
-            }) && unique_mapping_for_offset(&locator.authority.loader_maps, spec.hook.file_offset)
+            })
+            && unique_mapping_for_offset(&locator.authority.loader_maps, spec.hook.file_offset)
                 .is_ok_and(|current| current == *mapping);
         Ok(valid.then_some(locator.authority))
     }
@@ -29915,11 +29946,20 @@ impl Engine {
             else {
                 continue;
             };
-            let valid = self
-                .pinned
-                .summary(spec.loader)
-                .is_some_and(|loader| loader.key == locator.authority.loader_key)
-                && self.pinned.file_for(spec.loader).is_some_and(|file| {
+            let pin_key = self.pinned.summary(spec.loader).map(|loader| loader.key);
+            let loader_file = self.pinned.file_for(spec.loader);
+            let keys_agree = match (pin_key, loader_file) {
+                (Some(pin_key), Some(file)) => loader_pin_matches_locator(
+                    pin_key,
+                    locator.authority.loader_key,
+                    file,
+                    &mut self.budget,
+                    &KernelSelfMappingProbe,
+                ),
+                _ => false,
+            };
+            let valid = keys_agree
+                && loader_file.is_some_and(|file| {
                     FileSnapshot::read(file).ok().as_ref()
                         == Some(&locator.authority.interpreter_file)
                 })

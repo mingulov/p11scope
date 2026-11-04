@@ -25122,6 +25122,75 @@ fn loader_snapshot_retries_on_the_probed_overlay_key() {
 }
 
 #[test]
+fn loader_pin_match_accepts_equal_keys_without_probe() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, _maps_key, _maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(true, None);
+    assert!(loader_pin_matches_locator(
+        fd_key,
+        fd_key,
+        &file,
+        &mut budget,
+        &probe
+    ));
+    assert_eq!(probe.overlay_checks.get(), 0);
+    assert_eq!(probe.probes.get(), 0);
+}
+
+#[test]
+fn loader_pin_match_accepts_split_identity_on_probe_proof() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, maps_key, _maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
+    assert!(loader_pin_matches_locator(
+        maps_key,
+        fd_key,
+        &file,
+        &mut budget,
+        &probe
+    ));
+    assert_eq!(probe.probes.get(), 1);
+}
+
+#[test]
+fn loader_pin_match_refuses_genuine_mismatch() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    use p11scope_manifest::maps::Device;
+    let (fd_key, maps_key, _maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let other = ObjectKey {
+        device: Device { major: 9, minor: 9 },
+        inode: maps_key.inode,
+    };
+    let probe = FakeSelfMappingProbe::new(true, Some(other));
+    assert!(!loader_pin_matches_locator(
+        maps_key,
+        fd_key,
+        &file,
+        &mut budget,
+        &probe
+    ));
+}
+
+#[test]
+fn loader_pin_match_refuses_split_off_overlay() {
+    use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
+    let (fd_key, maps_key, _maps, _dir, file) = overlay_split_snapshot_fixture();
+    let mut budget = CaptureWorkBudget::default();
+    let probe = FakeSelfMappingProbe::new(false, Some(maps_key));
+    assert!(!loader_pin_matches_locator(
+        maps_key,
+        fd_key,
+        &file,
+        &mut budget,
+        &probe
+    ));
+    assert_eq!(probe.probes.get(), 0);
+}
+
+#[test]
 fn matching_snapshot_never_consults_the_probe() {
     use crate::discovery::identity::test_fixture::FakeSelfMappingProbe;
     let (fd_key, _, _, _dir, file) = overlay_split_snapshot_fixture();

@@ -726,6 +726,11 @@ class BrowserCells(unittest.TestCase):
         """The 5s regression signal survives as a named threshold."""
         self.assertEqual(cells.SLOW_ATTACH_WARN_SECONDS, 5)
 
+    def test_strict_attach_sites_reference_the_ruled_bound(self):
+        """All strict sites use cells.ATTACH_GRACE_SECONDS, never a literal."""
+        violations = strict_attach_grace_literals(Path(__file__).read_text())
+        self.assertEqual(violations, [])
+
     def test_capture_ready_parsing(self):
         """Unit: the readiness marker parses to its attached-probe count."""
         self.assertEqual(
@@ -1727,6 +1732,42 @@ class BrowserS1Oracle(unittest.TestCase):
         self.assertEqual(
             attach_cells_with_opened_floor(template % '{"sessions_opened_min": 1}'),
             ["test_probe_cell"])
+
+
+def strict_attach_grace_literals(source):
+    """Strict `attach_drive` sites that bypass the ruled bound constant.
+
+    Parses ``source`` (this suite file), finds every
+    ``attach_grace_seconds=`` keyword in ``BrowserCells`` methods, and
+    returns the violating ``(method, lineno)`` sites: any site whose
+    value is not the ``cells.ATTACH_GRACE_SECONDS`` attribute, except
+    the readiness probe's ``grace_seconds`` passthrough. A stale
+    literal (``=5`` breaks strict cells, ``=30`` silently re-widens
+    the ruled bound) lands here.
+    """
+    violations = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "BrowserCells":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            for call in ast.walk(item):
+                if not isinstance(call, ast.Call):
+                    continue
+                for keyword in call.keywords:
+                    if keyword.arg != "attach_grace_seconds":
+                        continue
+                    value = keyword.value
+                    if isinstance(value, ast.Name) and value.id == "grace_seconds":
+                        continue
+                    if (isinstance(value, ast.Attribute)
+                            and isinstance(value.value, ast.Name)
+                            and value.value.id == "cells"
+                            and value.attr == "ATTACH_GRACE_SECONDS"):
+                        continue
+                    violations.append((item.name, getattr(keyword, "lineno", 0)))
+    return violations
 
 
 if __name__ == "__main__":

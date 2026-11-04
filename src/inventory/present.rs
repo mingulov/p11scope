@@ -1431,13 +1431,14 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
         use crate::key_operation_projection::ObsStatus;
         let observations = &presentation.object_observations;
         if observations.status == ObsStatus::Unavailable {
-            // v0.5.0 ships no journal producer: say plainly that this
-            // version never reports key operations (OD33/R-50). Other
-            // reasons keep the generic unavailable wording.
+            // No journal producer is linked (the default without
+            // --key-operations, or a build without the journal object):
+            // say plainly that per-key tracking is off (OD33/R-50).
+            // Other reasons keep the generic unavailable wording.
             if observations.reason == "journal_unavailable" {
                 let _ = writeln!(
                     out,
-                    "key operations: not reported by this version (planned for 0.6.0)"
+                    "key operations: not reported (per-key tracking is off)"
                 );
             } else {
                 let _ = writeln!(out, "key operations: unavailable ({})", observations.reason);

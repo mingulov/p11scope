@@ -5014,9 +5014,9 @@ fn commit_semantic_finish(
 /// before the display opens, so the classic sink is correct on both
 /// paths. A promotion seals its new lane silently (its install and
 /// end already disclose through gaps); only the run's first seal
-/// readies users and scripts. v0.5.0 seals no key-operation lane
-/// (OD33/R-50), so the line says so plainly.
-const SEMANTIC_SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)";
+/// readies users and scripts. Key operations record only on the
+/// opted-in lane, so the line says so plainly.
+const SEMANTIC_SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
 
 /// Note the lane seal once, through the classic stderr sink.
 fn note_semantic_lane_sealed() {
@@ -24777,7 +24777,7 @@ mod seal_readiness_tests {
 
     /// The exact seal line, pinned as a literal: the wording is the
     /// contract with users and scripts, independent of the builder.
-    const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)";
+    const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(

@@ -1957,7 +1957,7 @@ impl CallerRegistry {
             caller: None,
             module: None,
             pid: None,
-            subject: "key operations are planned for 0.6.0; this capture keeps S1 mechanisms and API results"
+            subject: "per-key tracking is off; this capture keeps S1 mechanisms and API results"
                 .into(),
             reason: "joint_journal_unavailable".into(),
             budget: None,
@@ -4082,11 +4082,11 @@ mod object_tail_binding_tests {
     }
 }
 
-/// OD33/R-50: v0.5.0 links the object-journal producer into no BPF
-/// flavor, so no live run installs a key-operation (Joint) feed. An
-/// installed birth receipt on an unlinked attachment routes to S1Only
-/// (the backstop), the lane discloses once, S1 mechanisms and API
-/// returns stay exact, and `object_observations` reports
+/// OD33/R-50: with no journal producer linked (the default without
+/// --key-operations), no live run installs a key-operation (Joint)
+/// feed. An installed birth receipt on an unlinked attachment routes
+/// to S1Only (the backstop), the lane discloses once, S1 mechanisms
+/// and API returns stay exact, and `object_observations` reports
 /// `unavailable` with `journal_unavailable`.
 #[cfg(test)]
 mod journal_unavailable_tests {
@@ -4098,7 +4098,7 @@ mod journal_unavailable_tests {
     };
 
     const PLAN_TEXT: &str =
-        "key operations are planned for 0.6.0; this capture keeps S1 mechanisms and API results";
+        "per-key tracking is off; this capture keeps S1 mechanisms and API results";
     const MECHANISM: u64 = 0x40;
     const RV_OK: u64 = 0;
     const RV_SIGNATURE_INVALID: u64 = 0xc0;

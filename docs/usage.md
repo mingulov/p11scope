@@ -6,13 +6,13 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.5.0.** This source provides `doctor`,
+> **Status: v0.6.0.** This source provides `doctor`,
 > `inspect`, `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with PID, cgroup and system scopes, offline `diff`
-> comparison and diagnostics), with memory-scan discovery,
+> comparison and diagnostics, and opt-in live key operations), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
 > per-edge entry counts, FULL object-attribute capture in release builds
-> (P0 stays an explicit option), and schema v3; its
+> (P0 stays an explicit option), repeatable `--exclude-module`, and schema v3; its
 > [known limitations](../CHANGELOG.md#known-limitations) apply throughout,
 > [Install](../README.md#install) distinguishes the source build from the
 > older v0.3.0 binary downloads, and
@@ -988,15 +988,17 @@ Limits that matter in pods:
   application app-first-driver [c0 pid 4242 incarnation 0] -> module app-p1.so [m0]: Module mapped; activity not captured; coverage unknown (scan only)
   ```
 
-  The header also carries a key-operation summary line. In this
-  version key operations are never reported, so it reads
-  `key operations: not reported by this version (planned for 0.6.0)`.
-  From 0.6.0, once populated, it counts completions per operation
-  category, e.g.
+  The header also carries a key-operation summary line. Once key
+  operations populate (opt in with `--key-operations`), it counts
+  completions per operation category, e.g.
   `key operations: rev 1 populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active operations`.
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.
+  A linked capture whose key-operation tracking never starts reads
+  `key operations: unavailable (bootstrap_unavailable)`. Without the
+  opt-in, or on a build without the journal object, the line reads
+  `key operations: not reported (per-key tracking is off)`.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.

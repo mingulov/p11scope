@@ -66,7 +66,7 @@ if scenario == "exit-0-silent":
     sys.exit(0)
 if scenario == "die-at-3":
     sys.stderr.write("p11scope: semantic lane ready; mechanisms and API results are recorded"
-                     " from now on (key operations: planned for 0.6.0)\\n")
+                     " from now on (key operations: recorded only with --key-operations)\\n")
     sys.stderr.flush()
     time.sleep(3)
     sys.exit(3)
@@ -74,7 +74,7 @@ if scenario == "accept-with-token":
     sys.stderr.write("p11scope: journal-pair-unavailable-in-build: this build omits"
                      " the production journal object\\n")
 sys.stderr.write("p11scope: semantic lane ready; mechanisms and API results are recorded"
-                 " from now on (key operations: planned for 0.6.0)\\n")
+                 " from now on (key operations: recorded only with --key-operations)\\n")
 sys.stderr.flush()
 DOCS = {"populated": ("populated", "rev 1"),
         "unavailable-empty": ("unavailable", ""),

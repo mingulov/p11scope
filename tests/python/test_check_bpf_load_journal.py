@@ -72,20 +72,20 @@ def journal_rows():
 
 
 LINKED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
-p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0
 key operations: unavailable (bootstrap_unavailable)
 """
 
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
-p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0
-key operations: not reported by this version (planned for 0.6.0)
+key operations: not reported (per-key tracking is off)
 """
 
 IDLE_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
-p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)
-key operations: not reported by this version (planned for 0.6.0)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
+key operations: not reported (per-key tracking is off)
 """
 
 TOOL_SOURCE = r'''
@@ -199,10 +199,11 @@ class JournalGateTests(unittest.TestCase):
             "missing-root": {"rc": 0, "text": LINKED_TEXT},
             "unlinked": {"rc": 0, "text": LINKED_TEXT.replace(
                 "key operations: unavailable (bootstrap_unavailable)",
-                "key operations: not reported by this version (planned for 0.6.0)")},
+                "key operations: not reported (per-key tracking is off)")},
             "refused-build": {"rc": 0, "text":
                 "p11scope: semantic lane ready; mechanisms and API results "
-                "are recorded from now on (key operations: planned for 0.6.0)\n"
+                "are recorded from now on (key operations: recorded only "
+                "with --key-operations)\n"
                 "gap [key operations unavailable] "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object; broad inventory continues "

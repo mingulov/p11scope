@@ -1582,7 +1582,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("until", result.stdout)
 
     def test_skip_entry_with_expired_until_fails(self):
-        # Cargo.toml still says 0.5.0 while 0.6.0 is under development,
+        # The release under development is 0.6.0 (DEVELOPMENT_VERSION),
         # so "0.6.0" (the stale "deferred to 0.6.0") is already expired.
         for until in ("0.5.0", "0.6.0", "0.6"):
             with self.subTest(until=until):

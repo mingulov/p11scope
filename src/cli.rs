@@ -630,7 +630,7 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and attaches proved offsets through the inventory lane, with one interval row per input in `prearm[]`; requires auto or native.
 --key-operations opts in to per-key tracking through a linked journal session (default off); requires --capture auto or native, and a build with the journal object.
-Per-edge mechanisms and API results are recorded with or without it; key operations are planned for 0.6.0.
+In this version it adds per-key operation rows once tracking starts; mechanisms and API results are reported with or without it.
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
@@ -2120,12 +2120,12 @@ mod tests {
     }
 
     #[test]
-    fn inventory_help_states_manifest_s1_scope_and_planned_key_operations() {
+    fn inventory_help_states_manifest_s1_scope_and_opt_in_key_operations() {
         let help = HelpTopic::Inventory.text();
         assert!(
             help.contains(
-                "Per-edge mechanisms and API results are recorded with or without it; \
-                 key operations are planned for 0.6.0."
+                "In this version it adds per-key operation rows once tracking starts; \
+                 mechanisms and API results are reported with or without it."
             ),
             "{help}"
         );

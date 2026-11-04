@@ -2486,7 +2486,7 @@ class JointActiveGate(unittest.TestCase):
 
     def test_unlinked_disclosure_gap_fails(self):
         for subject in ("semantic lane disclosure",
-                        "key operations are planned for 0.6.0; "
+                        "per-key tracking is off; "
                         "this capture keeps S1 mechanisms and API results"):
             with tempfile.TemporaryDirectory(prefix="joint-discl-") as tmp:
                 def mutate(doc, subject=subject):

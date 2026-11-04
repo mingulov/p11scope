@@ -1550,7 +1550,7 @@ mod tests {
         assert_eq!(
             registry.staged_scope_gaps_for_test(),
             [(
-                "key operations are planned for 0.6.0; this capture keeps S1 mechanisms and API results"
+                "per-key tracking is off; this capture keeps S1 mechanisms and API results"
                     .to_string(),
                 "joint_journal_unavailable".to_string()
             )],

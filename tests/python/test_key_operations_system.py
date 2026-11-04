@@ -48,7 +48,7 @@ case $scenario in
         exit "$code"
         ;;
 esac
-echo "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: planned for 0.6.0)" >&2
+echo "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)" >&2
 sleep "${FAKE_OBSERVE_S:-8}"
 ring=0
 gaps="[]"

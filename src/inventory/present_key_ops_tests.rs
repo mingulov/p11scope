@@ -240,14 +240,14 @@ fn key_ops_line_unavailable_names_reason() {
 }
 
 #[test]
-fn key_ops_line_journal_unavailable_names_planned_version() {
+fn key_ops_line_journal_unavailable_names_tracking_off() {
     let presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: not reported by this version (planned for 0.6.0)",
-        "journal_unavailable names the planned version:\n{snapshot}"
+        "key operations: not reported (per-key tracking is off)",
+        "journal_unavailable names tracking off:\n{snapshot}"
     );
 }
 

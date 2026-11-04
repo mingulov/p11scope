@@ -13,13 +13,13 @@ available function-table or export evidence, including stripped providers
 when their tables can be acquired; probes attach by file offset. Saved inventory
 snapshots support offline comparison; detailed profiles support investigation.
 
-> **Status: v0.5.0** adds FULL object-attribute capture in release builds
-> (P0 stays an explicit option), a `key operations:` line in text inventory
-> snapshots (reading `not reported by this version (planned for 0.6.0)`),
-> a named `--max-endpoints` hint on over-budget plans, and
-> kernel-thread handling and discovery through a retained single live
-> survivor after an already-observed leader exits. Groups first met after
-> leader exit remain unadmitted. Read the
+> **Status: v0.6.0** answers "which application used which key, and how":
+> inventory captures gain opt-in live key operations with per-category
+> counts (`inventory --key-operations`), a counter capture can promote
+> one endpoint to full detail (`--select-endpoint`), repeatable
+> `--exclude-module` skips named providers, more provider tables prove
+> complete instead of reading PARTIAL, and live capture resolves newer
+> kernels (7.3, 7.4-rc1). Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on a
 > capture. `--system` selects whole-machine scope;
@@ -76,7 +76,7 @@ refund Inventory IDs during a capture.
 | --- | --- | --- |
 | Automatic discovery | Mapped providers, observed usage and physical entry counts; `profile`/`trace` add observed return values and timing | Complete coverage of every process or early call; names need separate layout/export evidence |
 | An explicitly accepted `--manifest` for the exact provider | Named offsets and admitted mechanism/API semantics | Trust in arbitrary provider code or recovery of calls before attachment |
-| FULL attribute capture | The approved bounded attribute reads | Public live per-key results: these remain unavailable in v0.5.0 and planned for 0.6.0 |
+| FULL attribute capture | The approved bounded attribute reads | Public live per-key results: unavailable in v0.5.0; v0.6.0 reports them through the opt-in `inventory --key-operations` ([limits](docs/known-limitations.md#known-limitations-in-060)) |
 
 A mapped library is not proof of use. Zero observed calls or zero event loss
 does not establish that no calls happened before probes attached. Check the
@@ -94,7 +94,7 @@ known limitations, [Install](#install) to build and install it, and
 [docs/usage.md](docs/usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
-The v0.5.0 user-facing limits live in
+The v0.6.0 user-facing limits live in
 [docs/known-limitations.md](docs/known-limitations.md).
 
 Saved inventories can be compared offline with
@@ -176,10 +176,12 @@ assets and local release-mode builds.
 ## Install
 
 p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
-with no binary bundles. No v0.5.0 tag or binary bundles are published
-yet; build current source as described in
-[Build locally from source](#build-locally-from-source). GitHub's
-automatic source archive still needs the dependency inputs described above.
+with no binary bundles. v0.5.0 was published on 2026-10-29
+([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
+No v0.6.0 tag or binary bundles are published yet; build current source
+as described in [Build locally from source](#build-locally-from-source).
+GitHub's automatic source archive still needs the dependency inputs
+described above.
 
 The older [v0.3.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 provides a static x86-64 Linux observer bundle, optional glibc and musl discovery

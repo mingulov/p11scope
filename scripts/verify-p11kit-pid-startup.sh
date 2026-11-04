@@ -22,7 +22,10 @@
 #
 # Needs root for the observer (sudo -n), plus gcc, the p11-kit trust and
 # proxy modules, opensc and softhsm2. Provider paths are probed (Debian and
-# Fedora layouts); nothing is hard-coded.
+# Fedora layouts); nothing is hard-coded. opensc also needs its PC/SC client
+# library resolvable (libpcsclite.so.1, Debian/Ubuntu libpcsclite1): without
+# it opensc fails C_Initialize, p11-kit silently drops that backend, and the
+# holder drives 2 x 5 instead of 3 x 5.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -111,6 +114,14 @@ GAP_MUST_LACK = (
 def require(ok, reason):
     if not ok:
         raise SystemExit("cell failed: " + reason)
+
+
+def require_resolvable(soname, purpose):
+    try:
+        ctypes.CDLL(soname)
+    except OSError as err:
+        require(False, "%s does not resolve (%s): %s"
+                       % (soname, purpose, err))
 
 
 def probe(candidates):
@@ -334,6 +345,16 @@ def self_test():
             continue
         require(False, "self-test negative %r did not fail" % (name,))
     print("self-test: %d negatives rejected" % len(negatives))
+    require_resolvable("libc.so.6", "self-test positive control")
+    print("self-test: soname probe resolves libc.so.6")
+    try:
+        require_resolvable("libp11scope-no-such-soname.so.0",
+                           "self-test negative control")
+    except SystemExit:
+        pass
+    else:
+        require(False, "self-test negative soname probe did not fail")
+    print("self-test: soname probe rejects an unresolvable name")
 
 
 def tail(path, n=30):
@@ -366,6 +387,11 @@ def main(binary, work, keep):
         ctypes.CDLL("libp11-kit.so.0")
     except OSError as err:
         require(False, "libp11-kit.so.0 does not resolve: %s" % (err,))
+    require_resolvable(
+        "libpcsclite.so.1",
+        "opensc fails C_Initialize without its PC/SC client library "
+        "(Debian/Ubuntu: libpcsclite1)",
+    )
     sudo = subprocess.run(["sudo", "-n", "true"])
     require(sudo.returncode == 0, "sudo -n is required for the observer")
     require(HOLDER_SRC.is_file(), "holder source missing: %s" % HOLDER_SRC)

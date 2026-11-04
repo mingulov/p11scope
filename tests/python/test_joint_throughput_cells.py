@@ -30,7 +30,9 @@ SCRIPT = ROOT / "scripts/ci/joint-throughput.sh"
 def run_script(argv, env=None, timeout=60):
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS",
+                           "JOINT_KEYOPS", "INTRUDER_AT", "INTRUDER_INIT",
+                           "INTRUDER_HOLD", "INTRUDER_COUNT", "INTRUDER_COPY")}
     if env:
         base.update(env)
     return subprocess.run([str(SCRIPT), *argv], capture_output=True,
@@ -44,7 +46,9 @@ def run_sourced(shell, env=None, timeout=60):
     """
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
-                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS")}
+                           "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS",
+                           "JOINT_KEYOPS", "INTRUDER_AT", "INTRUDER_INIT",
+                           "INTRUDER_HOLD", "INTRUDER_COUNT", "INTRUDER_COPY")}
     if env:
         base.update(env)
     base["JOINT_TP_SOURCED"] = "1"
@@ -153,6 +157,31 @@ class CellScriptLibrary(unittest.TestCase):
         self.assertEqual(proc.stdout.strip().splitlines(),
                          ["P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1",
                           "P11SCOPE_STAGE_TIMINGS=1"])
+
+    def test_start_intruder_is_off_unless_requested(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-intr-") as tmp:
+            proc = run_sourced(f'start_intruder "{tmp}"; wait')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((Path(tmp) / "intruder.log").exists())
+
+    def test_start_intruder_maps_the_provider_and_logs_its_exit(self):
+        provider = run_sourced('select_provider').stdout.strip()
+        self.assertTrue(Path(provider).is_file(), provider)
+        for copy in ("0", "1"):
+            with tempfile.TemporaryDirectory(prefix="jtp-intr-") as tmp:
+                proc = run_sourced(
+                    f'PROVIDER="{provider}"; start_intruder "{tmp}"; wait',
+                    env={"INTRUDER_AT": "0", "INTRUDER_HOLD": "0",
+                         "INTRUDER_COUNT": "2", "INTRUDER_COPY": copy})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                log = (Path(tmp) / "intruder.log").read_text(encoding="utf-8")
+                self.assertRegex(log, r"(?m)^start ")
+                self.assertRegex(log, r"(?m)^mapped ")
+                self.assertRegex(log, r"(?m)^exit .* rc=0$")
+                self.assertNotIn("C_Initialize", log)
+                self.assertEqual(
+                    (Path(tmp) / "intruder-provider.so").is_file(),
+                    copy == "1")
 
     def test_select_provider_finds_a_live_library(self):
         proc = run_sourced('select_provider')

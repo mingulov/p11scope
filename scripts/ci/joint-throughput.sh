@@ -23,6 +23,19 @@
 #   OBS_MARGIN
 #             observer seconds beyond DURATION for startup, the two
 #             admission passes and drain (default 90)
+#   JOINT_KEYOPS
+#             =0 runs the joint cells' --system observer without
+#             --key-operations (an S1-only control; the Joint oracle
+#             then fails by design, read observer.out's call line)
+#   INTRUDER_AT
+#             seconds after GO at which a second, foreign process maps
+#             the provider (unset: none). It makes no PKCS#11 call
+#             unless INTRUDER_INIT=1 (C_GetFunctionList, C_Initialize,
+#             C_Finalize), holds the mapping INTRUDER_HOLD seconds
+#             (default 3) and exits; times go to intruder.log.
+#             INTRUDER_COUNT (default 1) starts that many at once (the
+#             extra ones map only); INTRUDER_COPY=1 maps a private
+#             copy of the provider (a new file identity) instead
 #   SETTLEMENT_LAT
 #             =1 records the diagnostic per-call ENTRY-to-settle
 #             delays in the observer (1 ms buckets) and prints the
@@ -466,6 +479,45 @@ sample_load() {
     fi
 }
 
+# Optional foreign provider mapper INTRUDER_AT seconds after GO (see the
+# header). Runs detached; the cell never waits for it beyond its hold.
+start_intruder() {
+    [ -n "${INTRUDER_AT:-}" ] || return 0
+    (
+        sleep "$INTRUDER_AT"
+        printf 'start %s\n' "$(date +%s.%N)" >"$1/intruder.log"
+        lib=$PROVIDER
+        if [ "${INTRUDER_COPY:-0}" = 1 ]; then
+            lib="$1/intruder-provider.so"
+            cp "$PROVIDER" "$lib"
+        fi
+        n=1
+        while [ "$n" -lt "${INTRUDER_COUNT:-1}" ]; do
+            python3 -I -c 'import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); time.sleep(float(sys.argv[2]))' \
+                "$lib" "${INTRUDER_HOLD:-3}" >/dev/null 2>&1 &
+            n=$((n + 1))
+        done
+        python3 -I -c '
+import ctypes, sys, time
+lib = ctypes.CDLL(sys.argv[1])
+print("mapped", time.time(), flush=True)
+if sys.argv[3] == "1":
+    table = ctypes.c_void_p()
+    rv = lib.C_GetFunctionList(ctypes.byref(table))
+    print("C_GetFunctionList", rv, flush=True)
+    init = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+    fin = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+    funcs = ctypes.cast(table, ctypes.POINTER(ctypes.c_void_p))
+    print("C_Initialize", init(funcs[1])(None), flush=True)
+    time.sleep(float(sys.argv[2]))
+    print("C_Finalize", fin(funcs[2])(None), flush=True)
+else:
+    time.sleep(float(sys.argv[2]))
+' "$lib" "${INTRUDER_HOLD:-3}" "${INTRUDER_INIT:-0}" >>"$1/intruder.log" 2>&1
+        printf 'exit %s rc=%s\n' "$(date +%s.%N)" "$?" >>"$1/intruder.log"
+    ) &
+}
+
 # Prove the FINISH hold: DONE printed, PID alive, provider still mapped.
 prove_hold() {
     dir=$1
@@ -585,12 +637,14 @@ run_joint_cell() {
     exec 9>"$LOCK_FILE"
     flock 9
     log "$cell: lock held; starting the observer for ${obs_dur}s"
+    keyops_flag=--key-operations
+    [ "${JOINT_KEYOPS:-1}" = 0 ] && keyops_flag=
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
     # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
     sudo -n $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
-        --key-operations --duration "$obs_dur" --json -o "$dir/report.json" \
+        $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     echo $! > "$dir/observer.pid"
     if ! wait_for_line "p11scope: pass 0:" "$dir/observer.out" 300; then
@@ -657,6 +711,7 @@ run_joint_cell() {
     fi
     log "$cell: opening GO"
     touch "$dir/go"
+    start_intruder "$dir"
     log "$cell: generator running; waiting for DONE"
     if ! wait_for_line "DONE" "$dir/gen.out" $((DURATION + 240)); then
         log "$cell: DONE never printed"
@@ -762,6 +817,7 @@ run_twin_cell() {
     log "$cell: pass 0 published; opening GO"
     sample_load
     touch "$dir/go"
+    start_intruder "$dir"
     log "$cell: waiting for DONE"
     if ! wait_for_line "DONE" "$dir/gen.out" $((DURATION + 240)); then
         log "$cell: DONE never printed"

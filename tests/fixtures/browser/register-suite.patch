@@ -15,7 +15,7 @@ new file mode 100644
 index 00000000..9ed01bfe
 --- /dev/null
 +++ b/tests/python/test_browser_cells.py
-@@ -0,0 +1,1358 @@
+@@ -0,0 +1,1360 @@
 +# SPDX-License-Identifier: GPL-3.0-or-later
 +"""G33 browser application cells: real Firefox/Chromium PKCS#11 traffic.
 +
@@ -675,8 +675,10 @@ index 00000000..9ed01bfe
 +                        "navigation never ran after slow readiness")
 +        self.assertIn("slow attach", stderr,
 +                      "slow attach left no regression warning")
-+        self.assertIn("5s", stderr,
-+                      "warning does not name the original bound")
++        self.assertIn(
++            f"past the {cells.SLOW_ATTACH_WARN_SECONDS:g}s regression signal",
++            stderr,
++            "warning does not name the original bound")
 +
 +    def test_fast_attach_logs_no_regression_warning(self):
 +        """Control: a fast attach stays silent (no warning spam)."""

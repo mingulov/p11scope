@@ -657,8 +657,10 @@ class BrowserCells(unittest.TestCase):
                         "navigation never ran after slow readiness")
         self.assertIn("slow attach", stderr,
                       "slow attach left no regression warning")
-        self.assertIn("5s", stderr,
-                      "warning does not name the original bound")
+        self.assertIn(
+            f"past the {cells.SLOW_ATTACH_WARN_SECONDS:g}s regression signal",
+            stderr,
+            "warning does not name the original bound")
 
     def test_fast_attach_logs_no_regression_warning(self):
         """Control: a fast attach stays silent (no warning spam)."""

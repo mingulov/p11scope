@@ -15,6 +15,8 @@ Harness: tests/fixtures/browser/ (cells, flows, oracle, servers, profiles).
 
 import ast
 import functools
+import inspect
+import io
 import json
 import os
 import shutil
@@ -25,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -542,16 +545,18 @@ class BrowserCells(unittest.TestCase):
         strays = [p for p in (caller_home / ".pki", caller_home / ".local") if p.exists()]
         self.assertEqual(strays, [], f"browser NSS state leaked into caller HOME: {strays}")
 
-    def _run_readiness_probe(self, marker_delay):
-        """Run attach_drive against a scripted profiler; return (started, error).
+    def _run_readiness_probe(self, marker_delay, grace_seconds=2):
+        """Run attach_drive against a scripted profiler.
 
         The fake profiler prints its readiness marker after
-        ``marker_delay`` seconds; the grace period is 2s, so a long
-        delay means the marker never arrives. Target liveness is valid
-        synthetic liveness, so readiness is the only possible failure
-        source. Returns the flow's ``started`` dict and the CellError
-        raised (None when the cell ran). Uses a fake Playwright module
-        and a fake profiler process: stdlib only.
+        ``marker_delay`` seconds; the grace period is ``grace_seconds``
+        (2s by default, so a long delay means the marker never
+        arrives). Target liveness is valid synthetic liveness, so
+        readiness is the only possible failure source. Returns the
+        flow's ``started`` dict, the CellError raised (None when the
+        cell ran), and the harness stderr captured during the run.
+        Uses a fake Playwright module and a fake profiler process:
+        stdlib only.
         """
         import subprocess as stdlib_subprocess
 
@@ -645,8 +650,10 @@ class BrowserCells(unittest.TestCase):
             return {}
 
         fake_sync = SimpleNamespace(sync_playwright=lambda: FakePWContext())
-        with patch.dict(sys.modules, {"playwright": SimpleNamespace(),
-                                      "playwright.sync_api": fake_sync}), \
+        captured = io.StringIO()
+        with redirect_stderr(captured), \
+                patch.dict(sys.modules, {"playwright": SimpleNamespace(),
+                                         "playwright.sync_api": fake_sync}), \
                 patch("subprocess.Popen", FakePopen), \
                 patch.object(cells, "main_browser_pid", return_value=os.getpid()), \
                 patch.object(cells, "_target_liveness", return_value=(True, True)), \
@@ -655,10 +662,10 @@ class BrowserCells(unittest.TestCase):
                 cells.attach_drive(
                     "TWIN-READY", "firefox", self.work / "cell", "https://127.0.0.1:1/",
                     flow, Path("definitely-not-mapped-xyz.so"),
-                    duration_seconds=5, attach_grace_seconds=2)
+                    duration_seconds=5, attach_grace_seconds=grace_seconds)
             except cells.CellError as exc:
-                return started, exc
-            return started, None
+                return started, exc, captured.getvalue()
+            return started, None, captured.getvalue()
 
     def test_navigation_waits_for_capture_readiness(self):
         """P2-4 twin: navigation must not start before capture readiness.
@@ -667,7 +674,7 @@ class BrowserCells(unittest.TestCase):
         the grace period; the flow must never run and the cell must fail
         with a readiness-specific error.
         """
-        started, error = self._run_readiness_probe(marker_delay=30.0)
+        started, error, _stderr = self._run_readiness_probe(marker_delay=30.0)
         self.assertIsNotNone(error, "cell passed without capture readiness")
         assert error is not None
         self.assertIn("never became ready", str(error),
@@ -677,10 +684,47 @@ class BrowserCells(unittest.TestCase):
 
     def test_capture_readiness_marker_arrives_runs_flow(self):
         """Control: when the marker arrives promptly, navigation runs."""
-        started, error = self._run_readiness_probe(marker_delay=0.1)
+        started, error, _stderr = self._run_readiness_probe(marker_delay=0.1)
         self.assertIsNone(error, f"marker arrived yet the cell failed: {error}")
         self.assertTrue(started.get("ran", False),
                         "navigation never ran after capture readiness")
+
+    def test_slow_attach_logs_a_regression_warning(self):
+        """Readiness past the original 5s bound warns but still passes.
+
+        The strict bound is measured (15s); the original 5s stays a
+        logged regression signal, not a silent pass.
+        """
+        started, error, stderr = self._run_readiness_probe(
+            marker_delay=6.0, grace_seconds=15)
+        self.assertIsNone(error, f"slow-but-bounded attach failed: {error}")
+        self.assertTrue(started.get("ran", False),
+                        "navigation never ran after slow readiness")
+        self.assertIn("slow attach", stderr,
+                      "slow attach left no regression warning")
+        self.assertIn("5s", stderr,
+                      "warning does not name the original bound")
+
+    def test_fast_attach_logs_no_regression_warning(self):
+        """Control: a fast attach stays silent (no warning spam)."""
+        started, error, stderr = self._run_readiness_probe(
+            marker_delay=0.1, grace_seconds=15)
+        self.assertIsNone(error, f"fast attach failed: {error}")
+        self.assertTrue(started.get("ran", False),
+                        "navigation never ran after fast readiness")
+        self.assertNotIn("slow attach", stderr,
+                         f"fast attach warned spuriously: {stderr!r}")
+
+    def test_attach_grace_default_is_the_measured_bound(self):
+        """The harness default is the measured 15s bound, in one place."""
+        default = inspect.signature(cells.attach_drive).parameters[
+            "attach_grace_seconds"].default
+        self.assertEqual(default, 15)
+        self.assertEqual(default, cells.ATTACH_GRACE_SECONDS)
+
+    def test_slow_attach_threshold_preserves_the_original_bound(self):
+        """The 5s regression signal survives as a named threshold."""
+        self.assertEqual(cells.SLOW_ATTACH_WARN_SECONDS, 5)
 
     def test_capture_ready_parsing(self):
         """Unit: the readiness marker parses to its attached-probe count."""

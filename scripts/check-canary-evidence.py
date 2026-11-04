@@ -480,7 +480,7 @@ def assert_safe_profile(doc):
         for row in rows:
             assert set(row) == {"mechanism", "mechanism_hex", "registered",
                                 "calls", "errors"}, row
-            assert row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
+            assert isinstance(row["mechanism"], int) and row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
             if TARGET_BITS == 32:
                 if row["registered"] is False:
                     assert row["mechanism"] in (UNKNOWN, MAXIMUM), row
@@ -1956,6 +1956,7 @@ def strip_approved_unregistered_rows(content):
 
     def strip_row(row):
         if (isinstance(row, dict) and row.get("mechanism") in approved
+                and isinstance(row["mechanism"], int)
                 and row.get("registered") is False
                 and row.get("mechanism_hex") == f"0x{row['mechanism']:x}"):
             return {key: value for key, value in row.items()

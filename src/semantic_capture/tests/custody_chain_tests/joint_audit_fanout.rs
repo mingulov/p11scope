@@ -3188,6 +3188,140 @@ fn joint_machine_refused_image_production_binding_stays_s1_named() {
     );
 }
 
+/// JK-18 resolve-before-seal at machine level: an own-cookie unrouted
+/// shed finalized before any binding is provisionally disposed, and the
+/// first finalize that sees the owner's binding still barriers the match,
+/// so the first bound seal degrades with a named history loss instead of
+/// certifying the held position. No Joint feed or rows for the owner, no
+/// resolution NOTE (a match never forgives), and the bound call that made
+/// the seal attempt still joins S1.
+#[test]
+fn joint_machine_own_cookie_pre_binding_shed_barriers_at_the_first_bound_seal() {
+    let mut fixture = MachineScene::new(1);
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    // Quantum 1 must prepare with zero bindings so the shed populates
+    // the hold — but its Binding phase would bind the mapped main pid.
+    // Fail only that bind with a scripted scan fault, then clear it
+    // before the first H0 tick so collection and finalization run real.
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    fixture.reach_phase("AwaitH0");
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        0,
+        "quantum 1 binds nothing: its prepare will populate the hold"
+    );
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = None;
+    fixture.published_labeled("pre-binding-shed", None);
+    {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(
+            coordinator.semantic_bindings().len(),
+            0,
+            "nothing binds before the owner does"
+        );
+        assert!(
+            coordinator.registry().gaps().iter().any(|gap| {
+                gap.subject == "semantic calls unrouted" && gap.reason.contains("with 0 bindings")
+            }),
+            "the own-cookie shed is held pre-binding: {:?}",
+            coordinator.registry().gaps()
+        );
+        assert!(
+            coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "pre-binding unrouted calls resolved to other callers"),
+            "nothing is forgiven before a binding exists"
+        );
+        assert_eq!(coordinator.registry().joint_feeds(), 0);
+    }
+    // The owner binds between the publications; the main pid binds in
+    // quantum 2's own Binding phase, before its prepare — production
+    // order on both seams. The main pid's quantum-2 call then forces a
+    // real bound seal over the late barrier.
+    let caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        1,
+        "the owner binds between the publications"
+    );
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("first-bound-seal", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        2,
+        "quantum 2 binds the mapped main pid before its own prepare: {:?}",
+        fixture.scene.real.scene.coordinator.registry().gaps()
+    );
+    // The H3Loss seal failure stages its gap for the next publication,
+    // so a third quantum publishes it.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.published_labeled("history-loss-named", None);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != "pre-binding unrouted calls resolved to other callers"),
+        "the match never forgives: {:?}",
+        coordinator.registry().gaps()
+    );
+    let main = coordinator.adapter().live_id(std::process::id()).unwrap();
+    assert!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| gap.caller == Some(main)
+                && gap.subject == "Joint key operations unavailable; retained S1"
+                && gap.reason == "joint_seal_h3_loss_history_loss"),
+        "the first bound seal degrades on the late barrier: {:?}",
+        coordinator.registry().gaps()
+    );
+    let mut owner_feeds = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter(|record| record.caller == caller)
+        .map(|record| record.feed.mode());
+    assert_eq!(
+        owner_feeds.next(),
+        Some(crate::semantics_key_use::FeedMode::S1Only),
+        "the owner gains no Joint feed with the hole its refused history left"
+    );
+    assert!(owner_feeds.next().is_none(), "the owner keeps one S1 edge");
+    assert_eq!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "semantic calls unrouted")
+            .count(),
+        1,
+        "every bound call still joins S1: {:?}",
+        coordinator.registry().gaps()
+    );
+}
+
 /// The real command installs the machine even when the journal is unlinked.
 /// Its retained publication must not stop servicing that Session's DISCOVERY.
 #[test]

@@ -815,6 +815,31 @@ physical edge or a newer ordinal alone does not prove semantic recovery.
 Empty arrays in current production captures do not prove absence of instances
 or complete semantic coverage. No object authority is added.
 
+## Reload disclosure (additive within v1)
+
+When the Detailed lane observes a provider file's continuity break and
+rejoin without an observed unload — a reload it cannot exclude — the
+capture discloses it under the top-level `instance_reload_not_excluded`
+object. The key is absent when the capture produced no disclosure
+(never null):
+
+- `continued_across_global`, `joined_across_global`: capture-monotonic
+  saturating router totals, snapshotted at the terminal projection.
+  Exact even when `identities` is partial or empty.
+- `identities`: one entry per affected registry module, sorted by
+  module, each with the sorted disclosed instance references:
+  `{"module": "mN", "instances": ["iN", ...]}`. Entries that share a
+  module merge into one entry with the sorted union of instances.
+
+An empty `identities` list with nonzero counts is mint exhaustion: the
+router observed continuations it could not attribute to minted
+instances. Router IDs that never registered (refused or unconverted
+coverages) are omitted from their identity, and identities with
+nothing nameable are dropped; the corresponding registration loss is
+disclosed under the existing `instance semantics refused` gap. Like
+`instances[]`, these references disclose no router ID, native domain,
+task cookie, exec ID, address, session, slot or async handle.
+
 ## Object observations (additive within v1)
 
 The additive `object_observations` section carries capture-local object

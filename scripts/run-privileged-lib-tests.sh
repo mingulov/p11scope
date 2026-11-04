@@ -431,6 +431,13 @@ inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_
 # target up to 8192 for the full-scale run. Prints SCALE2_E2E lines
 # (a few minutes).
 inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64
+# Reload-disclosure cells: installed inventory captures over the owned
+# fixture pair. The churn run publishes the disclosure naming the
+# churned identity with exact counts; the clean control omits the key
+# while both instance rows stay live. Each runs its own capture
+# (about a minute); prints B17_LEG2 lines.
+inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_lists_churned_identity
+inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_omits_key_without_churn
 # Typed counter readers: real anonymous native maps, with no program load,
 # attach, external workload or opt-in object build required.
 metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes

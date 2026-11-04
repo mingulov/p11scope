@@ -1216,6 +1216,18 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory/present/reload_disclosure_privileged_tests.rs",
+      "path": "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_lists_churned_identity",
+      "reason": "privileged: installed inventory capture over a fixture; the disclosure names the churned identity with exact counts",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/present/reload_disclosure_privileged_tests.rs",
+      "path": "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_omits_key_without_churn",
+      "reason": "privileged: installed inventory capture over a fixture; the clean control omits the disclosure key",
+      "cell": "privileged"
+    },
+    {
       "file": "src/metrics/counter_reader.rs",
       "path": "metrics::counter_reader::tests::counter_bank_session_boundary_511_512_counts_growth_lp64",
       "reason": "requires prebuilt LP64 growth fixtures, selected format2 object, and authorized 513-endpoint native attachment",

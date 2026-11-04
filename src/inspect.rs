@@ -925,6 +925,7 @@ mod tests {
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,
@@ -1111,6 +1112,7 @@ mod tests {
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,

@@ -764,6 +764,11 @@ pub struct Engine {
     fail_next_loader_memory_scan: bool,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
+    /// Test-only one-shot: force the next record-path loader scan to
+    /// report incomplete, pinning the `found_complete` plumbing from
+    /// the record-path scan to the loader-timing classifier.
+    #[cfg(test)]
+    loader_force_record_scan_incomplete: bool,
     /// Scripted pin-probe answers, consumed in order by the next matching
     /// probe. Test-only: live pins re-observe the kernel on every call, so
     /// a race between two reads (exit proof, then observation failure)
@@ -4073,6 +4078,7 @@ impl ScannedModuleCopy {
                     mount_namespace: source.mount_namespace,
                     key: source.key,
                     double_loaded: source.double_loaded,
+                    same_file_loads: source.same_file_loads,
                     path: exact_owned_string(&source.path),
                     decoder_abi: source.decoder_abi,
                     exports: Vec::with_capacity(source.exports.len()),
@@ -8918,6 +8924,7 @@ fn publication_module(
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
@@ -8981,8 +8988,11 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     // evidence of one load, and a newly detected double-load must
     // land on its retained module. Clearing happens only by
     // complete-scan replacement (fresh `found` evidence rebuilds
-    // the view's modules outright), never by union.
+    // the view's modules outright), never by union. The load count
+    // keeps the maximum for the same reason: a partial pass that
+    // sees fewer loads is not fresh evidence of fewer loads.
     existing.double_loaded |= incoming.double_loaded;
+    existing.same_file_loads = existing.same_file_loads.max(incoming.same_file_loads);
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);
@@ -10156,6 +10166,7 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key: ObjectKey::of(mapping),
@@ -10332,6 +10343,8 @@ impl Engine {
             fail_next_loader_memory_scan: false,
             #[cfg(test)]
             loader_arm_scan_after_scan: None,
+            #[cfg(test)]
+            loader_force_record_scan_incomplete: false,
             #[cfg(test)]
             pin_probe_script: RefCell::new(VecDeque::new()),
             #[cfg(test)]
@@ -11204,6 +11217,32 @@ impl Engine {
                 self.paused_loader_views.insert(view);
             }
         }
+    }
+
+    /// Books a terminal-drain record as never pause-held. Terminal batches
+    /// are collected at detach/Finish, never handed to a pause stop, so no
+    /// stale pause proof from an earlier held batch may exonerate them. This
+    /// deliberately does not consult `held_records`: even inside a
+    /// pause-owned batch the terminal records arrived via the installed
+    /// batch, not via the held handoff.
+    fn note_terminal_record_unheld(&mut self, record: &DiscoveryRecord) {
+        if !matches!(
+            record.kind,
+            DISCOVERY_KIND_LOADER
+                | DISCOVERY_KIND_FUNCTION_LIST_RETURN
+                | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN
+                | DISCOVERY_KIND_INTERFACE_RETURN
+        ) {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let views: Vec<_> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        self.unpaused_loader_views.extend(views);
     }
 
     pub(crate) fn discovery_deferrals(&self) -> u64 {
@@ -15721,6 +15760,7 @@ impl Engine {
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: view.id(),
                 mount_namespace: view.mount_namespace(),
                 key,
@@ -16210,8 +16250,8 @@ impl Engine {
     /// unknown. Pause proof exonerates regardless of the diff: the child
     /// was stopped while the load happened, so no first call could have
     /// run unobserved. Anything unproven — an incomplete scan, an
-    /// unreadable announcement, a new or unclassifiable module — stays
-    /// unresolved.
+    /// unreadable announcement, a new or unclassifiable module, a
+    /// same-file double-load transition — stays unresolved.
     ///
     /// Completeness is the scan's own verdict: it already fails closed on
     /// truncating skips, budget stops, new refusals and unavailability.
@@ -16234,6 +16274,32 @@ impl Engine {
             && !self.unpaused_loader_views.contains(&view_id);
         if protected {
             self.loader_benign_hits = self.loader_benign_hits.saturating_add(1);
+            return;
+        }
+        // A same-file second load (notably a `dlmopen` private-namespace
+        // double-load) shares its (view, mount namespace, key, path) with
+        // the retained first load, so the mapping diff alone sees no change.
+        // The second instance owns a distinct session namespace whose first
+        // calls before attach went unobserved, so any double-load
+        // transition in either direction is a true window, never benign.
+        // The count comparison catches what the boolean cannot: a third
+        // (or later) same-file load keeps `double_loaded` true on both
+        // sides while moving the load count.
+        let double_load_transition = found.iter().any(|module| {
+            retained_before
+                .iter()
+                .find(|known| {
+                    known.view == module.view
+                        && known.mount_namespace == module.mount_namespace
+                        && known.key == module.key
+                        && known.path == module.path
+                })
+                .is_some_and(|known| {
+                    known.double_loaded != module.double_loaded
+                        || known.same_file_loads != module.same_file_loads
+                })
+        });
+        if double_load_transition {
             return;
         }
         let new_provider = found
@@ -16314,6 +16380,8 @@ impl Engine {
         {
             after_scan(self);
         }
+        #[cfg(test)]
+        let record_path_scan = catchup_authority.is_none();
         if let Some(expected) = catchup_authority {
             if self.original_exited(self.views[position].id()) {
                 return Ok(DiscoveryRecordOutcome::applied(false, true));
@@ -16360,6 +16428,16 @@ impl Engine {
                 return Err(error);
             }
         };
+        // Test-only: a one-shot incomplete verdict on the record path
+        // (the catch-up path already fails closed above), so the
+        // dispatch twin pins the live `found_complete` plumbing.
+        #[cfg(test)]
+        let found_complete =
+            if record_path_scan && std::mem::take(&mut self.loader_force_record_scan_incomplete) {
+                false
+            } else {
+                found_complete
+            };
         self.note_scan_observed(
             self.views[position].id(),
             self.views[position].view_admission(),
@@ -18718,6 +18796,7 @@ impl Engine {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view_id,
             mount_namespace: self.views[position].mount_namespace(),
             key: loader_identity,
@@ -19463,6 +19542,7 @@ impl Engine {
             // the handler runs. A retry retains exactly the untouched suffix.
             let queued = batch.records.remove(0);
             let origin = (queued.record.pid_tgid >> 32) as u32;
+            self.note_terminal_record_unheld(&queued.record);
             match self.dispatch_discovery_record(
                 queued,
                 session,

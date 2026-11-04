@@ -2140,6 +2140,19 @@ pub struct ScannedModule {
     /// scan evidence. The planner reads it for the operator-named closure
     /// exception only; it changes no scan filtering.
     pub module_hint: Option<PathBuf>,
+    /// Scan evidence: how many same-file loads this object's candidate
+    /// group covers, from [`duplicate_exec_load_count`] — 1 for a
+    /// single load, 2+ for overlapping executable file-offset coverage
+    /// at distinct addresses (notably `dlmopen` private-namespace
+    /// loads). The loader-timing gate compares this count across
+    /// scans: a third load keeps `double_loaded` true on both sides
+    /// but moves the count, and that new instance's first calls went
+    /// unobserved. Modules synthesized without group evidence
+    /// (heap-lowered records, loader prearm, single-mapping
+    /// projections) carry 1. Merges keep the maximum — a partial pass
+    /// that sees fewer loads is not fresh evidence of fewer loads —
+    /// and only a complete-scan replacement lowers it.
+    pub same_file_loads: u32,
     pub path: String,
     /// ABI used by the userspace memory decoder. Present only when this module
     /// came from `scan_process_view`; mapping and kernel-record projections do
@@ -3840,25 +3853,39 @@ pub(crate) fn candidate_groups(maps: &[MapEntry]) -> BTreeMap<ObjectKey, Vec<&Ma
 /// and neither are disjoint ranges; same-address pairs are the one
 /// mapping, never a duplicate.
 pub(crate) fn duplicate_exec_coverage(group: &[&MapEntry]) -> bool {
+    duplicate_exec_load_count(group) >= 2
+}
+
+/// How many same-file loads `group` evidences: the maximum number of
+/// executable mappings at distinct addresses covering one shared file
+/// offset. One load maps each offset once; a `dlmopen`
+/// private-namespace second load maps the same executable file range
+/// at a second address, a third load at a third address, and so on.
+/// Data-only duplicates are not evidence (no call surface attaches
+/// there), disjoint ranges never share an offset, and same-address
+/// pairs are the one mapping, never a duplicate. At least 1: a module
+/// row evidences one load.
+pub(crate) fn duplicate_exec_load_count(group: &[&MapEntry]) -> u32 {
     let exec: Vec<&&MapEntry> = group
         .iter()
         .filter(|entry| entry.permissions[2] == b'x')
         .collect();
-    for (index, first) in exec.iter().enumerate() {
-        let first_len = first.end.saturating_sub(first.start);
-        let first_end = first.file_offset.saturating_add(first_len);
-        for second in exec.iter().skip(index + 1) {
-            if first.start == second.start {
-                continue;
-            }
-            let second_len = second.end.saturating_sub(second.start);
-            let second_end = second.file_offset.saturating_add(second_len);
-            if first.file_offset < second_end && second.file_offset < first_end {
-                return true;
+    let mut loads = 1u32;
+    for probe in &exec {
+        let mut addresses: Vec<u64> = Vec::new();
+        for other in &exec {
+            let other_len = other.end.saturating_sub(other.start);
+            let other_end = other.file_offset.saturating_add(other_len);
+            if other.file_offset <= probe.file_offset
+                && probe.file_offset < other_end
+                && !addresses.contains(&other.start)
+            {
+                addresses.push(other.start);
             }
         }
+        loads = loads.max(addresses.len() as u32);
     }
-    false
+    loads
 }
 
 /// Opens an object as the *target* sees it (spec §4.5: needs only `PTRACE_MODE_READ`;
@@ -5696,13 +5723,15 @@ fn scan_view_examined_mode(
         // first matched hint the alias gate accepted above. Recorded only;
         // the planner reads it for the operator-named closure exception.
         let module_hint = named_hint;
+        let same_file_loads = duplicate_exec_load_count(&group);
         let mut module = ScannedModule {
             module_hint,
             mapped_identity: scanned_identity,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,
-            double_loaded: duplicate_exec_coverage(&group),
+            double_loaded: same_file_loads >= 2,
+            same_file_loads,
             path,
             decoder_abi: Some(abi),
             exports: hook_exports,
@@ -7439,6 +7468,65 @@ mod tests {
     }
 
     #[test]
+    fn same_file_load_count_counts_distinct_executable_instances() {
+        // One load: each offset mapped once.
+        let single = group_of(
+            b"1000-2000 r--p 00000000 08:01 7 /lib/provider.so\n\
+              2000-3000 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&single)), 1);
+        // A dlmopen double-load: the r-x file range mapped twice at
+        // different addresses.
+        let double = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&double)), 2);
+        // A third same-file load: the same r-x file range at a third
+        // address. The boolean detector stays true here too, so only
+        // the count sees the new instance.
+        let triple = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              c100-c200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&triple)), 3);
+        assert!(duplicate_exec_coverage(&group_refs(&triple)));
+        // Disjoint executable ranges: two segments, one load each.
+        let disjoint = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b200 r-xp 00002000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&disjoint)), 1);
+        // Data-only duplicates: no call surface, still one load.
+        let data = group_of(
+            b"a000-a100 r--p 00000000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b000-b100 r--p 00000000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&data)), 1);
+        // Partial executable overlap still shares offsets: two loads.
+        let overlap = group_of(
+            b"a100-a300 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              b100-b300 r-xp 00001100 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&overlap)), 2);
+        // The same mapping listed twice is the one mapping.
+        let repeated = group_of(
+            b"a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n\
+              a100-a200 r-xp 00001000 08:01 7 /lib/provider.so\n",
+            7,
+        );
+        assert_eq!(duplicate_exec_load_count(&group_refs(&repeated)), 1);
+    }
+
+    #[test]
     fn ilp32_tables_use_four_byte_words_and_ignore_adjacent_poison() {
         let maps = parse_maps(b"1000-3000 r-xp 00000000 08:01 7 /lib/provider.so\n").unwrap();
         let map_index = MapIndex::new(&maps).unwrap();
@@ -8862,6 +8950,7 @@ mod tests {
                     },
                     key,
                     double_loaded: false,
+                    same_file_loads: 1,
                     path,
                     decoder_abi: Some(ElfAbi::Lp64),
                     exports: Vec::new(),

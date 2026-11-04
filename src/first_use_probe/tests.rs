@@ -221,6 +221,7 @@ fn scan_identity_truncation_is_bounded_and_invalidates_the_journal() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key: ObjectKey {

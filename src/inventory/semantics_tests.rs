@@ -127,6 +127,7 @@ impl ProviderFixture {
                 mount_namespace: view.mount_namespace(),
                 key,
                 double_loaded: false,
+                same_file_loads: 1,
                 path: self.manifest.module_path.clone(),
                 decoder_abi: None,
                 exports: Vec::new(),

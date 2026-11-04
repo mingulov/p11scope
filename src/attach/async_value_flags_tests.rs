@@ -179,6 +179,7 @@ fn pin_and_plan(
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,

@@ -5387,6 +5387,7 @@ pub(crate) mod tests {
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -5498,6 +5499,7 @@ pub(crate) mod tests {
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -7166,6 +7168,7 @@ pub(crate) mod tests {
             },
             key,
             double_loaded: false,
+            same_file_loads: 1,
             path: "/lib/provider.so".into(),
             decoder_abi: Some(ElfAbi::Lp64),
             exports: hook_exports,
@@ -7651,6 +7654,7 @@ pub(crate) mod tests {
             },
             key,
             double_loaded: false,
+            same_file_loads: 1,
             path: "/lib/provider.so".into(),
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],

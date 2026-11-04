@@ -852,6 +852,7 @@ mod tests {
                 module_hint: None,
                 mapped_identity: None,
                 double_loaded: false,
+                same_file_loads: 1,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,

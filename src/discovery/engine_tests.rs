@@ -2109,6 +2109,7 @@ fn double_load_transition_keeps_its_hit_unresolved() {
             inode: 42,
         },
         double_loaded,
+        same_file_loads: u32::from(double_loaded) + 1,
         path: "/opt/p.so".into(),
         decoder_abi: None,
         exports: vec![],
@@ -2133,6 +2134,94 @@ fn double_load_transition_keeps_its_hit_unresolved() {
     );
 }
 
+/// A third same-file load keeps `double_loaded` true on both scans, so a
+/// boolean transition check sees no change — but the third instance owns a
+/// distinct PKCS#11 session namespace whose first calls before attach went
+/// unobserved. Any same-file load-count change in either direction keeps
+/// its hit unresolved.
+#[test]
+fn same_file_load_count_change_keeps_its_hit_unresolved() {
+    let (_fixture, mut engine, _context, _record, session) = armed_seed_route(1);
+    engine.update_counter_snapshot(&session).unwrap();
+    let view = engine.views[0].id();
+    let mount_namespace = engine.views[0].mount_namespace();
+    let module = |double_loaded, same_file_loads| ScannedModule {
+        mapped_identity: None,
+        view,
+        mount_namespace,
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        double_loaded,
+        same_file_loads,
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    // A third load arriving (and a third load going away) keeps the
+    // boolean true on both sides; only the count moves.
+    for (retained_loads, found_loads) in [(2u32, 3u32), (3, 2)] {
+        for class in [
+            LoaderHitClass::Announced(1),
+            LoaderHitClass::Consistent { resolving: None },
+        ] {
+            let retained = vec![module(true, retained_loads)];
+            let found = vec![module(true, found_loads)];
+            engine.classify_loader_record_scan(view, class, &retained, &found, true);
+        }
+    }
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "a same-file load-count change is a new instance, never benign"
+    );
+}
+
+/// A stable same-file load count exonerates: two scans that both see
+/// the same two loads observed no new instance. Pins the carve-out —
+/// only a count *change* keeps the hit unresolved.
+#[test]
+fn stable_same_file_load_count_resolves_benignly() {
+    let (_fixture, mut engine, _context, _record, session) = armed_seed_route(1);
+    engine.update_counter_snapshot(&session).unwrap();
+    let view = engine.views[0].id();
+    let mount_namespace = engine.views[0].mount_namespace();
+    let module = ScannedModule {
+        mapped_identity: None,
+        view,
+        mount_namespace,
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        double_loaded: true,
+        same_file_loads: 2,
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    for class in [
+        LoaderHitClass::Announced(1),
+        LoaderHitClass::Consistent { resolving: None },
+    ] {
+        let retained = vec![module.clone()];
+        let found = vec![module.clone()];
+        engine.classify_loader_record_scan(view, class, &retained, &found, true);
+    }
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        2,
+        "a stable double-load count observed no new instance"
+    );
+}
+
 /// An incomplete scan proves nothing: truncating skips, budget stops, new
 /// refusals and unavailability already fail closed in the scan's own
 /// verdict, and the classifier returns early on it even when the visible
@@ -2152,6 +2241,7 @@ fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
             inode: 42,
         },
         double_loaded: false,
+        same_file_loads: 1,
         path: "/opt/p.so".into(),
         decoder_abi: None,
         exports: vec![],
@@ -2173,6 +2263,31 @@ fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
         engine.loader_discovery().benign_hits,
         0,
         "an incomplete scan never exonerates, even with no visible change"
+    );
+}
+
+/// The live `found_complete` plumbing: a record-path scan that reports
+/// incomplete keeps its hit unresolved through dispatch, even with no
+/// mapping change. Uses the real batch route with a forced incomplete
+/// verdict — a mutant hardcoding `true` at the classify call site
+/// exonerates here.
+#[test]
+fn incomplete_record_scan_keeps_its_hit_unresolved_through_dispatch() {
+    let (_fixture, mut engine, _context, mut record, mut session) =
+        armed_seed_route_with_retained_provider(1);
+    record.announced_count = 0; // RT_CONSISTENT, unmatched: a failed/refcount open.
+    engine.loader_force_record_scan_incomplete = true;
+    apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(
+        !engine.modules.is_empty(),
+        "vacuous unless the scan still observes the retained provider"
+    );
+    assert_eq!(engine.loader_discovery().hits, 1);
+    assert_eq!(
+        engine.loader_discovery().benign_hits,
+        0,
+        "an incomplete record-path scan never exonerates, even with no visible change"
     );
 }
 
@@ -28400,6 +28515,7 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: crate::process::MountNamespaceId {
             device: 1,
@@ -28469,6 +28585,7 @@ fn incomplete_rescan_preserves_double_load_detection() {
         module_hint: None,
         mapped_identity: None,
         double_loaded,
+        same_file_loads: u32::from(double_loaded) + 1,
         view: ProcessViewId(0),
         mount_namespace: crate::process::MountNamespaceId {
             device: 1,
@@ -28513,6 +28630,7 @@ fn incomplete_rescan_unions_the_extension_proof() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: crate::process::MountNamespaceId {
             device: 1,
@@ -28551,6 +28669,51 @@ fn incomplete_rescan_unions_the_extension_proof() {
         assert_eq!(merged[0].tables.len(), 1, "equal tables union, not twins");
         assert_eq!(
             merged[0].tables[0].extension_impossible, expected,
+            "retained={retained} incoming={incoming}"
+        );
+    }
+}
+
+#[test]
+fn incomplete_rescan_preserves_highest_load_count() {
+    // The count analog of the boolean union above: a retained 3
+    // survives an incoming 1 (a partial pass is not fresh evidence
+    // of fewer loads), and an incoming 3 lands on a retained 1
+    // (a newly detected third load is not lost). Clearing happens
+    // only by complete-scan replacement, never by union.
+    let module = |same_file_loads| ScannedModule {
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: same_file_loads >= 2,
+        same_file_loads,
+        view: ProcessViewId(0),
+        mount_namespace: crate::process::MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        key: ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 42,
+        },
+        path: "/opt/p.so".into(),
+        decoder_abi: None,
+        exports: vec![],
+        tables: vec![],
+        interfaces: vec![],
+    };
+    for (retained, incoming, expected) in [
+        (1u32, 1u32, 1u32),
+        (2, 1, 2),
+        (1, 2, 2),
+        (2, 3, 3),
+        (3, 2, 3),
+        (3, 3, 3),
+    ] {
+        let mut merged = vec![module(retained)];
+        merge_scanned_module(&mut merged, module(incoming));
+        assert_eq!(merged.len(), 1, "same module unions, not twins");
+        assert_eq!(
+            merged[0].same_file_loads, expected,
             "retained={retained} incoming={incoming}"
         );
     }
@@ -31550,6 +31713,7 @@ fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedMo
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key: facts[0].0,
@@ -32504,6 +32668,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key,
@@ -32739,6 +32904,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view,
             mount_namespace: current_mount_namespace(),
             key,
@@ -32835,6 +33001,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view,
             mount_namespace: current_mount_namespace(),
             key,
@@ -32907,6 +33074,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: ProcessViewId(0),
             mount_namespace: current_mount_namespace(),
             key,
@@ -32988,6 +33156,7 @@ fn pinned_self() -> (Vec<ScannedModule>, PinnedObjects) {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
@@ -33996,6 +34165,7 @@ fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: ProcessViewId(0),
             mount_namespace: current_mount_namespace(),
             key: ObjectKey {
@@ -34083,6 +34253,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key: key(module_mapping),
@@ -34261,6 +34432,7 @@ fn retargeting_only_adopts_the_matched_scanned_object() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: ProcessViewId(0),
         mount_namespace: current_mount_namespace(),
         key: ObjectKey {
@@ -37383,6 +37555,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view_id,
             mount_namespace,
             key: ObjectKey {
@@ -37473,6 +37646,7 @@ fn view_pin_revalidation_detects_replaced_files() {
         module_hint: None,
         mapped_identity: None,
         double_loaded: false,
+        same_file_loads: 1,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
@@ -53164,6 +53338,7 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view,
             mount_namespace: current_mount_namespace(),
             key,

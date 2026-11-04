@@ -7885,6 +7885,7 @@ pub(crate) mod test_fixture {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: ProcessViewId(key.device.minor as u32),
             mount_namespace: MountNamespaceId {
                 device: 1,
@@ -9072,6 +9073,7 @@ mod tests {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -9185,6 +9187,7 @@ mod tests {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -9260,6 +9263,7 @@ mod tests {
             module_hint: None,
             mapped_identity: None,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -11041,6 +11045,7 @@ mod tests {
             module_hint: None,
             mapped_identity,
             double_loaded: false,
+            same_file_loads: 1,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {

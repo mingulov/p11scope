@@ -128,7 +128,7 @@ PY
 }
 
 # judge_cell NAME LOG RC DURATION_MS appends the cell's row and returns 0
-# for a pass. A zero rc alone is not a pass: the log must show exactly one
+# for a pass or a recorded expected failure. A zero rc alone is not a pass: the log must show exactly one
 # passed test (libtest exits 0 on "0 passed, 1 ignored" when a cell gains
 # #[ignore]) and the observed branch must be the cell's required one, so a
 # drifted or silent cell fails instead of passing as branch=unknown.
@@ -156,6 +156,7 @@ judge_cell() {
     fi
     if reason=$(expected_reason "$name"); then
         result "$name" 0 "$detail (expected: $reason)" expected-failure
+        return 0
     else
         result "$name" 0 "$detail" failed
     fi

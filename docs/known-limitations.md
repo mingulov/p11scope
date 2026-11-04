@@ -331,6 +331,10 @@ mappings established before it. Shared-mm exits, refused hooks,
 and local faults likewise read `unknown`. Admissions and overflow
 sentinels carry no verdict, and there is no "did not map" claim:
 nothing here proves a process did not map a watched provider.
+The live cell qualifying this split builds its fixtures on guest tmpfs
+inside virtme-ng guests rather than under `TMPDIR`, so a host `TMPDIR`
+naming the shared 9p tree cannot lend the fixtures remapped ownership
+or device identity.
 
 ## Planned for later versions
 

@@ -6,7 +6,14 @@
  * list, no C_GetInterface/C_GetInterfaceList exports):
  *   - C_GetFunctionList publishes exactly 68 ordered slots, labelled
  *     {3,2} (overridable with -DLEGACY32_MAJOR= -DLEGACY32_MINOR= for
- *     negative controls; the {3,0} variant is the documented one);
+ *     negative controls; the {3,0} variant is the documented one).
+ *     Further negative controls for the --shape-only gate suite
+ *     (tests/python/test_legacy32_shape.py), each failing exactly one
+ *     gate while every earlier gate still holds: -DLEGACY32_NULL_SLOT66
+ *     (NULL slot), -DLEGACY32_ALIAS_SLOT66 (two slots share one
+ *     function), -DLEGACY32_EXPORT_INTERFACE (C_GetInterface defined),
+ *     -DLEGACY32_HIDE_SLOT67 (slot 67 loses its dynamic export),
+ *     -DLEGACY32_EXTRA_EXPORT (one extra non-C_ text export);
  *   - every slot holds a distinct exported C_* function, so the six
  *     workload targets are unambiguous and every entry agrees with its
  *     .dynsym definition, exactly like the real 68-export module;
@@ -276,7 +283,9 @@ LEGACY32_STUB(C_DeriveKey, 62)
 LEGACY32_STUB(C_SeedRandom, 63)
 LEGACY32_STUB(C_GetFunctionStatus, 65)
 LEGACY32_STUB(C_CancelFunction, 66)
+#ifndef LEGACY32_HIDE_SLOT67
 LEGACY32_STUB(C_WaitForSlotEvent, 67)
+#endif
 
 /* Tail guard values: small unmapped addresses, so ordinal 68 fails
  * structurally (never NULL, which would read as a hole). */
@@ -284,6 +293,42 @@ LEGACY32_STUB(C_WaitForSlotEvent, 67)
     (a), (a) + 1, (a) + 2, (a) + 3, (a) + 4, (a) + 5, (a) + 6, (a) + 7
 
 CK_RV C_GetFunctionList(void **out);
+
+/* Negative-control knobs for the --shape-only gate suite. Slots 66 and
+ * 67 are plain stubs outside the gated ordinals, so breaking them leaves
+ * every earlier gate holding and fails exactly the targeted one. */
+#ifdef LEGACY32_NULL_SLOT66
+#define LEGACY32_SLOT66 NULL
+#elif defined(LEGACY32_ALIAS_SLOT66)
+#define LEGACY32_SLOT66 C_GetFunctionStatus
+#else
+#define LEGACY32_SLOT66 C_CancelFunction
+#endif
+#ifdef LEGACY32_HIDE_SLOT67
+static CK_RV hidden_slot67(void)
+{
+    volatile unsigned long mark = 67UL;
+    (void)mark;
+    return CKR_OK;
+}
+#define LEGACY32_SLOT67 hidden_slot67
+#else
+#define LEGACY32_SLOT67 C_WaitForSlotEvent
+#endif
+#ifdef LEGACY32_EXTRA_EXPORT
+CK_RV legacy32_extra_probe(void)
+{
+    return CKR_OK;
+}
+#endif
+#ifdef LEGACY32_EXPORT_INTERFACE
+CK_RV C_GetInterface(void)
+{
+    volatile unsigned long mark = 68UL;
+    (void)mark;
+    return CKR_OK;
+}
+#endif
 
 static const struct {
     Legacy32Table table;
@@ -358,8 +403,8 @@ static const struct {
             [63] = C_SeedRandom,
             [64] = C_GenerateRandom,
             [65] = C_GetFunctionStatus,
-            [66] = C_CancelFunction,
-            [67] = C_WaitForSlotEvent,
+            [66] = LEGACY32_SLOT66,
+            [67] = LEGACY32_SLOT67,
         },
     },
     .tail = {LEGACY32_G8(1), LEGACY32_G8(9), LEGACY32_G8(17), LEGACY32_G8(25), 33, 34, 35, 36},

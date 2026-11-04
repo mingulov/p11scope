@@ -986,8 +986,10 @@ def check_joint_active(doc, selected, view, events):
     object_observations is populated with reason none and no
     joint_journal_unavailable marker anywhere; every key-operation
     row sits on the driver's instance with its equation and
-    completed == started; the per-object started multiset equals the
-    ledgered per-key operation multiset; no unknown-key rows persist;
+    completed == started; the per-object key-reference multiset equals
+    the ledgered per-key operation multiset, with labelled rows plus
+    `metadata_unknown` sign summaries summing exactly (no other
+    unknown-key reason, and one `not_applicable` generation per key);
     every key was created in the window and destroyed; and one
     closed session row exists per ledgered C_OpenSession.
     """
@@ -1051,12 +1053,68 @@ def check_joint_active(doc, selected, view, events):
                  f"object {obj} has completed {completed} != "
                  f"started {started}")
         per_object[obj] = per_object.get(obj, 0) + started
-    seen = sorted(per_object.values())
+    # Per-key identity: each created key's successful key references
+    # (one per C_SignInit that named it) must equal its ledger's sign
+    # count, so every ledgered sign is attributed to exactly one key.
+    # A sign's metadata label may stay `metadata_unknown` when the
+    # workload never exposed the key's attributes (the closed attribute
+    # vocabulary has no generic-secret label): those signs sit in the
+    # fixed unknown summary, and labelled plus unknown must sum exactly.
+    views = observed.get("objects")
+    _require(type(views) is list, "object_observations without objects")
+    references = {}
+    for row in views:
+        if not (type(row) is dict and row.get("origin") == "created"
+                and row.get("creation") == "generate"):
+            continue
+        obj = row.get("object")
+        refs = row.get("successful_key_references")
+        _require(_u64(obj) and obj not in references,
+                 f"created object {obj} is not one unique view")
+        _require(_u64(refs), f"object {obj} key references out of range")
+        references[obj] = refs
+    for obj, started in per_object.items():
+        _require(obj in references,
+                 f"key row for object {obj} with no created key view")
+        _require(started <= references[obj],
+                 f"per-key object {obj}: {started} labelled operations "
+                 f"exceed its "
+                 f"{references[obj]} key references")
+    seen = sorted(references.values())
     _require(seen == expected,
              f"per-key operations {seen} != ledgered {expected}")
     unknown = observed.get("unknown_key_operations")
-    _require(unknown == [],
-             f"unknown-key operations persist: {len(unknown or [])} rows")
+    _require(type(unknown) is list,
+             "object_observations without unknown-key rows")
+    unknown_signs = 0
+    unknown_keygens = 0
+    for row in unknown:
+        _require(type(row) is dict, "unknown-key row must be an object")
+        category, why = row.get("category"), row.get("reason")
+        counters = [row.get(name) for name in
+                    ("completed", "failed", "cancelled", "unknown", "active")]
+        _require(all(_u64(value) for value in counters),
+                 f"unknown-key row {category}/{why} counters out of range")
+        _require(counters[1:] == [0, 0, 0, 0],
+                 f"unknown-key row {category}/{why} has failed, cancelled, "
+                 "unknown or active operations")
+        _require(row.get("unit") == "operations",
+                 f"unknown-key row {category}/{why} unit {row.get('unit')}")
+        if category == "sign" and why == "metadata_unknown":
+            unknown_signs += counters[0]
+        elif category == "generate_key" and why == "not_applicable":
+            unknown_keygens += counters[0]
+        else:
+            _require(False,
+                     f"unknown-key operations persist: {category}/{why} "
+                     f"({counters[0]} completed)")
+    labelled = sum(per_object.values())
+    _require(labelled + unknown_signs == sum(expected),
+             f"sign operations {labelled} labelled + {unknown_signs} "
+             f"metadata_unknown != ledgered {sum(expected)}")
+    _require(unknown_keygens == len(expected),
+             f"generate_key operations {unknown_keygens} != ledgered "
+             f"{len(expected)} key creations")
     objects = observed.get("objects")
     _require(type(objects) is list, "object_observations without objects")
     created = [row for row in objects

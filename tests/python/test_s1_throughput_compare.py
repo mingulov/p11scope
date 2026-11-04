@@ -472,9 +472,15 @@ def joint_key_row(instance, object_id, ops):
             "unknown": 0, "active": 0, "key_join_lost": 0}
 
 
+def joint_unknown_row(category, reason, completed):
+    return {"category": category, "reason": reason, "unit": "operations",
+            "completed": completed, "failed": 0, "cancelled": 0,
+            "unknown": 0, "active": 0}
+
+
 def joint_object_view(object_id, session=1, birth_start=R0 + 500,
                      birth_end=R0 + 1500, origin="created",
-                     creation="generate", lifetime="destroyed"):
+                     creation="generate", lifetime="destroyed", key_refs=2):
     blank = {"status": "unknown", "value": None}
     value = {"status": "value", "value": 0}
     return {"object": object_id, "session": session, "origin": origin,
@@ -492,8 +498,8 @@ def joint_object_view(object_id, session=1, birth_start=R0 + 500,
                         "token": "established", "value_len": "not_queried",
                         "modulus_bits": "not_queried",
                         "ec_params": "not_queried"},
-            "label": None, "successful_references": 3,
-            "successful_key_references": 2, "accessing_sessions": 1}
+            "label": None, "successful_references": key_refs + 1,
+            "successful_key_references": key_refs, "accessing_sessions": 1}
 
 
 def joint_object_observations(ops_per_key, sessions=1, instance="i0",
@@ -504,18 +510,22 @@ def joint_object_observations(ops_per_key, sessions=1, instance="i0",
         "version": 1, "revision": 4, "status": status, "reason": reason,
         "sessions": [{"session": number + 1, "origin": "opened",
                       "status": "closed"} for number in range(sessions)],
-        "objects": [joint_object_view(11 + index, session=1 + (index % sessions))
-                    for index in range(len(ops_per_key))],
+        "objects": [joint_object_view(11 + index, session=1 + (index % sessions),
+                                      key_refs=ops)
+                    for index, ops in enumerate(ops_per_key)],
         "key_operations": [joint_key_row(instance, 11 + index, ops)
                            for index, ops in enumerate(ops_per_key)],
-        "unknown_key_operations": [],
+        # One not_applicable generation per created key, as the product
+        # always reports for C_GenerateKey.
+        "unknown_key_operations": [joint_unknown_row(
+            "generate_key", "not_applicable", len(ops_per_key))],
         "gaps": {"rows": [], "suppressed": 0},
         "budgets": {"key_rows": {"limit": 65536,
                                  "occupied": len(ops_per_key), "refused": 0},
                     "object_rows": {"limit": 65536,
                                     "occupied": len(ops_per_key),
                                     "refused": 0},
-                    "unknown_rows": {"occupied": 0}, "encoded_bytes": 410,
+                    "unknown_rows": {"occupied": 1}, "encoded_bytes": 410,
                     "allocation_refused": False, "refusal_reason": "none"},
     }
 
@@ -2535,6 +2545,119 @@ class JointActiveGate(unittest.TestCase):
                      "cancelled": 0, "unknown": 0, "active": 0}]
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "unknown-key"):
+                self.run_joint(Path(tmp), mutate)
+
+    @staticmethod
+    def unknown_metadata(doc, unknown_signs):
+        """The product's shape when the workload never exposed key
+        metadata: no labelled key rows, every sign in the fixed
+        `metadata_unknown` summary, identity kept by each key's
+        successful key references."""
+        observed = doc["object_observations"]
+        keys = len(observed["objects"])
+        observed["key_operations"] = []
+        observed["unknown_key_operations"] = [
+            joint_unknown_row("generate_key", "not_applicable", keys),
+            joint_unknown_row("sign", "metadata_unknown", unknown_signs)]
+
+    def test_metadata_unknown_signs_with_exact_identity_pass(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mdunk-") as tmp:
+            result = self.run_joint(
+                Path(tmp), lambda doc: self.unknown_metadata(doc, 9999))
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["joint"]["per_key_ops"], [9999])
+
+    def test_metadata_unknown_churn_with_exact_identity_passes(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mdunk-churn-") as tmp:
+            result = self.run_joint(
+                Path(tmp), lambda doc: self.unknown_metadata(doc, 6000),
+                ops_per_key=(2500, 2000, 1500), per_s=1000, sessions=8,
+                min_rate=1000)
+            self.assertEqual(result["verdict"], "pass")
+
+    def test_labelled_and_unknown_signs_sum_exactly(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mixed-") as tmp:
+            def mutate(doc):
+                observed = doc["object_observations"]
+                observed["key_operations"][0]["started"] = 9000
+                observed["key_operations"][0]["completed"] = 9000
+                observed["unknown_key_operations"].append(
+                    joint_unknown_row("sign", "metadata_unknown", 999))
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+
+    def test_metadata_unknown_missing_sign_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mdunk-miss-") as tmp:
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "metadata_unknown != ledgered"):
+                self.run_joint(Path(tmp),
+                               lambda doc: self.unknown_metadata(doc, 9998))
+
+    def test_metadata_unknown_extra_sign_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mdunk-extra-") as tmp:
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "metadata_unknown != ledgered"):
+                self.run_joint(Path(tmp),
+                               lambda doc: self.unknown_metadata(doc, 10000))
+
+    def test_metadata_unknown_missing_key_reference_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mdunk-ref-") as tmp:
+            def mutate(doc):
+                self.unknown_metadata(doc, 9999)
+                doc["object_observations"]["objects"][0][
+                    "successful_key_references"] -= 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "per-key operations"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_misattributed_sign_fails(self):
+        # One sign moves from one key's identity to another's: totals
+        # stay exact, but the per-key identity multiset breaks.
+        with tempfile.TemporaryDirectory(prefix="joint-misattr-") as tmp:
+            def mutate(doc):
+                self.unknown_metadata(doc, 6000)
+                views = doc["object_observations"]["objects"]
+                views[0]["successful_key_references"] -= 1
+                views[1]["successful_key_references"] += 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "per-key operations"):
+                self.run_joint(Path(tmp), mutate,
+                               ops_per_key=(2500, 2000, 1500), per_s=1000,
+                               sessions=8, min_rate=1000)
+
+    def test_labelled_row_on_the_wrong_key_fails(self):
+        # A labelled row names a key whose identity never saw that many
+        # references: the label cannot move signs between keys.
+        with tempfile.TemporaryDirectory(prefix="joint-wrongkey-") as tmp:
+            def mutate(doc):
+                rows = doc["object_observations"]["key_operations"]
+                rows[0]["started"] -= 1
+                rows[0]["completed"] -= 1
+                rows[1]["started"] += 1
+                rows[1]["completed"] += 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "per-key object"):
+                self.run_joint(Path(tmp), mutate,
+                               ops_per_key=(2500, 2000, 1500), per_s=1000,
+                               sessions=8, min_rate=1000)
+
+    def test_unknown_summary_with_failed_operations_fails(self):
+        with tempfile.TemporaryDirectory(prefix="joint-mdunk-fail-") as tmp:
+            def mutate(doc):
+                self.unknown_metadata(doc, 9999)
+                doc["object_observations"]["unknown_key_operations"][1][
+                    "failed"] = 1
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "failed, cancelled"):
+                self.run_joint(Path(tmp), mutate)
+
+    def test_generation_count_must_match_the_ledgered_keys(self):
+        with tempfile.TemporaryDirectory(prefix="joint-keygen-") as tmp:
+            def mutate(doc):
+                doc["object_observations"]["unknown_key_operations"][0][
+                    "completed"] = 2
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "generate_key operations"):
                 self.run_joint(Path(tmp), mutate)
 
     def test_foreign_instance_key_row_fails(self):

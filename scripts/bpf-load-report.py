@@ -115,6 +115,13 @@ WITNESS_UNIQUE_ROOTS = frozenset({
     "p11_pw_unmap", "p11_pw_depart_exit", "p11_pw_depart_exec",
     "p11_pw_depart", "p11_pw_torn", "p11_pw_migrate", "p11_pw_walk",
 })
+# The kernel identity object (crates/ebpf/native/vma_identity.c,
+# src/attach/identity_iter.rs ANCHOR_PROGRAM/TARGET_PROGRAM): the two
+# task_vma iterators, standalone, sharing no roots with any other
+# object. Linked inventories load it beside the journal object.
+IDENTITY_UNIQUE_ROOTS = frozenset({
+    "p11_anchor_vma", "p11_identity_vma",
+})
 # Every root any shipped object loads (for foreign-group detection).
 # The 13 defaults are shared by Detailed and counter; 10 of them are
 # also shared by Inventory (which lacks p11_entry/p11_return/task_newtask).
@@ -127,7 +134,8 @@ KNOWN_SHARED_ROOTS = frozenset({
 })
 KNOWN_ROOTS = (KNOWN_SHARED_ROOTS | INVENTORY_UNIQUE_ROOTS
                | COUNTER_UNIQUE_ROOTS | DETAILED_UNIQUE_ROOTS
-               | JOURNAL_UNIQUE_ROOTS | WITNESS_UNIQUE_ROOTS)
+               | JOURNAL_UNIQUE_ROOTS | WITNESS_UNIQUE_ROOTS
+               | IDENTITY_UNIQUE_ROOTS)
 # Inventory's 12 loaded programs (for partial-group compatibility: a
 # shared-only group whose roots all sit in this set is an Inventory
 # partial that failed before its usage roots loaded).
@@ -219,15 +227,16 @@ def assign_btf_group(entries):
     """One object's name for a BTF group, or None when shared-only.
 
     Returns (object, error) where object is "inventory", "counter",
-    "detailed", "journal", "witness", or None, and error names an
-    ambiguous (two objects) or foreign (no known root) group.
+    "detailed", "journal", "witness", "identity", or None, and error
+    names an ambiguous (two objects) or foreign (no known root) group.
     Shared-only groups of known roots (the lone Detailed return,
     partial loads that failed before their unique roots) return
     (None, None); the caller decides by the requested object whether
     they belong. The journal pair wins over Detailed (every journal
     group carries Detailed-only roots); journal with inventory,
-    counter, or witness roots is still ambiguous. The witness object
-    shares no roots, so any mixing with it is ambiguous.
+    counter, witness, or identity roots is still ambiguous. The
+    witness and identity objects share no roots, so any mixing with
+    them is ambiguous.
     """
     roots = {entry["root"] for entry in entries}
     has_inventory = bool(roots & INVENTORY_UNIQUE_ROOTS)
@@ -235,24 +244,38 @@ def assign_btf_group(entries):
     has_detailed = bool(roots & DETAILED_UNIQUE_ROOTS)
     has_journal = bool(roots & JOURNAL_UNIQUE_ROOTS)
     has_witness = bool(roots & WITNESS_UNIQUE_ROOTS)
-    if has_journal and (has_inventory or has_counter or has_witness):
+    has_identity = bool(roots & IDENTITY_UNIQUE_ROOTS)
+    if has_journal and (has_inventory or has_counter or has_witness
+                       or has_identity):
         kinds = sorted(kind for kind, has in
                        (("counter", has_counter),
+                        ("identity", has_identity),
                         ("inventory", has_inventory),
                         ("journal", has_journal),
                         ("witness", has_witness)) if has)
         return None, f"matches two objects ({','.join(kinds)})"
     if has_journal:
         return "journal", None
-    if has_witness and (has_inventory or has_counter or has_detailed):
+    if has_witness and (has_inventory or has_counter or has_detailed
+                       or has_identity):
         kinds = sorted(kind for kind, has in
                        (("counter", has_counter),
                         ("detailed", has_detailed),
+                        ("identity", has_identity),
                         ("inventory", has_inventory),
                         ("witness", has_witness)) if has)
         return None, f"matches two objects ({','.join(kinds)})"
     if has_witness:
         return "witness", None
+    if has_identity and (has_inventory or has_counter or has_detailed):
+        kinds = sorted(kind for kind, has in
+                       (("counter", has_counter),
+                        ("detailed", has_detailed),
+                        ("identity", has_identity),
+                        ("inventory", has_inventory)) if has)
+        return None, f"matches two objects ({','.join(kinds)})"
+    if has_identity:
+        return "identity", None
     hits = sum((has_inventory, has_counter, has_detailed))
     if hits > 1:
         kinds = sorted(kind for kind, has in
@@ -335,8 +358,8 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     roots) belong to Detailed, and to Inventory only when every root
     sits in Inventory's program set; counter objects always carry
     their bank roots, journal objects always carry their pair, and
-    witness groups always carry witness roots, so shared-only groups
-    never belong to them.
+    witness and identity groups always carry their own roots, so
+    shared-only groups never belong to them.
     "detailed-gate1" selects exactly the Detailed groups and
     "journal-gate1" exactly the journal groups (gate-1 objects carry the
     same unique roots); only the budget-key prefix differs.
@@ -353,6 +376,7 @@ def select_object_loads(parsed_loads, object_name, group_errors):
     want_detailed = object_name in ("detailed", "detailed-gate1")
     want_journal = object_name in ("journal", "journal-gate1")
     want_witness = object_name == "prearm-witness"
+    want_identity = object_name == "identity"
     for btf_id in sorted(by_btf):
         entries = by_btf[btf_id]
         if btf_id == 0:
@@ -380,6 +404,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
         elif assigned == "witness":
             if want_witness:
                 selected.extend(entries)
+        elif assigned == "identity":
+            if want_identity:
+                selected.extend(entries)
         elif assigned == "detailed":
             if want_detailed:
                 selected.extend(entries)
@@ -390,8 +417,9 @@ def select_object_loads(parsed_loads, object_name, group_errors):
             elif object_name == "inventory" and roots <= INVENTORY_PROGRAMS:
                 selected.extend(entries)
             # Counter modes take only bank-carrying groups, journal
-            # takes only pair-carrying groups, and prearm-witness takes
-            # only witness-root groups; shared-only groups (the lone
+            # takes only pair-carrying groups, prearm-witness takes
+            # only witness-root groups and identity takes only
+            # identity-root groups; shared-only groups (the lone
             # Detailed return) never belong to them.
     return selected
 

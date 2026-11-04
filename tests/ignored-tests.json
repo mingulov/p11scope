@@ -1851,7 +1851,11 @@
       "file": "src/attach/prearm_witness_tests.rs",
       "path": "attach::prearm_witness::prearm_witness_tests::witness_fixture_entrypoint",
       "reason": "private witness fixture helper; invoked by P2-7 cells",
-      "cell": "helper"
+      "cell": "helper",
+      "until": {
+        "item": "permanent: private re-exec helper, never a standalone cell",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "tests/prearm_witness_cli.rs",

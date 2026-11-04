@@ -377,7 +377,7 @@ class Gate0IdentityTests(unittest.TestCase):
         self.assertEqual(CHECKER.compare_object(self.fixture, mutated), [])
 
     def lay_out(self, root, source=None):
-        """All seven objects as copies of one object (nested + flat)."""
+        """All eight objects as copies of one object (nested + flat)."""
         for name in CHECKER.OBJECTS:
             target = root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -524,6 +524,38 @@ class Gate0IdentityTests(unittest.TestCase):
         self.assertIn("OVERALL: FAIL", text)
         self.assertIn("p11scope-ebpf-inventory-callers: FAIL", text)
         self.assertIn(".rel.text", text)
+
+    def test_main_compares_the_journal_object(self):
+        base = self.case_path("base")
+        cand = self.case_path("cand")
+        self.lay_out(base)
+        self.lay_out(cand)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(CHECKER.main(["check", str(base), str(cand)]), 0)
+        self.assertIn("p11scope-ebpf-journal-v1: PASS", out.getvalue())
+        self.flip_section_byte(cand / "journal-v1" / "p11scope-ebpf-journal-v1", ".text")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(CHECKER.main(["check", str(base), str(cand)]), 1)
+        text = out.getvalue()
+        self.assertIn("OVERALL: FAIL", text)
+        self.assertIn("p11scope-ebpf-journal-v1: FAIL", text)
+        self.assertIn(".text", text)
+
+    def test_main_fails_when_the_journal_object_is_missing(self):
+        base = self.case_path("base")
+        cand = self.case_path("cand")
+        self.lay_out(base)
+        self.lay_out(cand)
+        (cand / "journal-v1" / "p11scope-ebpf-journal-v1").unlink()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(CHECKER.main(["check", str(base), str(cand)]), 1)
+        text = out.getvalue()
+        self.assertIn("OVERALL: FAIL", text)
+        self.assertIn("p11scope-ebpf-journal-v1: FAIL", text)
+        self.assertIn("missing in candidate", text)
 
 
 if __name__ == "__main__":

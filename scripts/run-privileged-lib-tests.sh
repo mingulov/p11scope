@@ -647,6 +647,7 @@ semantics_edge::resource_tests::native_semantic_resource_probe
 discovery::sweep_attribution::tests::d4_thread_mapping_helper
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
 discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
+attach::prearm_witness::prearm_witness_tests::witness_fixture_entrypoint
 # TID-scoped nonleader anchor run (installs nothing live; strict BPF
 # load): needs root with a live nonleader thread, run by hand.
 attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
@@ -690,6 +691,7 @@ SKIP_REASONS=(
 "private entrypoint re-executed only by the owned live-thread/private-files parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
+"private re-exec entrypoint for the P2-7 witness fixture children (P11SCOPE_PW_CHILD modes); missing fixture configuration fails and this helper never qualifies independently"
 "needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "live-kernel BPF lane: reports bpf_loop helper presence without asserting it; run exact --ignored as root in an authorized BPF lane"
 "pre-5.17 kernel lane: proves preparation refuses cleanly without the bpf_loop helper (passes vacuously on newer hosts); run exact --ignored as root on that kernel lane"

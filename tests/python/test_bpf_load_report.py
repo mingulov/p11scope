@@ -1379,6 +1379,82 @@ class ReportTests(unittest.TestCase):
                        "p11_pw_torn", "p11_pw_migrate", "p11_pw_walk"]:
             self.assertIn(f'"{member}"', block)
 
+    def mixed_identity_journal_loads(self):
+        # The linked inventory probe file: the journal group plus the
+        # two identity BTF groups the kernel session's probe-then-fresh
+        # load leaves behind (anchor + target programs each time).
+        return self.mixed_journal_loads() + [
+            load_row("p11_anchor_vma", processed=22001, btf_id=63),
+            load_row("p11_identity_vma", processed=15044, btf_id=63),
+            load_row("p11_anchor_vma", processed=22001, btf_id=64),
+            load_row("p11_identity_vma", processed=15044, btf_id=64),
+        ]
+
+    def test_mixed_identity_journal_gate1_scores_journal_only(self):
+        # The identity groups are known and out of scope for the
+        # journal gate: journal-gate1 keeps its own counts, and the
+        # identity roots never read as foreign.
+        loads = self.mixed_identity_journal_loads()
+        budgets = self.write_budgets({
+            "journal-gate1/p11_entry_journal": {KERNEL: 120000},
+            "journal-gate1/p11_return_journal": {KERNEL: 300000},
+            "journal-gate1/p11_image_query": {KERNEL: 512},
+            "journal-gate1/interface_entry": {KERNEL: 95853},
+            "journal-gate1/interface_return": {KERNEL: 863427},
+        })
+        result = self.run_report(self.write_loads("journal.jsonl", loads),
+                                 budgets=budgets,
+                                 object_name="journal-gate1")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("journal-gate1/p11_entry_journal", result.stdout)
+        self.assertIn("83350", result.stdout)
+        self.assertNotIn("matches no object", result.stdout)
+        self.assertNotIn("p11_anchor_vma", result.stdout)
+        self.assertNotIn("p11_identity_vma", result.stdout)
+
+    def test_identity_object_scores_identity_only(self):
+        loads = self.mixed_identity_journal_loads()
+        budgets = self.write_budgets({
+            "identity/p11_anchor_vma": {KERNEL: 30000},
+            "identity/p11_identity_vma": {KERNEL: 30000},
+        })
+        result = self.run_report(self.write_loads("identity.jsonl", loads),
+                                 budgets=budgets, object_name="identity")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("identity/p11_anchor_vma", result.stdout)
+        self.assertIn("22001", result.stdout)
+        self.assertNotIn("83350", result.stdout)
+        self.assertNotIn("p11_entry_journal", result.stdout)
+
+    def test_identity_group_with_detailed_root_is_ambiguous(self):
+        # A BTF group holding both an identity root and a
+        # Detailed-only root matches two objects: it FAILs naming
+        # its BTF id, whichever object is scored.
+        loads = [
+            load_row("p11_anchor_vma", processed=22001, btf_id=61),
+            load_row("p11_image_query", processed=512, btf_id=61),
+        ]
+        budgets = self.write_budgets({
+            "identity/p11_anchor_vma": {KERNEL: 30000},
+        })
+        result = self.run_report(self.write_loads("mixed.jsonl", loads),
+                                 budgets=budgets, object_name="identity")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("btf-61-ambiguous", result.stdout)
+        self.assertIn("matches two objects", result.stdout)
+
+    def test_identity_members_are_identity_unique_roots(self):
+        # Both identity roots must assign their BTF group to the
+        # identity object; an unknown root fails the whole gate.
+        text = SCRIPT.read_text(encoding="ascii")
+        block = text[text.index("IDENTITY_UNIQUE_ROOTS"):
+                     text.index("KNOWN_ROOTS")]
+        for member in ["p11_anchor_vma", "p11_identity_vma"]:
+            self.assertIn(f'"{member}"', block)
+
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked
 # against src/attach.rs by the fingerprint test above.

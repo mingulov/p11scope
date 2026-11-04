@@ -48,6 +48,71 @@ def write_results(tmp, rows):
     return path
 
 
+def extract_inventory_oracle():
+    """Extract the inventory-cgroup python oracle block from the qualifier."""
+    lines = QUAL.read_text().splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if '"$cell-inside.wl"' in line
+        and line.strip().startswith("python3 - "))
+    end = next(i for i in range(start, len(lines))
+               if lines[i].rstrip("\n") == "PY")
+    return "".join(lines[start + 1:end])
+
+
+MODPATH = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
+UNPROVEN = "original_file_unproven: kernel witness unavailable"
+NATIVE = ("no settled expected native image for this caller in the "
+          "acquisition domain; scan-pinned fallback retained")
+
+
+def overlay_report():
+    """The exact 0-module overlay signature (CI guest shape)."""
+    return {
+        "schema": "p11scope/inventory/v1",
+        "scope": "cgroup",
+        "modules": [],
+        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        "edges": [],
+        "gaps": [
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": UNPROVEN, "subject": MODPATH, "repeats": 12},
+            {"caller": None, "module": None, "pid": None,
+             "reason": "cgroup member scan was incomplete",
+             "subject": "cgroup scope transaction incomplete",
+             "repeats": 24},
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": NATIVE, "subject": "native owner activation refused",
+             "repeats": 11},
+            {"caller": "c1", "module": None, "pid": 101,
+             "reason": UNPROVEN, "subject": MODPATH, "repeats": 10},
+            {"caller": "c1", "module": None, "pid": 101,
+             "reason": NATIVE, "subject": "native owner activation refused",
+             "repeats": 9},
+        ],
+    }
+
+
+def run_oracle(report, *, modfs="overlay", pin=None):
+    """Run the extracted oracle against a fixture report."""
+    block = extract_inventory_oracle()
+    if pin is None:
+        pin = {"dev": [0, 0], "ino": 0, "sha256": "00"}
+    inside_wl = "READY pid=100\nCHILD pid=101\nLEDGER x\n"
+    outside_wl = "READY pid=102\nLEDGER y\n"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        (tmp / "r.json").write_text(json.dumps(report))
+        (tmp / "in.wl").write_text(inside_wl)
+        (tmp / "out.wl").write_text(outside_wl)
+        proc = subprocess.run(
+            ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
+             json.dumps(pin), MODPATH, modfs],
+            input=block, capture_output=True, text=True, timeout=30,
+            cwd=str(tmp))
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 class SummaryTests(unittest.TestCase):
     def test_expected_failures_do_not_fail_summary(self):
         rows = [
@@ -224,7 +289,8 @@ class ScriptTextTests(unittest.TestCase):
     def test_expected_reasons_present(self):
         text = QUAL.read_text()
         for name in ("REASON_CGROUP", "REASON_TRACE_CGROUP",
-                     "REASON_INVENTORY_7X", "REASON_IA32"):
+                     "REASON_INVENTORY_7X", "REASON_INVENTORY_OVERLAY",
+                     "REASON_IA32"):
             self.assertIn(name, text, f"missing {name} with named product-gap reason")
         self.assertNotIn("REASON_RUN", text,
                          "run exact loss is fixed and qualified; its reason must be gone")
@@ -269,6 +335,85 @@ class ScriptTextTests(unittest.TestCase):
         self.assertIn("inventory gaps about owned module", text)
         self.assertIn("REASON_INVENTORY_7X", text,
                       "inventory 7.x gap must map to expected-failure with named reason")
+
+    def test_inventory_overlay_reason_present(self):
+        text = QUAL.read_text()
+        self.assertIn("REASON_INVENTORY_OVERLAY", text,
+                      "overlay unproven signature needs a named reason")
+        self.assertIn('module_fs=$(stat -f -c %T "$MODULE"', text,
+                      "the overlay branch must be gated on the module fs")
+        pos = text.index("inventory\\ overlay\\ unproven\\ signature")
+        segment = text[pos:pos + 400]
+        self.assertIn("REASON_INVENTORY_OVERLAY", segment)
+        self.assertIn("expected-failure", segment,
+                      "the overlay signature must map to expected-failure")
+
+
+class InventoryOverlayTests(unittest.TestCase):
+    def test_overlay_signature_emits_the_marker(self):
+        rc, out = run_oracle(overlay_report())
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inventory overlay unproven signature: "
+                      "0 modules, 2 unproven gaps", out)
+
+    def test_overlay_branch_rejects(self):
+        cases = []
+        ext4 = overlay_report()
+        cases.append(("ext4", ext4, "ext4", "owned provider not inventoried"))
+        other = overlay_report()
+        other["modules"] = [{"id": "m9", "identity": {}}]
+        cases.append(("nonempty-modules", other, "overlay",
+                      "owned provider not inventoried"))
+        dropped = overlay_report()
+        dropped["gaps"] = [g for g in dropped["gaps"]
+                           if g.get("caller") != "c1"
+                           or g.get("reason") != UNPROVEN]
+        cases.append(("dropped-unproven", dropped, "overlay",
+                      "overlay unproven caller cover"))
+        leaked = overlay_report()
+        leaked["callers"].append({"id": "c2", "pid": 102})
+        cases.append(("outside-leak", leaked, "overlay",
+                      "outside workload leaked into cgroup inventory"))
+        edged = overlay_report()
+        edged["edges"] = [{"caller": "c0", "module": "m0"}]
+        cases.append(("edges-present", edged, "overlay",
+                      "overlay unproven edges present"))
+        extra = overlay_report()
+        extra["gaps"].append({"caller": None, "module": None, "pid": None,
+                             "reason": "something new",
+                             "subject": "novel gap", "repeats": 1})
+        cases.append(("extra-gap", extra, "overlay",
+                      "overlay unproven extra gap"))
+        subject = overlay_report()
+        subject["gaps"][0]["subject"] = "/some/other/path.so"
+        cases.append(("wrong-subject", subject, "overlay",
+                      "overlay unproven subject"))
+        for name, report, modfs, marker in cases:
+            with self.subTest(name=name):
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(marker, out)
+                self.assertNotIn("inventory overlay unproven signature",
+                                 out)
+
+    def test_owned_pass_path_still_passes(self):
+        pin = {"dev": [8, 1], "ino": 42, "sha256": "ab" * 32}
+        report = {
+            "schema": "p11scope/inventory/v1",
+            "scope": "cgroup",
+            "modules": [{"id": "m0",
+                         "identity": {"device": {"major": 8, "minor": 1},
+                                      "inode": 42, "sha256": "ab" * 32},
+                         "admission": {"state": "admitted"}}],
+            "callers": [{"id": "c0", "pid": 100},
+                        {"id": "c1", "pid": 101}],
+            "edges": [{"caller": "c0", "module": "m0"}],
+            "gaps": [],
+        }
+        rc, out = run_oracle(report, modfs="ext4", pin=pin)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("inventory cgroup: inside=100 child=101 "
+                      "outside=102 excluded module=m0 gaps=0", out)
 
 
 if __name__ == "__main__":

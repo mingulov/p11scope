@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,10 @@ static int target(const char *name, void *address) {
 static const char *names[] = {"C_GenerateRandom", "C_DigestInit", "C_Digest",
   "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal"};
 static const int ordinals[] = {64, 37, 38, 26, 27, 28};
+/* CK_FUNCTION_LIST opens with the 2-byte version; the function table
+ * follows at pointer alignment (8 on LP64, 4 on ILP32). The ia32 leg
+ * builds this fixture -m32, so the offset must come from the compiler. */
+struct ck_function_list_head { unsigned char major, minor; void *first; };
 int main(int argc, char **argv) {
   if (argc != 5) { fprintf(stderr, "usage: gated MODULE ITERS SLEEP_US GATEFILE\n"); return 2; }
   long n = atol(argv[2]), us = atol(argv[3]); const char *gate = argv[4]; int gated = strcmp(gate, "-") != 0;
@@ -46,7 +51,7 @@ int main(int argc, char **argv) {
   unsigned long (*gfl)(void **) = (unsigned long (*)(void **))dlsym(h, "C_GetFunctionList");
   void *list = 0;
   if (!gfl || gfl(&list) || !list) return 1;
-  fns = (void **)((char *)list + 8);
+  fns = (void **)((char *)list + offsetof(struct ck_function_list_head, first));
   if (F(0, CK_RV (*)(void *))(NULL)) return 1;
   CK_SLOT_ID slots[16]; CK_ULONG ns = 16;
   if (F(4, CK_RV (*)(unsigned char, CK_SLOT_ID *, CK_ULONG *))(1, slots, &ns) || !ns) return 1;

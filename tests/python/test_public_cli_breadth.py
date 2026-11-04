@@ -479,5 +479,83 @@ class ForkFixtureTests(unittest.TestCase):
             self.assertEqual(row["successful"], 6)
 
 
+PROVIDER32 = r'''
+#include <stdlib.h>
+typedef unsigned long U;
+U C_Initialize(void *a){(void)a;return 0;}
+U C_Finalize(void *a){(void)a;return 0;}
+U C_GetSlotList(unsigned char t,U *s,U *n){(void)t;s[0]=1;*n=1;return 0;}
+U C_OpenSession(U a,U b,void *c,void*d,U*s){(void)a;(void)b;(void)c;(void)d;*s=1;return 0;}
+U C_CloseSession(U s){(void)s;return 0;}
+U C_Login(U s,U u,unsigned char*p,U n){(void)s;(void)u;(void)p;(void)n;return 0;}
+U C_Logout(U s){(void)s;return 0;}
+U C_GenerateRandom(U s,unsigned char*b,U n){(void)s;(void)b;(void)n;return 0;}
+U C_DigestInit(U s,void*m){(void)s;(void)m;return 0;}
+U C_Digest(U s,unsigned char*b,U n,unsigned char*o,U*l){(void)s;(void)b;(void)n;(void)o;*l=32;return 0;}
+U C_FindObjectsInit(U s,void*t,U n){(void)s;(void)t;(void)n;return 0;}
+U C_FindObjects(U s,U*o,U n,U*c){(void)s;(void)o;(void)n;*c=0;return 0;}
+U C_FindObjectsFinal(U s){(void)s;return 0;}
+/* True cryptoki layout: the 2-byte version, then the table at pointer
+ * alignment (offset 4 under -m32). A fixture that hard-codes the LP64
+ * offset reads every entry shifted and never reaches READY. */
+struct { unsigned char major, minor; void *p[70]; } list={.major=2,.minor=40,.p={
+ [0]=C_Initialize,[1]=C_Finalize,[4]=C_GetSlotList,[12]=C_OpenSession,
+ [13]=C_CloseSession,[18]=C_Login,[19]=C_Logout,[26]=C_FindObjectsInit,
+ [27]=C_FindObjects,[28]=C_FindObjectsFinal,[37]=C_DigestInit,[38]=C_Digest,[64]=C_GenerateRandom}};
+U C_GetFunctionList(void**out){*out=&list;return 0;}
+'''
+
+
+class Gated32FixtureTests(unittest.TestCase):
+    """The ia32 leg builds gated.c -m32; its function-table offset must be
+    width-correct or the workload segfaults before READY (no ledger)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.storage = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls.storage.name)
+        probe = cls.tmp / "probe32.c"
+        probe.write_text("int main(void){return 0;}\n")
+        tiny = cls.tmp / "tiny32"
+        build = subprocess.run(["gcc", "-m32", "-O1", "-o", str(tiny), str(probe)],
+                               capture_output=True, text=True)
+        runnable = (build.returncode == 0 and tiny.exists() and
+                    subprocess.run([str(tiny)]).returncode == 0)
+        if not runnable:
+            raise unittest.SkipTest("no working gcc -m32 on this host")
+        source = cls.tmp / "provider32.c"
+        source.write_text(PROVIDER32)
+        cls.module = cls.tmp / "provider32.so"
+        subprocess.run(["gcc", "-m32", "-shared", "-fPIC", "-O1",
+                        "-o", str(cls.module), str(source)], check=True)
+        cls.gated = cls.tmp / "gated32"
+        subprocess.run(["gcc", "-m32", "-O1", "-o", str(cls.gated),
+                        str(ROOT / "tests/fixtures/public-cli/gated.c"),
+                        "-ldl"], check=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.storage.cleanup()
+
+    def test_gated32_reaches_ready_and_ledgers(self):
+        proc = subprocess.run([str(self.gated), str(self.module),
+                               "3", "0", "-"],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = proc.stdout.splitlines()
+        targets = [json.loads(line[7:]) for line in lines
+                   if line.startswith("TARGET ")]
+        self.assertEqual({row["name"] for row in targets}, set(NAMES))
+        ready = [line for line in lines if line.startswith("READY pid=")]
+        self.assertEqual(len(ready), 1)
+        ledgers = [json.loads(line[7:]) for line in lines
+                   if line.startswith("LEDGER ")]
+        self.assertEqual(len(ledgers), 1)
+        self.assertTrue(ledgers[0]["complete"])
+        for row in ledgers[0]["functions"]:
+            self.assertEqual(row["attempts"], 3)
+            self.assertEqual(row["successful"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

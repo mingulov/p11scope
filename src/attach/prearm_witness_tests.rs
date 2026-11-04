@@ -913,8 +913,19 @@ fn fixture_sleep() {
 
 // userfaultfd ABI (linux/userfaultfd.h): ioctl numbers and structs for
 // the held-teardown holder. Verified against the host headers.
+// musl `ioctl` takes a c_int request, glibc a c_ulong one; the `as`
+// casts keep the identical bit patterns (the numbers set the high bit).
+#[cfg(target_env = "musl")]
+const UFFDIO_API_NR: libc::c_int = 0xC018_AA3F_u32 as libc::c_int;
+#[cfg(target_env = "musl")]
+const UFFDIO_REGISTER_NR: libc::c_int = 0xC020_AA00_u32 as libc::c_int;
+#[cfg(target_env = "musl")]
+const UFFDIO_ZEROPAGE_NR: libc::c_int = 0xC020_AA04_u32 as libc::c_int;
+#[cfg(not(target_env = "musl"))]
 const UFFDIO_API_NR: libc::c_ulong = 0xC018_AA3F;
+#[cfg(not(target_env = "musl"))]
 const UFFDIO_REGISTER_NR: libc::c_ulong = 0xC020_AA00;
+#[cfg(not(target_env = "musl"))]
 const UFFDIO_ZEROPAGE_NR: libc::c_ulong = 0xC020_AA04;
 const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
 

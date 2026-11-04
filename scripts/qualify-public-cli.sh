@@ -190,6 +190,7 @@ PY
 REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
 REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
 REASON_INVENTORY_7X="inventory cgroup owned-module gaps on 7.x (native endpoint attach failed, 68 deferred); product fix lane for inventory 7.x"
+REASON_INVENTORY_OVERLAY="inventory cgroup overlay unproven (K1 collection witness unavailable, owned file unproven with 0 modules); product fix lane for inventory overlay witness"
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
 asuser() {
   if [ "$CONTROL" = 1 ]; then exec "$@"; fi
@@ -509,11 +510,13 @@ cgroup_capture() {
   if [ "$cg_gone" != 1 ]; then result "$cell" 0 "owned cgroup not removed $CG (force cleanup attempted)" failed; return 1; fi
   if [ "$kind" = inventory ]; then
     publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
-    python3 - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" <<'PY' > "$cell.detail" 2>&1
+    module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
+    python3 - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$MODULE" "$module_fs" <<'PY' > "$cell.detail" 2>&1
 import json,sys
 report=json.load(open(sys.argv[1]))
 inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
 pin=json.loads(sys.argv[4])
+modpath=sys.argv[5]; modfs=sys.argv[6]
 assert report.get('schema')=='p11scope/inventory/v1', 'inventory schema'
 assert report.get('scope')=='cgroup', 'inventory scope'
 inside_pid=int([l for l in inside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
@@ -528,7 +531,28 @@ for mid,m in modules.items():
     dev=ident.get('device',{})
     if [dev.get('major'),dev.get('minor')]==pin['dev'] and ident.get('inode')==pin['ino'] and ident.get('sha256')==pin['sha256']:
         owned=mid; break
-assert owned is not None, 'owned provider not inventoried'
+assert owned is not None or modfs=='overlay', 'owned provider not inventoried'
+if owned is None:
+    assert modules=={}, 'owned provider not inventoried'
+    callers={c['id']:c for c in report.get('callers',[])}
+    inside_ids=[cid for cid,c in callers.items() if c.get('pid')==inside_pid]
+    child_ids=[cid for cid,c in callers.items() if c.get('pid')==child_pid]
+    outside_ids=[cid for cid,c in callers.items() if c.get('pid')==outside_pid]
+    assert inside_ids, 'overlay unproven inside parent not a caller'
+    assert child_ids, 'overlay unproven fork-after-attach child not a caller'
+    assert not outside_ids, 'outside workload leaked into cgroup inventory'
+    assert report.get('edges',[])==[], 'overlay unproven edges present'
+    want=sorted(set(inside_ids+child_ids))
+    unproven=[g for g in report.get('gaps',[]) if g.get('reason')=='original_file_unproven: kernel witness unavailable']
+    assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
+    pidof={cid:callers[cid].get('pid') for cid in want}
+    for g in unproven:
+        assert g.get('subject')==modpath, 'overlay unproven subject'
+        assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
+    rest=[g for g in report.get('gaps',[]) if g.get('reason')!='original_file_unproven: kernel witness unavailable']
+    known={'cgroup member scan was incomplete','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'}
+    assert all(g.get('reason') in known for g in rest), 'overlay unproven extra gap: %r' % rest
+    assert False, 'inventory overlay unproven signature: 0 modules, %d unproven gaps' % len(unproven)
 assert modules[owned].get('admission',{}).get('state')=='admitted', 'owned provider not admitted'
 callers={c['id']:c for c in report.get('callers',[])}
 inside_ids=[cid for cid,c in callers.items() if c.get('pid')==inside_pid]
@@ -552,6 +576,8 @@ PY
       case "$detail" in
         *inventory\ gaps\ about\ owned\ module*)
           result "$cell" 0 "$REASON_INVENTORY_7X: [failed] $detail" expected-failure ;;
+        *inventory\ overlay\ unproven\ signature*)
+          result "$cell" 0 "$REASON_INVENTORY_OVERLAY: [failed] $detail" expected-failure ;;
         *) result "$cell" 0 "$detail" failed ;;
       esac
     fi

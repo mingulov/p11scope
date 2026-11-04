@@ -3,8 +3,9 @@
 """Section-level gate-0 identity check (ruling P2F-2, hardened by P2F-5 F3,
 I1 program sections and the P2F-9 structural .BTF fallback).
 
-Compares the seven default BPF objects between two build output directories
-(a base OUT_DIR and a candidate OUT_DIR). For each object the following must
+Compares the eight default BPF objects between two build output directories
+(a base OUT_DIR and a candidate OUT_DIR): the seven gate-0 objects plus the
+production journal object. For each object the following must
 be byte-identical:
 
 - .text (executable code)
@@ -47,10 +48,11 @@ Usage:
   python3 -I scripts/check-gate0-identity.py BASE_OUT CANDIDATE_OUT
 
 Each OUT_DIR holds p11scope-ebpf{,-inventory,-inventory-callers,-identity}
-at its top level and the three counter-bank objects under
-counter-bank-growth-v2/ (a flat directory holding all seven by basename is
+at its top level, the three counter-bank objects under
+counter-bank-growth-v2/ and the production journal object under
+journal-v1/ (a flat directory holding all eight by basename is
 also accepted, for archived evidence). Exits 0 only when every required
-section matches for all seven objects.
+section matches for all eight objects.
 """
 
 import hashlib
@@ -71,6 +73,7 @@ OBJECTS = (
     "counter-bank-growth-v2/p11scope-ebpf-counts-bank-growth-v2",
     "counter-bank-growth-v2/p11scope-ebpf-latency-bank-growth-v2",
     "counter-bank-growth-v2/p11scope-ebpf-timestamps-bank-growth-v2",
+    "journal-v1/p11scope-ebpf-journal-v1",
 )
 
 REQUIRED_SECTIONS = (".text", ".rodata", ".maps", "maps", ".BTF")

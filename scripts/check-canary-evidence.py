@@ -1915,17 +1915,21 @@ def assert_final_artifact_privacy(artifacts):
 
 # Safe profile/trace lanes whose own capture document legitimately
 # carries the narrow unknown ids on 32-bit targets (approved shape
-# only: id fields in profile JSON rows, mechanism tokens in trace
-# text, the same trace lines duplicated verbatim in observer logs,
-# and the mechanism field in retained EVENTS bytes). Every other lane
-# and every other artifact — map dumps, receipts, manifests, metrics,
-# START and object/journal lanes — gets no allowance.
+# only: id fields in profile JSON rows, approved profile-table rows
+# in observer logs, mechanism tokens in trace text, the same trace
+# lines duplicated verbatim in observer logs, and the mechanism field
+# in retained EVENTS bytes). Every other lane and every other
+# artifact — map dumps, receipts, manifests, metrics, START and
+# object/journal lanes — gets no allowance.
 SAFE_PROFILE_TRACE_LANES = frozenset({
     "default-safe-profile", "feature-safe-profile",
     "default-safe-trace", "feature-safe-trace",
 })
 SAFE_TRACE_LANES = frozenset({
     "default-safe-trace", "feature-safe-trace",
+})
+SAFE_PROFILE_LANES = frozenset({
+    "default-safe-profile", "feature-safe-profile",
 })
 
 
@@ -1990,6 +1994,29 @@ def strip_approved_mechanism_tokens(content):
         stripped = re.sub(rb" C_[A-Za-z]+ " + re.escape(token) + " → ".encode(),
                           b" ", stripped)
     return stripped
+
+
+def strip_approved_profile_text_rows(content):
+    """Drop only the approved id token from approved profile-table rows.
+
+    Removes the `0x<approved>` token, and only that token, from lines
+    that are exactly a profile MECHANISM table row (hex id plus calls
+    and errors counts, nothing else). The counts stay for the
+    unchanged alias scan, as with the JSON row strip. Any other
+    spelling (decimal, a non-approved id, an extra field, packed
+    bytes) survives it.
+    """
+    approved = {f"0x{value:x}".encode() for value in (UNKNOWN, MAXIMUM)}
+    stripped = []
+    for line in content.splitlines(keepends=True):
+        bare = line.rstrip(b"\r\n")
+        ending = line[len(bare):]
+        fields = bare.split()
+        if (len(fields) == 3 and fields[0] in approved
+                and fields[1].isdigit() and fields[2].isdigit()):
+            bare = bare.replace(fields[0], b" ", 1)
+        stripped.append(bare + ending)
+    return b"".join(stripped)
 
 
 def strip_approved_events_raw(content):
@@ -2060,6 +2087,16 @@ def assert_safe_lane_alias_privacy(lane, paths):
                     bare = strip_approved_mechanism_tokens(bare)
                 kept.append(bare + ending)
             content = b"".join(kept)
+        elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_LANES
+                and path.name == f"{lane}.observer.log"):
+            # The stopped-phase harness merges the observer's stdout
+            # into this log, so it duplicates the profile MECHANISM
+            # table: bare approved hex ids with call/error counts (the
+            # profile table is a documented publication surface). The
+            # JSON output has no verbatim text lines, so instead of
+            # the trace-log verbatim rule, only exact approved-shape
+            # rows are stripped, keeping their counts for the scan.
+            content = strip_approved_profile_text_rows(content)
         elif (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
                 and path.name == f"{lane}.EVENTS.raw"):
             # The retained records legitimately carry UNKNOWN at the
@@ -2580,6 +2617,31 @@ def main(argv=None):
             reject("observer log token on a log-only line",
                    lambda: assert_safe_lane_alias_privacy(
                        "default-safe-trace", [lane_out, lane_log]))
+        # The profile-text strip drops only the approved token from
+        # exact table rows: a decimal id, a non-approved id, an extra
+        # field, a smuggled count or packed bytes all survive it.
+        profile_row = f"0x{UNKNOWN:x}                          1      0\n".encode()
+        assert alias_hits(strip_approved_profile_text_rows(profile_row)) == set()
+        for label, leaked in (
+            ("decimal id", f"{UNKNOWN}                          1      0\n".encode()),
+            ("non-approved id",
+             f"0x{ALIASES['pss_hash']:x}                          1      0\n".encode()),
+            ("extra field", profile_row[:-1] + b" note\n"),
+            ("smuggled count",
+             f"0x{UNKNOWN:x}                          {UNKNOWN}      0\n".encode()),
+            ("packed bytes", struct.pack("<Q", UNKNOWN)),
+        ):
+            assert alias_hits(strip_approved_profile_text_rows(leaked)) != set(), label
+        with tempfile.TemporaryDirectory() as tmp:
+            lane_out = Path(tmp) / "default-safe-profile.output"
+            lane_log = Path(tmp) / "default-safe-profile.observer.log"
+            lane_out.write_bytes(b"{}")
+            lane_log.write_bytes(profile_row + b"p11scope: capture ended\n")
+            assert_safe_lane_alias_privacy("default-safe-profile", [lane_out, lane_log])
+            lane_log.write_bytes(profile_row + f"leak 0x{UNKNOWN:x}\n".encode())
+            reject("profile observer log misplaced mechanism value",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [lane_out, lane_log]))
         # The EVENTS.raw final scan zeroes only the approved mechanism
         # field: a packed parameter alias, or UNKNOWN outside [48,56),
         # still fails.

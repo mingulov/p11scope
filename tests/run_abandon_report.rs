@@ -218,10 +218,7 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
 /// not match its own source.)
 #[test]
 fn observer_override_uses_the_dedicated_variable() {
-    let path = format!(
-        "{}/tests/run_abandon_report.rs",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = format!("{}/tests/run_abandon_report.rs", env!("CARGO_MANIFEST_DIR"));
     let source = std::fs::read_to_string(&path).unwrap();
     assert!(
         source.contains(r#"std::env::var("P11SCOPE_E2E_OBSERVER")"#),

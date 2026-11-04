@@ -53,7 +53,6 @@ versioned separately and are opaque, exact dispatch keys.
   inspection admits first-come (an over-budget heuristic provider admits
   its strongest prefix with the spill disclosed) instead of refusing
   whole modules at the shared reserve.
->>>>>>> c6ab35747 (docs: document --exclude-module reporting and schema)
 
 ## [0.5.0]
 

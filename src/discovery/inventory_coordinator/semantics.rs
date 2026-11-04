@@ -986,6 +986,38 @@ impl SemanticBindingSet {
                 .all(|history| history.domain == domain && history.image.task_cookie != cookie)
     }
 
+    /// Whether an unrouted call of a journal-refused image proves a
+    /// caller that can never hold Joint history, so its lost position
+    /// need not barrier the bound Joint callers. A refused image's
+    /// birth and attestation refuse permanently, so it never joins
+    /// Joint; this covers the refused caller that later binds for S1,
+    /// whose own binding and admission history then hold its cookie
+    /// and defeat [`Self::proves_unbound_caller`]. Fails closed: the
+    /// call's exact image must itself be refused, and every binding
+    /// or admission history sharing its cookie must be refused too —
+    /// an unrefused same-cookie image (an exec keeps the cookie)
+    /// could own the call and keeps the barrier.
+    pub(crate) fn proves_refused_other_caller(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        image_refused: impl Fn(ImageIdentity) -> bool,
+    ) -> bool {
+        let cookie = image.task_cookie;
+        cookie != 0
+            && !self.bindings.is_empty()
+            && image_refused(image)
+            && self.bindings.iter().all(|binding| {
+                binding.domain() == domain
+                    && binding.image().task_cookie != 0
+                    && (binding.image().task_cookie != cookie || image_refused(binding.image()))
+            })
+            && self.admission_images.values().all(|history| {
+                history.domain == domain
+                    && (history.image.task_cookie != cookie || image_refused(history.image))
+            })
+    }
+
     /// Whether a bound caller holds this Detailed ticket: proven-image
     /// retention keys on it, so the map never outgrows the binding cap.
     fn has_ticket(&self, domain: NativeDomainId, ticket: u64) -> bool {
@@ -3452,12 +3484,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     // Only consulted for unjoined calls below: a record
                     // proving another caller than every bound Joint
                     // caller disposes its position instead of barriering
-                    // their history. It stays shed and disclosed.
-                    let other_caller = (shed_reason.is_some()
-                        && call.domain() == domain
-                        && self
-                            .semantic_bindings
-                            .proves_unbound_caller(domain, call.image()))
+                    // their history. It stays shed and disclosed. The
+                    // refused-image proof covers the other caller that
+                    // bound for S1 after its refusal: refused in the
+                    // journal it can never hold Joint history, so its
+                    // later sheds are still not a Joint caller's loss.
+                    let other_caller = (shed_reason.is_some() && call.domain() == domain && {
+                        let adapter = self.joint_capture.adapter();
+                        let refused = |image: ImageIdentity| {
+                            adapter.image_refused((image.task_cookie, image.exec_id))
+                        };
+                        self.semantic_bindings
+                            .proves_unbound_caller(domain, call.image())
+                            || self.semantic_bindings.proves_refused_other_caller(
+                                domain,
+                                call.image(),
+                                refused,
+                            )
+                    })
                     .then(|| (call.record().event.pid_tgid >> 32) as u32);
                     let call_image = call.image();
                     let cookie = call_image.task_cookie;

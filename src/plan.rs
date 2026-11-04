@@ -894,11 +894,12 @@ pub struct AttachPlan {
     // publication-authorized tables. Carried through rebuilds, never grown.
     // Generic object identity only — no provider names, offsets or symbols.
     first_plan_objects: BTreeSet<PinnedObjectId>,
-    // Whether the capture's first plan input held at least one non-closure
-    // provider (PA-9/C1). A closure alone in the first plan takes no
-    // late-start prefix — it is treated like a mid-capture one — so a
-    // backend decoded later still fits. Computed from the input classes on
-    // an initial build, carried through rebuilds like `first_plan_objects`.
+    // Whether the capture's first plan admitted at least one non-closure
+    // provider onto a slot (PA-9/C1). A closure without one in the first
+    // plan takes no late-start prefix — it is treated like a mid-capture
+    // one — so a backend decoded later still fits. Set by an initial build
+    // as providers are admitted, carried through rebuilds like
+    // `first_plan_objects`.
     first_plan_had_provider: bool,
     // Plan fence for the conservative rebuild cursor: every `&mut self`
     // method bumps `mutations` first, and `token` is minted fresh per plan
@@ -2741,16 +2742,17 @@ fn merge(
     }
     let reserve = shared_scope_reserve(capacity);
     // PA-9/C1: the late-start prefix is granted only when the capture's
-    // first plan also held a non-closure provider. An initial build's input
-    // IS its first plan, so this is read off its classes; a rebuild carries
-    // what its first plan held. A closure alone in the first plan is
-    // treated like a mid-capture one below (published tables only, or the
-    // named exception), so a backend decoded later still fits.
-    let first_plan_had_provider = match allocated.first_plan {
+    // first plan also admitted a non-closure provider onto at least one
+    // slot. An initial build IS the first plan: closures decide after every
+    // provider in each scope, so this is known when a closure decides, and
+    // it is set below as providers are admitted. A provider refused whole,
+    // or one with nothing attachable, does not count. A rebuild carries
+    // what its first plan held. A closure without such a provider in the
+    // first plan is treated like a mid-capture one below (published tables
+    // only, or the named exception), so a backend decoded later still fits.
+    let mut first_plan_had_provider = match allocated.first_plan {
         Some(_) => allocated.first_plan_had_provider,
-        None => classes
-            .iter()
-            .any(|(class, _)| *class != AdmissionClass::ClosureArray),
+        None => false,
     };
     // PA-5 C1 plus the operator-named exception: the heuristic closure
     // prefix is allowed only for a closure object already mapped when the
@@ -3361,6 +3363,12 @@ fn merge(
             && !demand.is_empty()
         {
             provider_omitted = true;
+        }
+        if allocated.first_plan.is_none()
+            && class != AdmissionClass::ClosureArray
+            && kept.len() + fresh.len() > 0
+        {
+            first_plan_had_provider = true;
         }
         allocated_slots = admission_policy
             .checked_required(allocated_slots, fresh.len())
@@ -4075,9 +4083,9 @@ struct ExistingAllocation<'a> {
     /// build, whose input IS the first plan). A closure array gets its
     /// heuristic prefix only when its object is here (PA-5 C1).
     first_plan: Option<&'a BTreeSet<PinnedObjectId>>,
-    /// Whether the capture's first plan input held a non-closure provider
-    /// (PA-9/C1). Read only when `first_plan` is `Some`; an initial build
-    /// computes it from its input classes instead.
+    /// Whether the capture's first plan admitted a non-closure provider
+    /// onto a slot (PA-9/C1). Read only when `first_plan` is `Some`; an
+    /// initial build sets it as its providers are admitted instead.
     first_plan_had_provider: bool,
 }
 
@@ -13365,6 +13373,44 @@ mod tests {
             "{}",
             partial.reason
         );
+    }
+
+    /// PA-9/C1 guard: only a provider the first plan admitted onto a slot
+    /// grants the late-start prefix. A provider refused whole beside the
+    /// closure leaves it as alone as no provider: once that provider is
+    /// gone, the closure still admits only its published tables (none
+    /// here), and the backend arriving after it is admitted in full.
+    #[test]
+    fn refused_provider_in_first_plan_grants_the_closure_no_prefix() {
+        let big = provider_with_tables(50, "/opt/big.so", 1, 600, false);
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let first = scoped_plan(&[big, p11_kit.clone()], AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 50), 0, "oversized provider refused whole");
+        assert_eq!(slots_of(&first, 31), 0, "no prefix behind the loss");
+        let alone = first.rebuild_from_sources(
+            std::slice::from_ref(&p11_kit),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        let refusal = refusal_of(&alone, P11_KIT).expect("closure gap stays named");
+        assert!(
+            is_closure_awaiting_publication(&refusal.reason),
+            "published-only, nothing published: {}",
+            refusal.reason
+        );
+        assert_eq!(
+            slots_of(&alone, 31),
+            0,
+            "a refused provider is no provider: no late-start prefix"
+        );
+        let later = alone.rebuild_from_sources(&[p11_kit, trust], &[], &PinnedObjects::empty());
+        assert_eq!(
+            slots_of(&later, 32),
+            68,
+            "the later backend is admitted in full"
+        );
+        assert_eq!(slots_of(&later, 31), 0, "the closure stays at zero");
     }
 
     /// The unpublished-closure gap states no demand: nothing is refused for

@@ -3571,9 +3571,11 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
 /// descendant (python3 + ctypes, no calls) and prints selected-vs-broad
 /// admission for the report. Run filtered, alone in the process:
 /// `cargo test -p p11scope --lib broad_p11kit -- --ignored --nocapture`.
-/// Asserts only host-robust invariants (broad never spills; a total
-/// refusal carries the whole-module shape); the exact printed numbers
-/// are recorded by hand into the Task 1.6 report.
+/// Asserts only host-robust invariants: selected refuses the lone
+/// dormant proxy whole as awaiting publication (no slots, every table
+/// spilled, one closure-awaiting-publication skip), broad never spills,
+/// and a total refusal carries the whole-module shape. The exact printed
+/// numbers are recorded by hand into the Task 1.6 report.
 #[test]
 #[ignore = "manual: needs host libp11-kit + python3; run filtered with --ignored --nocapture"]
 fn broad_p11kit_admission_arithmetic() {
@@ -3613,9 +3615,31 @@ fn broad_p11kit_admission_arithmetic() {
         selected.plan().uncorroborated_candidates,
         selected.plan().modules_skipped.len(),
     );
+    // Closure era (PA-9/C1): a lone dormant proxy takes no prefix — the
+    // capture's first plan holds no provider beside it, nothing is
+    // published yet, so selected refuses it whole as awaiting publication.
     assert!(
-        !selected.plan().slots.is_empty(),
-        "selected admits something on a real provider"
+        selected.plan().slots.is_empty(),
+        "a lone dormant proxy takes no prefix without a provider beside it"
+    );
+    assert!(
+        selected_tables > 0,
+        "the scan really saw the proxy's lookalike tables"
+    );
+    assert_eq!(
+        selected.plan().uncorroborated_candidates,
+        selected_tables as u64,
+        "every lookalike table spills while unpublished"
+    );
+    assert_eq!(
+        selected.plan().modules_skipped.len(),
+        1,
+        "the lone proxy is the only refusal"
+    );
+    assert!(
+        plan::is_closure_awaiting_publication(&selected.plan().modules_skipped[0].reason),
+        "the lone-proxy refusal carries the awaiting-publication shape: {}",
+        selected.plan().modules_skipped[0].reason,
     );
 
     let mut broad = scan_engine_over_pids(std::slice::from_ref(&pid), true);

@@ -22,6 +22,16 @@ scoped Singles stays correct, finite and disclosed in `observation.attach` and
 `evidence.attach_backend`; it does not establish Multi performance coverage.
 Readiness bounds are disclosed harness parameters, never a cold-start SLA.
 
+Under a saturating multi-threaded flood (twelve threads spinning PKCS#11
+calls for 5 s, about 190,000 calls/s), the userspace drain can lose ring
+events on small hosts: on a quiet 3-vCPU host about one third of the
+~1M calls went unobserved, disclosed as `event_loss` with PARTIAL
+coverage, while the same volume at six threads lost nothing and larger
+hosts and guests hold the twelve-thread flood loss-free. For exact
+captures under a synthetic flood, size the workload to about two
+producer threads per CPU; real application traffic stays far below
+these rates.
+
 Measurement modes aggregate on eligible LP64 hosts, subject to independent
 feature/load limits. A refused counter-mode or Detailed start exits nonzero
 without writing a report or starting the requested `run` program. Latency

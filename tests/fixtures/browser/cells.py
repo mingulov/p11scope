@@ -90,6 +90,15 @@ def _tail(text: str, lines: int = 25) -> str:
     return "\n".join(text.splitlines()[-lines:])
 
 
+def _host_load() -> str:
+    """One-minute load average for timeout diagnostics (never raises)."""
+    try:
+        with open("/proc/loadavg", encoding="ascii") as handle:
+            return handle.read().split()[0]
+    except (OSError, IndexError, UnicodeDecodeError):
+        return "unknown"
+
+
 def _trusted_dir(path: Path) -> Path:
     """Create ``path`` with owner-only writes (the observer refuses group-writable ``-o`` dirs)."""
     path.mkdir(parents=True, exist_ok=True)
@@ -302,7 +311,8 @@ class _ProfilerSession:
         self._proc.kill()
         raise CellError(
             f"profiler never became ready within {timeout_seconds:g}s "
-            f"(no `p11scope: capturing:` marker): {_tail(self.stderr_text())}")
+            f"(no `p11scope: capturing:` marker; host load {_host_load()}): "
+            f"{_tail(self.stderr_text())}")
 
     def poll(self):
         """The profiler's exit code, or None while it runs."""
@@ -356,7 +366,7 @@ def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
                  flow, observe_module: Path, register_module: Path | None = None,
                  browser_env: dict | None = None,
                  duration_seconds: int = 90,
-                 attach_grace_seconds: int = 5,
+                 attach_grace_seconds: int = 30,
                  wait_for_map: tuple[str, ...] | None = None,
                  extra_browser_args: tuple[str, ...] = (),
                  auto_select_cert: bool = True,
@@ -367,8 +377,10 @@ def attach_drive(name: str, browser: str, workdir: Path, flow_url: str,
     ``flow`` is a Playwright callable returning a JSON-able fact dict. The
     profiler observes ``observe_module`` and starts first
     (duration-bounded); the flow runs only after the profiler prints its
-    capture-readiness marker (``attach_grace_seconds`` bounds the wait),
-    so early flow traffic is inside the window. ``register_module`` is the
+    capture-readiness marker (``attach_grace_seconds`` bounds the wait —
+    30s by default, since a quiet attach takes under a second but a
+    post-campaign loaded host needs more), so early flow traffic is inside
+    the window. ``register_module`` is the
     provider registered in the fresh profile (`None` leaves the profile
     without one, for absence twins). ``browser_env`` (notably
     ``SOFTHSM2_CONF``) is applied to this process so the Playwright-launched

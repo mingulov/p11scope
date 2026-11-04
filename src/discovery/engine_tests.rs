@@ -49088,10 +49088,21 @@ fn assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(recovered_cla
             engine.exec_rearm_views[&engine.views[0].id()],
             Some(request.serial)
         );
+        // Diagnostic message only (ruling WU1B-1): the condition is unchanged.
+        // A future failure prints the batch outcome and the surrounding
+        // route state so the next occurrence self-diagnoses.
+        let batch = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(
-            apply_ordinary_batch(&mut engine, &mut session, Vec::new())
-                .unwrap()
-                .required_complete
+            batch.required_complete,
+            "completed-rearm borrow batch incomplete: batch={batch:?} class={class} \
+             recovered_class={recovered_class} pid={pid} request={request:?} before={before:?} \
+             views={} view_live={} refresh_after={:?}",
+            engine.views.len(),
+            engine
+                .views
+                .first()
+                .is_some_and(|view| view.still_the_same()),
+            engine.refresh_requested.get(&pid),
         );
         let current = session
             .pid_continuity

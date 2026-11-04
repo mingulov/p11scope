@@ -296,9 +296,10 @@ release.
 its proved offsets (`watch` on the discovery record, with `attached_at_ns`
 and `unobserved_windows` merged at capture end). A quiet pre-armed interval
 is a stated watch interval, not proven-exact coverage, except on an owned
-`run` whose every declared probe attached before the barrier release while
-the barrier held the child from its start: that capture publishes an
-explicitly empty `unobserved_windows` on the pre-armed module.
+`run` whose every declared probe attached at or before the barrier release
+while the barrier held the child from its start and whose pause gate
+completed a gap-free first epoch: that capture publishes an explicitly
+empty `unobserved_windows` on the pre-armed module.
 Every other capture still discloses its window, including any declared stamp
 dated after the release; ordering-evidence exactness for other scopes is
 later work.
@@ -345,8 +346,9 @@ or device identity.
 
 - Live key operations (key type and size, sign/verify per key) in 0.6.0.
 - Promoting one endpoint to full detail during a counter capture, in 0.6.0.
-- Pre-arm exactness producers, inventory Detailed-subset activation, and
-  same-granularity rewrite proof (packet 6.13 follow-ups).
+- Ordering-evidence pre-arm exactness producer for non-`run` scopes,
+  inventory Detailed-subset activation, and same-granularity rewrite proof
+  (packet 6.13 follow-ups).
 - Longer bounded runs (4 h, 24 h).
 - Faster teardown on kernels without uprobe_multi.
 - A per-mechanism counter view and per-mechanism key-operation rows.

@@ -1978,6 +1978,79 @@ fn joint_raw_negative_preserves_sealed_domain_loss_effects() {
     assert_eq!(owner.ledger().census(), settled_census);
 }
 
+/// A raw quantum disposed before any journal key exists (the process's
+/// own calls arriving while it is still unbound, as with a browser
+/// launched right after the observer) must not refuse that process's
+/// image forever: nothing is provably another caller's against an empty
+/// binding set. The disposed interval is still lost (a named failure
+/// rides the disposition), but the image itself is not tainted, so the
+/// binding that arrives later can still enter Joint above the fence.
+#[test]
+fn joint_pre_key_raw_disposal_does_not_taint_the_callers_own_image() {
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawDisposeReason};
+
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (_report, admitted) = harness.route(&mut raw);
+    let image = (harness.io.current_image.task_cookie, harness.io.current_image.exec_id);
+    let mut owner = JointCaptureOwner::from_existing_parts_for_test(
+        harness.adapter,
+        crate::semantics_objects::ObjectSemantics::new(),
+    );
+    let negative = raw
+        .dispose_without_ingest(&mut owner, &harness.producers, RawDisposeReason::NoAdmission)
+        .unwrap_or_else(|(_, reason)| panic!("pre-key disposition: {reason:?}"));
+    assert!(
+        negative.failure().is_some(),
+        "the disposed affecting original is still a named loss, never hidden"
+    );
+    assert!(
+        !owner.adapter().image_tainted_for_test(image),
+        "no binding existed to prove this image another caller's"
+    );
+    assert!(
+        owner.adapter_mut().bind_admitted_key(&admitted).is_ok(),
+        "the later binding of the same process is not refused"
+    );
+}
+
+/// Twin: once a journal key exists, a NoAdmission disposal keeps its
+/// localized loss semantics — the disposed image is tainted and a later
+/// bind of it refuses. The pre-key fence above must not broaden into
+/// forgiving disposed affecting records under a live binding set.
+#[test]
+fn joint_raw_disposal_with_a_bound_key_still_taints_the_disposed_image() {
+    use crate::semantics_objects::journal::AttestationRefusal;
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawDisposeReason};
+
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (_report, admitted) = harness.route(&mut raw);
+    let (_collection, _proof) = harness.ingest(raw, &admitted);
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (_report, next_admitted) = harness.route(&mut raw);
+    let image = (harness.io.current_image.task_cookie, harness.io.current_image.exec_id);
+    let mut owner = JointCaptureOwner::from_existing_parts_for_test(
+        harness.adapter,
+        crate::semantics_objects::ObjectSemantics::new(),
+    );
+    let negative = raw
+        .dispose_without_ingest(&mut owner, &harness.producers, RawDisposeReason::NoAdmission)
+        .unwrap_or_else(|(_, reason)| panic!("bound disposition: {reason:?}"));
+    assert!(negative.failure().is_some(), "the loss stays named");
+    assert!(
+        owner.adapter().image_tainted_for_test(image),
+        "a live binding set keeps the localized refusal"
+    );
+    assert_eq!(
+        owner.adapter_mut().bind_admitted_key(&next_admitted),
+        Err(AttestationRefusal::ImageTainted)
+    );
+}
+
 #[test]
 fn joint_unlocalized_raw_loss_retains_all_sealed_domains_and_effects() {
     use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;

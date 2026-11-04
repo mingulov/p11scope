@@ -7,7 +7,6 @@ streams are constructed to satisfy the loss identity from
 system-scope-measure.py.
 """
 
-import copy
 import json
 import subprocess
 import sys
@@ -352,8 +351,6 @@ class BreadthTests(unittest.TestCase):
         self.run_case(cell="profile-pid-ia32")
 
     def test_trace_pid_loss_identity_passes_as_smoke(self):
-        report, ledger, _ = inputs(cell="trace-pid")
-        total = sum(json.loads(ledger[-1][7:])["functions"][i]["attempts"] for i in range(6))
         text = trace_stream(calls_per_function=7)
         self.run_case(cell="trace-pid", want=2, report_text=text)
 

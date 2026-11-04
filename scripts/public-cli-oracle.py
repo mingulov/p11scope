@@ -279,25 +279,21 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         evidence.get("attach_mechanisms") if mode == "profile" else None,
         report)
     terminal(evidence, profile=mode == "profile")
-    if relaxed:
-        gaps = evidence.get("pid_descendant_gaps", 0)
-        require(evidence.get("multi_rebuild_gaps") == 0,
-                "disclosed noise allows only pid_descendant_gaps")
-        classes = evidence.get("gap_classes", {})
-        want_obs = ["pid_descendant_gaps"] if gaps > 0 else []
-        require(classes.get("observation", {}).get("causes") == want_obs,
-                "disclosed noise allows only pid_descendant_gaps")
-        require(classes.get("attribution", {}).get("causes") == [] and
-                classes.get("semantics", {}).get("causes") == [],
-                "disclosed noise allows only pid_descendant_gaps")
-        if gaps > 0:
-            require(evidence.get("completeness") == "PARTIAL" and
-                    evidence.get("verdict_detail") == "concrete_gap",
-                    "disclosed noise must stay PARTIAL with a concrete gap")
-            hints = evidence.get("gap_exe_hints")
-            if hints is not None:
-                require(hints.get("links_provider", 0) == 0,
-                        "runner noise subject links the watched provider")
+    if relaxed and evidence.get("pid_descendant_gaps", 0) > 0:
+        # The pre-terminal observation pin plus terminal consistency already
+        # prove the single observation class: any nonzero multi_rebuild_gaps
+        # or other loss would have failed above, and PARTIAL/concrete_gap
+        # follow necessarily. Attribution and semantics gaps are not gated
+        # by the system counts cell -- strict mode discloses them via
+        # PARTIAL without failing -- so relaxed mode must accept them too;
+        # otherwise it would be stricter than strict. The only added ruling
+        # requirement is the provider-subject check below. Hints are never
+        # required; when present they must not place a gap subject in the
+        # watched provider set.
+        hints = evidence.get("gap_exe_hints")
+        if hints is not None:
+            require(hints.get("links_provider", 0) == 0,
+                    "runner noise subject links the watched provider")
     provider = identity(receipt["provider_before"])
     admitted = evidence.get("discovery")
     require(isinstance(admitted, list) and any(identity(row) == provider for row in admitted

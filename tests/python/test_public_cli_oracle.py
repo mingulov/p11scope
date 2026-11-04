@@ -626,6 +626,26 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         self.run_case(mutate, cell="system", want=1)
 
+    def test_attribution_gap_without_noise_passes_in_both_modes(self):
+        # The system counts cell never gated attribution/semantics gaps
+        # (strict discloses them via PARTIAL); relaxed mode must accept
+        # them too, otherwise it would be stricter than strict. Shape
+        # mirrors hosted run 41743410302 (attribution_only, zero noise).
+        def mutate(d, l, r):
+            d["evidence"].update(semantic_unverified_slots=6,
+                                  completeness="PARTIAL",
+                                  verdict_detail="attribution_only")
+            d["evidence"]["gap_classes"]["attribution"] = {
+                "status": "withheld", "causes": ["semantic_unverified_slots"]}
+            d["evidence"]["gap_classes"]["semantics"] = {
+                "status": "not_applicable", "causes": []}
+        strict = self.run_case(mutate, cell="system")
+        self.assertEqual(strict["qualification"], "owned-provider-counts")
+        relaxed = self.run_case(mutate, cell="system",
+                                allow_pid_descendant_gaps=True)
+        self.assertTrue(relaxed["pass"])
+        self.assertIn("disclosed runner noise", relaxed["detail"])
+
 
 # Test-only independent mapping code runs in both separate lifecycle children.
 FAKE_MAPPING = '''

@@ -101,6 +101,35 @@ fn journal_proof_output_matches_this_build_selection() {
     }
 }
 
+/// Write an executable stub that a test will later exec: stage the bytes to
+/// a never-executed sibling, then copy them into place through a waited-for
+/// `cp` child, never in-process. An in-process write holds the destination
+/// open for writing, and a concurrent fork from another test thread inherits
+/// that fd — if the fork-child has not exec'd yet when the test execs the
+/// stub, the exec fails with ETXTBSY. The staging file is never executed and
+/// carries no mode bit; the waited `cp` owns the stub's write fd privately,
+/// so no in-process fork can inherit it, and the wait proves the fd is closed
+/// before any exec of the stub. `chmod` stays in-process: it opens no fd.
+fn write_executable_stub_via_waited_child(path: &Path, content: &[u8], mode: u32) {
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(".src");
+    let staging = std::path::PathBuf::from(staging);
+    fs::write(&staging, content).expect("write executable-stub staging file");
+    let status = Command::new("cp")
+        .arg(&staging)
+        .arg(path)
+        .status()
+        .expect("copy executable stub through a waited child");
+    assert!(
+        status.success(),
+        "cp {} {}: {status}",
+        staging.display(),
+        path.display()
+    );
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("make stub executable");
+    fs::remove_file(&staging).expect("remove executable-stub staging file");
+}
+
 fn preflight(
     value: Option<&OsStr>,
     settings: &[(&str, &str)],
@@ -114,13 +143,11 @@ fn preflight(
     fs::write(out.join("preserved"), b"keep").unwrap();
     let trace = root.path().join("compiler-reached");
     for name in ["rustc", "cargo", "clang-18"] {
-        let tool = tools.join(name);
-        fs::write(
-            &tool,
-            "#!/bin/sh\nprintf '%s\\n' reached > \"$P11_JOURNAL_TEST_TRACE\"\nexit 97\n",
-        )
-        .unwrap();
-        fs::set_permissions(tool, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_stub_via_waited_child(
+            &tools.join(name),
+            b"#!/bin/sh\nprintf '%s\\n' reached > \"$P11_JOURNAL_TEST_TRACE\"\nexit 97\n",
+            0o755,
+        );
     }
     let mut command = Command::new(env!("P11SCOPE_JOURNAL_PROOF_BUILD_SCRIPT"));
     command
@@ -513,13 +540,11 @@ fn preflight_switch(
     fs::write(out.join("preserved"), b"keep").unwrap();
     let trace = root.path().join("compiler-reached");
     for name in ["rustc", "cargo", "clang-18"] {
-        let tool = tools.join(name);
-        fs::write(
-            &tool,
-            "#!/bin/sh\nprintf '%s\\n' reached > \"$P11_JOURNAL_TEST_TRACE\"\nexit 97\n",
-        )
-        .unwrap();
-        fs::set_permissions(tool, fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable_stub_via_waited_child(
+            &tools.join(name),
+            b"#!/bin/sh\nprintf '%s\\n' reached > \"$P11_JOURNAL_TEST_TRACE\"\nexit 97\n",
+            0o755,
+        );
     }
     let mut command = Command::new(env!("P11SCOPE_JOURNAL_PROOF_BUILD_SCRIPT"));
     command

@@ -8473,6 +8473,16 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
         0,
         "the pre-break key never resumes Joint; its calls stay S1"
     );
+    // The void itself is named too, not only the break quantum's seal:
+    // its own refusal (every key ended, staged custody voided, a fence on
+    // the consumed history) is disclosed even when no seal fails with it.
+    assert!(
+        gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_void_adapter_invalidated_history_loss".to_string()
+        )),
+        "the ingest-break void names its own gap: {gaps:?}"
+    );
 }
 
 /// A void the pool cannot pay for is all-or-nothing: the lane stays

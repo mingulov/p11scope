@@ -61,16 +61,15 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
 }
 
 /// Unrouted calls shed before any binding existed: their distinct image
-/// cookies, position span and route labels. Their positions stay
-/// undisposed (a pending floor) until resolved: disposed when the first
-/// binding proves every cookie another caller's, otherwise (any match,
-/// overflow, or a stop before any binding) a loss barrier at the lowest
-/// held position. Bounded by distinct cookies; the shed calls were already
-/// counted into the stop line when held.
+/// cookies, lowest position and route labels. They are disclosed and counted
+/// when shed, and their positions are provisionally disposed (no bound key
+/// can seal before a binding). The first finalize that sees a binding keeps
+/// them disposed when every cookie proves another caller, and otherwise
+/// (any match, overflow, or a stop before any binding) barriers at the
+/// lowest held position. Bounded by distinct cookies.
 pub(in crate::discovery::engine::inventory_coordinator) struct PreBindingHold {
     pub(super) cookies: BTreeSet<u64>,
     pub(super) min: u64,
-    pub(super) max: u64,
     pub(super) labels: Vec<(&'static str, u64)>,
     pub(super) pid: Option<Option<u32>>,
     pub(super) limit: usize,
@@ -81,7 +80,6 @@ impl PreBindingHold {
         Self {
             cookies: BTreeSet::new(),
             min: u64::MAX,
-            max: 0,
             labels: Vec::new(),
             pid: None,
             // The capture-wide waiting-call queue: held calls are calls
@@ -92,11 +90,6 @@ impl PreBindingHold {
 
     pub(super) fn is_empty(&self) -> bool {
         self.labels.is_empty()
-    }
-
-    /// The lowest held position, while anything is held.
-    pub(super) fn floor(&self) -> Option<u64> {
-        (!self.is_empty()).then_some(self.min)
     }
 
     /// Hold one positioned call. Refuses (holding nothing) when a new
@@ -115,7 +108,6 @@ impl PreBindingHold {
             self.cookies.insert(cookie);
         }
         self.min = self.min.min(position);
-        self.max = self.max.max(position);
         match self.labels.iter_mut().find(|(known, _)| *known == label) {
             Some((_, count)) => *count += 1,
             None => self.labels.push((label, 1)),

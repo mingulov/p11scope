@@ -3468,7 +3468,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                         Some(_) => Some(None),
                                     };
                                 }
-                                (Some(_), None) if held => {}
+                                // Provisionally disposed: no bound key can
+                                // seal yet, and a pending floor here would
+                                // stall the publication that admits the
+                                // first binding. The first binding's
+                                // finalize barriers it late if it cannot
+                                // prove another caller.
+                                (Some(at), None) if held => staged_positions.push(Some(at)),
                                 (Some(at), None) => {
                                     shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
                                 }
@@ -3523,11 +3529,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
-        // Resolve the pre-binding hold at the first binding (or as loss at
-        // a stop before any binding); otherwise its floor keeps the held
-        // positions undisposed.
+        // Resolve the pre-binding hold at the first finalize that sees a
+        // binding (or as loss at a stop before any binding). Any seal of a
+        // bound key needs that finalize first, so the late barrier reaches
+        // every seal that could certify past a held position.
         let bound = self.semantic_bindings.len() != 0;
-        let mut held_floor = None;
         let mut resolved_other: Option<finalizer::PreBindingHold> = None;
         if let Some(state) = self
             .semantic_finalizer
@@ -3551,14 +3557,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             )
                         });
                     if forgiven {
-                        staged_positions.push(Some(held.max));
                         resolved_other = Some(held);
                     } else {
                         shed_min = Some(shed_min.map_or(held.min, |floor| floor.min(held.min)));
                     }
                 }
-            } else {
-                held_floor = state.pre_binding.floor();
             }
         }
         if shed_calls != 0 {
@@ -3752,7 +3755,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             PreparedH3 {
                 negatives,
                 staged_positions,
-                awaiting_floor: batch_awaiting.into_iter().chain(held_floor).min(),
+                awaiting_floor: batch_awaiting,
                 shed_floor: batch_shed.into_iter().chain(shed_min).min(),
                 exhausted: batch_exhausted || unpositioned,
             },
@@ -5439,11 +5442,11 @@ mod finalizer_history_tests {
             matches!(
                 before,
                 H3DispositionEvidence::Clean {
-                    staged_max: 1,
-                    pending_floor: Some(2)
+                    staged_max: 3,
+                    pending_floor: None
                 }
             ),
-            "held positions wait, neither certified nor lost: {before:?}"
+            "held positions are provisionally disposed, never barriered before a binding: {before:?}"
         );
         assert!(
             matches!(

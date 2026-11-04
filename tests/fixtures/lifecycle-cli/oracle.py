@@ -139,10 +139,31 @@ def judge_reload(report, ledger_text, receipt):
     observation = evidence.get("gap_classes", {}).get("observation", {})
     # Reload discloses loader windows; the calls themselves stay exact.
     # Pin the documented causes: no other loss may hide behind reload.
-    # Ubuntu reports loader_discovery windows; Fedora's SoftHSM 2.7 shape
-    # reports surfaces instead. Both are disclosed; counts stay exact.
+    # Ubuntu reports loader_discovery windows. Fedora's SoftHSM 2.7 shape
+    # (68-slot table labelled {3,2}, walked as known_prefix) additionally
+    # reports surfaces; that cause is allowed only for that known shape
+    # and is labelled, so any other surfaces failure still fails.
     causes = set(observation.get("causes") or [])
-    allowed = {"unprotected_live_windows", "loader_discovery", "surfaces"}
+    allowed = {"unprotected_live_windows", "loader_discovery"}
+    known_shape = False
+    if "surfaces" in causes:
+        surfaces = evidence.get("surfaces") or []
+        ok = (
+            isinstance(surfaces, list)
+            and bool(surfaces)
+            and any(isinstance(entry, dict)
+                    and entry.get("walk") == "known_prefix"
+                    for entry in surfaces)
+            and all(isinstance(entry, dict)
+                    and entry.get("walk") in ("full", "known_prefix")
+                    and entry.get("acquisition") == "ok"
+                    for entry in surfaces)
+        )
+        require(ok,
+                f"surfaces cause without the known SoftHSM 2.7 "
+                f"known_prefix shape: {surfaces!r}")
+        allowed = allowed | {"surfaces"}
+        known_shape = True
     require(causes <= allowed,
             f"unexpected observation causes {causes}")
     if observation.get("status") == "exact":
@@ -153,8 +174,11 @@ def judge_reload(report, ledger_text, receipt):
     provider = receipt["provider_before"]
     matched = check_report_counts(report, expected, cell, provider)
     shown = {name: matched.get(name, 0) for name in sorted(expected)}
-    return passed(cell, f"reload totals exact across dlclose/dlopen: {shown} "
-                        f"causes={sorted(causes)}")
+    detail = (f"reload totals exact across dlclose/dlopen: {shown} "
+              f"causes={sorted(causes)}")
+    if known_shape:
+        detail += " [SoftHSM 2.7 table shape; exec-scan-legacy32]"
+    return passed(cell, detail)
 
 
 def judge_reuse(report, ledger_text, receipt, stderr_text):

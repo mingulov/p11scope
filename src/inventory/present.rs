@@ -27,8 +27,8 @@ use crate::discovery::caller_registry::{
     ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId, ModuleLifecycle,
     ModuleRecord, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
 };
-use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
+use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
 use crate::render::escape_controls;
 use crate::semantics_edge::resources::SemanticResourceSnapshot;
 use crate::semantics_edge::{EdgeEvidence, EdgeSemantics, S1Occupancy};

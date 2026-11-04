@@ -5414,6 +5414,325 @@ mod finalizer_history_tests {
         }
     }
 
+    /// One unrouted call with an explicit exec id.
+    fn unrouted_call_exec(
+        domain: NativeDomainId,
+        cookie: u64,
+        exec_id: u64,
+        position: u64,
+    ) -> TickOutcome {
+        use crate::discovery::instances::UnknownReason;
+        let event = Event {
+            pid_tgid: (4242u64 << 32) | 4242,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id,
+            },
+            ..Event::default()
+        };
+        TickOutcome::Call(RoutedCall::scripted(
+            domain,
+            crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0x2200,
+                ),
+                object: None,
+            },
+            Route::Unknown(UnknownReason::Unobserved),
+            None,
+            Some(position),
+        ))
+    }
+
+    fn bind_image(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        domain: NativeDomainId,
+        caller: u32,
+        image: ImageIdentity,
+    ) {
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                CallerId(caller),
+                ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                domain,
+                image,
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+    }
+
+    fn admit_history(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        domain: NativeDomainId,
+        caller: u32,
+        image: ImageIdentity,
+    ) {
+        coordinator.semantic_bindings.admission_images.insert(
+            CallerId(caller),
+            SemanticAdmissionHistory {
+                domain,
+                image,
+                incarnation: 1,
+                generation: crate::inspect_system::MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                pin: Arc::new(PidPin::test_proc_only(1234)),
+                initial_scope_cut: false,
+                pending_gap: None,
+            },
+        );
+    }
+
+    #[test]
+    fn refused_other_caller_sheds_after_its_own_binding_keep_the_bound_history() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // The live intruder shape: a foreign caller's first unrouted
+        // calls prove it another caller, so its image is refused in the
+        // journal and it can never join Joint. It then binds (S1 only,
+        // named). A later unrouted call of that same image is still
+        // provably not the bound Joint caller's: it must dispose, not
+        // barrier, even though its own binding and admission history
+        // now hold its cookie.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let foreign = ImageIdentity {
+            task_cookie: 77,
+            exec_id: 3,
+        };
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        let first = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+                unrouted_call(domain, 77, 3),
+            ],
+        );
+        assert!(
+            matches!(
+                first,
+                H3DispositionEvidence::Clean {
+                    staged_max: 3,
+                    pending_floor: None
+                }
+            ),
+            "the unbound foreign sheds dispose as before: {first:?}"
+        );
+        assert!(
+            coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((foreign.task_cookie, foreign.exec_id)),
+            "the foreign image is refused in the journal after its sheds"
+        );
+        bind_image(&mut coordinator, domain, 10, foreign);
+        admit_history(&mut coordinator, domain, 10, foreign);
+        let second = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    4,
+                ),
+                unrouted_call(domain, 77, 5),
+            ],
+        );
+        assert!(
+            matches!(
+                second,
+                H3DispositionEvidence::Clean {
+                    staged_max: 5,
+                    pending_floor: None
+                }
+            ),
+            "a refused caller's later shed must not barrier the bound history: {second:?}"
+        );
+        // Every shed is still shed and disclosed, under the
+        // other-callers subject; the totals do not move.
+        assert_eq!(lane.shed_calls_disclosed(), 3);
+        assert_eq!(unrouted_gap_calls(&coordinator), 3);
+        assert_eq!(unrouted_subject_calls(&coordinator, OTHER), 3);
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 0);
+    }
+
+    #[test]
+    fn bound_other_caller_without_a_refusal_still_barriers() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // Twin: a second bound caller that was never refused in the
+        // journal could still hold Joint history, so its unrouted call
+        // is a bound caller's own loss and barriers as today.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 3,
+            },
+        );
+        let evidence = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "an unrefused bound caller's shed still barriers: {evidence:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 1);
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 1);
+    }
+
+    #[test]
+    fn refused_image_sheds_still_barrier_beside_an_unrefused_same_cookie_binding() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // Twin: the refused image (77, exec 3) sheds again, but an
+        // unrefused binding now holds the same cookie at a later exec.
+        // An exec keeps the cookie, so that binding could own the
+        // call: fail closed and barrier.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        let first = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            matches!(
+                first,
+                H3DispositionEvidence::Clean {
+                    staged_max: 2,
+                    pending_floor: None
+                }
+            ),
+            "the unbound foreign shed disposes and refuses its image: {first:?}"
+        );
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 9,
+            },
+        );
+        let second = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![unrouted_call_exec(domain, 77, 3, 5)],
+        );
+        assert!(
+            matches!(second, H3DispositionEvidence::StagedLoss { barrier: 5 }),
+            "a same-cookie unrefused binding could own the shed: {second:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 2);
+    }
+
+    #[test]
+    fn refused_other_caller_shed_beside_an_unknown_shed_still_barriers() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // Twin: in one batch, a refused caller's shed disposes while
+        // an unknown-image shed (cookie 0) still barriers at its own
+        // position. Forgiving the foreign position never forgives an
+        // unknown one beside it.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let foreign = ImageIdentity {
+            task_cookie: 77,
+            exec_id: 3,
+        };
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        bind_image(&mut coordinator, domain, 10, foreign);
+        let evidence = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![unrouted_call(domain, 77, 5), unrouted_call(domain, 0, 6)],
+        );
+        assert!(
+            matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 6 }),
+            "the unknown shed barriers at its own position: {evidence:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 3);
+        assert_eq!(unrouted_gap_calls(&coordinator), 3);
+    }
+
     /// Gap reasons by subject for the two unrouted subjects.
     fn unrouted_subject_calls(
         coordinator: &InventoryCoordinator<OsProcessSource>,

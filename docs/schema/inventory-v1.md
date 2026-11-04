@@ -827,18 +827,23 @@ object. The key is absent when the capture produced no disclosure
   saturating router totals, snapshotted at the terminal projection.
   Exact even when `identities` is partial or empty.
 - `identities`: one entry per affected registry module, sorted by
-  module, each with the sorted disclosed instance references:
+  numeric module order, each with the disclosed instance references in
+  numeric instance order:
   `{"module": "mN", "instances": ["iN", ...]}`. Entries that share a
   module merge into one entry with the sorted union of instances.
 
-An empty `identities` list with nonzero counts is mint exhaustion: the
-router observed continuations it could not attribute to minted
-instances. Router IDs that never registered (refused or unconverted
+An empty `identities` list with nonzero counts means the router
+observed continuations that project to no nameable identity: mint
+exhaustion, an identity whose every router ID is unregistered, or
+identities shed past the ledger cap. The counts stay exact either
+way. Router IDs that never registered (refused or unconverted
 coverages) are omitted from their identity, and identities with
-nothing nameable are dropped; the corresponding registration loss is
-disclosed under the existing `instance semantics refused` gap. Like
-`instances[]`, these references disclose no router ID, native domain,
-task cookie, exec ID, address, session, slot or async handle.
+nothing nameable are dropped. Registration refusals are disclosed
+under the existing `instance semantics refused` gap, conversion
+refusals under `semantic input refused`, and ledger-cap shed under
+`reload disclosure identities shed`. Like `instances[]`, these
+references disclose no router ID, native domain, task cookie, exec
+ID, address, session, slot or async handle.
 
 ## Object observations (additive within v1)
 

@@ -14,6 +14,11 @@
 # proves wiring only and never qualifies for the 1800 s cell). Do not
 # run the 1800 s version as a proof; it belongs on weekly dispatch.
 #
+# Weekly dispatch only: the manifest soak fails today on resource
+# bounds (120 s proofs: RSS 258 MiB vs the 256 MiB bound, then FD
+# growth; product lane, not a harness gap) and must not run per-push
+# until that lane lands.
+#
 # Apt prerequisites (ubuntu-26.04 runner, as root): gcc python3 softhsm2
 # procps. Needs passwordless sudo when run as non-root, BTF, and the
 # privileged lock for live mode as non-root. Expected time: about

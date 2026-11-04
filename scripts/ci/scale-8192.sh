@@ -7,10 +7,14 @@
 # OUTDIR/results.jsonl. Exit 0 when the cell passes, 1 when it fails,
 # 2 on harness error, 77 when a prerequisite is missing.
 #
+# Weekly dispatch only: the capacity boundary fails today (verdict
+# FAILED fail=230 pass=539 in 548 s; product lane, not a harness gap)
+# and must not run per-push until that lane lands.
+#
 # Apt prerequisites (ubuntu-26.04 runner, as root): gcc python3
 # (boundary uses synthetic providers; no SoftHSM needed). Needs
 # passwordless sudo when run as non-root, BTF, and a root-owned --base.
-# Expected time: 10-30 minutes (not yet measured at scale).
+# Expected time: about 9 minutes (548 s measured).
 set -eu
 cd "$(dirname "$0")/../.."
 P=${1:?usage: scale-8192.sh P11SCOPE OUTDIR}

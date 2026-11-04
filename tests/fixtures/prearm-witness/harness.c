@@ -741,6 +741,17 @@ static void test_walk_found_and_member(void)
     assert(p11_pw_walk(&c3) == 0);
     assert(state.found_slots == 0);
     check_busy_zero("walk observer");
+    /* Slot 64 is the first out-of-range value (valid 0..63): the
+     * walk faults like the unmap path instead of silently missing. */
+    reset_all();
+    cfg.active = 1;
+    cfg.scope_kind = PW_SCOPE_PID;
+    cfg.target_tgid = 100;
+    watched_slot = 64;
+    struct pw_iter_task_vma c4 = walk_ctx(&task_member, &vma);
+    assert(p11_pw_walk(&c4) == 0);
+    assert(state.faults == 1 && state.found_slots == 0);
+    check_busy_zero("walk bad slot");
 }
 
 static void test_walk_runs_and_clear(void)

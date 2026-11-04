@@ -1114,8 +1114,10 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
 ) -> Vec<FileVerdict> {
     let keep_all = |reason: KeepReason| vec![FileVerdict::Keep(reason); slots];
     let walk_ok = matches!(backend.run_walk(), Ok(WalkOutcome::Done));
-    // Close ordering: deactivate, settle, read, release (always release).
-    let _ = backend.deactivate();
+    // Close ordering: deactivate, settle, read, release (always
+    // release). A failed deactivate still drains the close, but the
+    // state read is then untrusted: the hooks may have stayed live.
+    let deactivated = backend.deactivate().is_ok();
     let settled = backend.settle_busy(QUIESCE_MAX_FLIPS).unwrap_or(false);
     // Single close-time read (§4.6 step 4): pending is frozen after
     // deactivate + settle, so re-reading cannot observe a change.
@@ -1123,6 +1125,9 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
     let _ = backend.release();
     if !walk_ok {
         return keep_all(KeepReason::Walk);
+    }
+    if !deactivated {
+        return keep_all(KeepReason::Quiesce);
     }
     if !settled {
         return keep_all(KeepReason::Quiesce);
@@ -1160,8 +1165,10 @@ pub(crate) fn finalize_with<B: FinalizeBackend>(
         PROGRAM_MIGRATE,
         PROGRAM_WALK,
     ] {
-        // Missing programs report 0 misses (not attached on this kernel).
-        if backend.recursion_misses(program).unwrap_or(0) != 0 {
+        // Missing programs report 0 misses (not attached on this
+        // kernel); an unreadable count on a loaded program is missing
+        // health evidence, not a clean bill.
+        if !matches!(backend.recursion_misses(program), Ok(0)) {
             return keep_all(KeepReason::Recursion);
         }
     }
@@ -1367,7 +1374,7 @@ mod tests {
                     loaded.ebpf.program_mut(name).unwrap().try_into().unwrap();
                 let link = program.attach().expect("attach walk");
                 attached.push(format!("{name}: iter link"));
-                drop(link);
+                let _ = link;
                 continue;
             }
             if name == super::PROGRAM_TORN {
@@ -1720,7 +1727,7 @@ mod tests {
             assert_ne!(slot.i_ino, 0, "calibration inode nonzero");
             (slot.s_dev, slot.i_ino)
         };
-        drop(_unmap_link);
+        let _ = _unmap_link;
         // Map a page of the same file for the walk to find, then activate
         // with the calibrated key. Clear PW_SELF (test-only): calibration
         // recorded this mm as the observer, but this cell proves cgroup
@@ -2180,14 +2187,20 @@ mod tests {
         busy_settles: bool,
         misses: u64,
         settle_max: Option<u32>,
+        // Scripted close-error inputs (None takes the Ok path).
+        misses_err: Option<String>,
+        deactivate_err: Option<String>,
+        read_err: Option<String>,
     }
 
     impl ScriptFinalize {
         fn clean() -> Self {
-            let mut state = super::PwState::default();
-            state.walk_end = 1;
-            state.pending_in = 2;
-            state.pending_out = 2;
+            let state = super::PwState {
+                walk_end: 1,
+                pending_in: 2,
+                pending_out: 2,
+                ..super::PwState::default()
+            };
             Self {
                 ops: Vec::new(),
                 walks: vec![super::WalkOutcome::Done],
@@ -2195,6 +2208,9 @@ mod tests {
                 busy_settles: true,
                 misses: 0,
                 settle_max: None,
+                misses_err: None,
+                deactivate_err: None,
+                read_err: None,
             }
         }
     }
@@ -2207,10 +2223,16 @@ mod tests {
         }
         fn read_state(&mut self) -> Result<super::PwState, String> {
             self.ops.push("read".into());
+            if let Some(error) = self.read_err.clone() {
+                return Err(error);
+            }
             Ok(self.state)
         }
         fn deactivate(&mut self) -> Result<(), String> {
             self.ops.push("deactivate".into());
+            if let Some(error) = self.deactivate_err.clone() {
+                return Err(error);
+            }
             Ok(())
         }
         fn settle_busy(&mut self, max: u32) -> Result<bool, String> {
@@ -2224,6 +2246,9 @@ mod tests {
         }
         fn recursion_misses(&mut self, program: &str) -> Result<u64, String> {
             self.ops.push(format!("miss:{program}"));
+            if let Some(error) = self.misses_err.clone() {
+                return Err(error);
+            }
             Ok(self.misses)
         }
     }
@@ -2323,7 +2348,8 @@ mod tests {
         use super::KeepReason;
         // Each boundary condition keeps the window with its exact reason
         // (P2-5 RED: each nonclean §8 group 3-5 input → that exact reason).
-        let mut cases: Vec<(KeepReason, Box<dyn Fn(&mut super::PwState)>)> = vec![
+        type StateCase = (KeepReason, Box<dyn Fn(&mut super::PwState)>);
+        let mut cases: Vec<StateCase> = vec![
             (KeepReason::Latched, Box::new(|s| s.latch_slots = 1)),
             (KeepReason::Torn, Box::new(|s| s.torn_slots = 1)),
             (KeepReason::Found, Box::new(|s| s.found_slots = 1)),
@@ -2382,6 +2408,51 @@ mod tests {
         assert_eq!(
             verdicts,
             vec![super::FileVerdict::Keep(KeepReason::Latched)]
+        );
+    }
+
+    #[test]
+    fn finalize_recursion_misses_error_keeps_recursion() {
+        // Spec §2 condition 7 needs the health fact verified, not
+        // assumed: an unreadable recursion-miss count keeps windows.
+        let mut backend = ScriptFinalize::clean();
+        backend.misses_err = Some("prog info omits recursion misses".into());
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            verdicts,
+            vec![super::FileVerdict::Keep(super::KeepReason::Recursion)]
+        );
+    }
+
+    #[test]
+    fn finalize_deactivate_error_keeps_quiesce() {
+        // A close that never proved its hooks quiet cannot trust the
+        // state read; cleanup (settle, read, release) still runs.
+        let mut backend = ScriptFinalize::clean();
+        backend.deactivate_err = Some("cfg rewrite refused".into());
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            verdicts,
+            vec![super::FileVerdict::Keep(super::KeepReason::Quiesce)]
+        );
+        for op in ["walk", "deactivate", "settle", "read", "release"] {
+            assert!(
+                backend.ops.iter().any(|seen| seen == op),
+                "cleanup still runs {op}: {:?}",
+                backend.ops
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_read_state_error_keeps_fault() {
+        // An unreadable close-time state is a fault, not evidence.
+        let mut backend = ScriptFinalize::clean();
+        backend.read_err = Some("PW_STATE unreadable".into());
+        let verdicts = super::finalize_with(&mut backend, 1, Some("1".into()));
+        assert_eq!(
+            verdicts,
+            vec![super::FileVerdict::Keep(super::KeepReason::Fault)]
         );
     }
 

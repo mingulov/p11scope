@@ -31,7 +31,10 @@ APPROVED (owner decision OD11, 2026-10-24),
 and [extensive-mode executable dependency hints](#extensive-mode-executable-dependency-hints-614-option-b-d-transitive),
 which implements the ratified D-transitive hint contract below,
 and [unregistered mechanism id publication](#unregistered-mechanism-id-publication-owner-2026-11-03),
-which publishes unregistered mechanism ids with counts only.**
+which publishes unregistered mechanism ids with counts only,
+and [pre-arm mapping-instant witness](#pre-arm-mapping-instant-witness-v060),
+which loads the short-lived kernel witness behind `--prearm-module` and
+publishes no new field.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1449,3 +1452,25 @@ processes. On 64-bit processes it withholds pointers and any word with a
 nonzero upper half, but not short zero-padded values. The v1
 function-name rule is untouched: function words still reach output only
 by exact membership in the 104 published names.
+
+## Pre-arm mapping-instant witness (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0 by owner decision 2026-11-01 (WU-13 in full).**
+With `--prearm-module`, `profile` and `trace` captures under `--pid`,
+`--cgroup` or `--system` load a short-lived kernel witness at startup and
+drop it before the capture reports ready. Its only purpose is to let the
+pre-armed module's existing `unobserved_windows` value be an explicitly empty
+list when the kernel shows that no scope member had the pinned provider file
+mapped between the capture's scope start and the module's attach-complete
+instant. `run` loads it during discovery but drops it without a verdict (the
+pause hold is its proof); inventory does not load it. It adds no
+output field.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Witness file key and observer exclusion | The observer opens each `--prearm-module` path (regular files only), maps one read-only page of it once and unmaps it; the unmap hook records that file's kernel `(s_dev, i_ino)` and the observer's own address-space pointer. The key is then compared with the trusted pin of the same path. | Key and pointer stay in capture-private BPF maps; the pointer is never read by userspace; nothing is retained after the witness is dropped (before readiness). | Calibration miss, inode 0, identity mismatch with the pin, or more than 64 files: no witness, today's window. Evidence: calibration twins, identity-mismatch twin. |
+| Mapping-removal latch | `fentry/uprobe_munmap`, from just before the scope-start stamp until close: for every file VMA removal host-wide it reads `vm_file`, `f_inode`, `i_ino`, `i_sb->s_dev`, `vm_mm`, `mm_users`, and for the current task its flags, `mm` and scope membership (TGID for `--pid`; default-hierarchy cgroup ids up the parent chain for `--cgroup`). A watched file's removal sets one per-file bit unless it is the observer's address space or a single-threaded non-member removing from its own never-member-departed address space. | One bit per pre-armed file; no address, length, protection, path, PID or time is stored or published. | Read failure before the key lookup, unreadable membership or cgroup depth over 64 counts as a fault: today's window. Evidence: native harness for every return path; map-unmap and teardown privileged cells. |
+| Address-space departure accounting | `exit_mm_release`/`exec_mm_release` (Linux 6.6-7.2) or `mm_exit_exec_release` (7.3+) record, for scope members only, the address-space pointer a task leaves; `fexit/exit_mmap` resolves the entry at teardown and sets the per-file teardown bit if a watched file was torn down. The presence walk clears an entry only after a complete member visit that started after the last departure. | Pointers and sequence numbers stay kernel-only in bounded hash maps (16,384 departed, 65,536 visited); userspace reads only two counters (entries opened, entries resolved) and per-file bits. | A pending entry at close, a failed insert or an exhausted update: today's window. Evidence: held-address-space teardown cell (a holder keeps the exited member's address space past close), exec-departure cell, harness CAS and insert-failure twins. |
+| Cgroup out-migration latch (`--cgroup` only) | `fentry/cgroup_migrate`: whether the moved task was in the scope cgroup subtree before the move. | One counter. | Any member migration while the witness is active: today's window. Evidence: migration-out privileged cell. |
+| Presence walk | One `iter/task_vma` pass after attach-complete: `--pid` over the target process (pidfd), otherwise over every task in the initial PID namespace; per VMA it reads `vm_mm`, `mm->map_count`, `vm_file`, `f_inode`, `i_ino`, `i_sb->s_dev` (any protection), and membership as above; no leader gate. It sets one bit per watched file found in a member address space, and resolves departure entries. | Per-file found bits, an END count and fault counters; no range, address, PID or inode is emitted (the iterator writes no bytes). | No END, read error, deadline, observer outside the initial PID namespace, or found bit: today's window. Evidence: zombie-leader, read-only-mapping, non-member, observer and 1M-VMA cells. |
+| Published result | Userspace combines the bits and counters above with the existing attach-complete stamps and scope-start stamp, plus hook health (`recursion_misses`, `ftrace_enabled`). | Only the existing `unobserved_windows` value of the pre-armed module's discovery record: an explicitly empty list only when every witness fact is clean and the R2-D1-6 interval matches exactly; otherwise unchanged. The `--system` result is exact for all tasks; `--pid`/`--cgroup` results can show a window caused by removals outside the scope (multi-threaded or remote unmaps), never an empty list caused by them. | Any missing, failed or dirty fact keeps today's window (or today's absent key for a never-mapped module). Evidence: engine twins for every fact; sentinel test that no witness bit, counter, key or pointer reaches JSON, JSONL, trace output, stderr diagnostics or logs. |

@@ -500,6 +500,25 @@ metrics::k0_live_cells::k0_live_run_exit_in_window_counts_lp64
 metrics::k0_live_cells::k0_live_pid_exit_in_window_counts_lp64
 metrics::k0_live_cells::k0_live_run_gateless_exit_matches_main_counts_lp64
 metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
+# Pre-arm witness cells (P2-7 behavior cells plus the object/start/finalize
+# live cells): each loads the short-lived witness on a Multi-capable
+# kernel as root and needs no provider install. Seconds each.
+attach::prearm_witness::prearm_witness_tests::privileged_map_and_call_after_finalize_is_clean
+attach::prearm_witness::prearm_witness_tests::privileged_observer_self_map_during_startup_is_clean
+attach::prearm_witness::prearm_witness_tests::privileged_readonly_mapped_before_start_is_found
+attach::prearm_witness::prearm_witness_tests::privileged_mprotect_dance_before_finalize_is_found
+attach::prearm_witness::prearm_witness_tests::privileged_map_unmap_inside_window_is_latched
+attach::prearm_witness::prearm_witness_tests::privileged_zombie_leader_holding_file_is_found
+attach::prearm_witness::prearm_witness_tests::privileged_held_teardown_is_pending
+attach::prearm_witness::prearm_witness_tests::privileged_exec_departure_under_holder_is_pending
+attach::prearm_witness::prearm_witness_tests::privileged_cgroup_member_migrated_out_is_migration
+attach::prearm_witness::prearm_witness_tests::privileged_nested_pidns_observer_is_unavailable
+attach::prearm_witness::prearm_witness_tests::privileged_walk_scale_completes
+attach::prearm_witness::tests::privileged_prearm_witness_loads_and_attaches
+attach::prearm_witness::tests::privileged_cgroup_id_matches_kernfs_id
+attach::prearm_witness::tests::privileged_start_activates_on_host
+attach::prearm_witness::tests::privileged_finalize_clears_clean_start
+attach::prearm_witness::tests::privileged_finalize_settles_under_churn
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the
@@ -796,6 +815,12 @@ tests/inventory_identity.rs:d4_btrfs_scan_backends_match_exact_fixture_populatio
 tests/inventory_identity.rs:kernel_identity_positive_cell_rejects_refusal
 tests/object_producer_activation.rs:counter_bank_btf_maps_and_programs_load
 tests/run_abandon_report.rs:second_sigint_during_teardown_publishes_truthful_report_and_exits_130
+tests/prearm_witness_cli.rs:privileged_profile_pid_prearm_clean_exact_counts
+tests/prearm_witness_cli.rs:privileged_profile_cgroup_prearm_clean_exact_counts
+tests/prearm_witness_cli.rs:privileged_profile_system_prearm_clean_exact_counts
+tests/prearm_witness_cli.rs:privileged_profile_metrics_system_prearm_clean_exact_counts
+tests/prearm_witness_cli.rs:privileged_profile_pid_prearm_twin_exact_window
+tests/prearm_witness_cli.rs:privileged_trace_system_prearm_clean_exact_counts
 )
 
 usage() {

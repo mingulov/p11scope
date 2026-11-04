@@ -1750,6 +1750,144 @@
       "reason": "privileged: live Joint stop after the last waiter resolves; run by hand via scripts/ci/stop-races.sh (results.jsonl entry), unscheduled in CI",
       "cell": "privileged",
       "until": "0.7.0"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_map_and_call_after_finalize_is_clean",
+      "reason": "privileged: pre-arm witness P2-7 map_and_call_after_finalize_is_clean cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_observer_self_map_during_startup_is_clean",
+      "reason": "privileged: pre-arm witness P2-7 observer_self_map_during_startup_is_clean cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_readonly_mapped_before_start_is_found",
+      "reason": "privileged: pre-arm witness P2-7 readonly_mapped_before_start_is_found cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_mprotect_dance_before_finalize_is_found",
+      "reason": "privileged: pre-arm witness P2-7 mprotect_dance_before_finalize_is_found cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_map_unmap_inside_window_is_latched",
+      "reason": "privileged: pre-arm witness P2-7 map_unmap_inside_window_is_latched cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_zombie_leader_holding_file_is_found",
+      "reason": "privileged: pre-arm witness P2-7 zombie_leader_holding_file_is_found cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_held_teardown_is_pending",
+      "reason": "privileged: pre-arm witness P2-7 held_teardown_is_pending cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_exec_departure_under_holder_is_pending",
+      "reason": "privileged: pre-arm witness P2-7 exec_departure_under_holder_is_pending cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_cgroup_member_migrated_out_is_migration",
+      "reason": "privileged: pre-arm witness P2-7 cgroup_member_migrated_out_is_migration cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_nested_pidns_observer_is_unavailable",
+      "reason": "privileged: pre-arm witness P2-7 nested_pidns_observer_is_unavailable cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::privileged_walk_scale_completes",
+      "reason": "privileged: pre-arm witness P2-7 walk_scale_completes cell (BPF load, root)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_prearm_witness_loads_and_attaches",
+      "reason": "privileged: loads the witness object on the host kernel",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_cgroup_id_matches_kernfs_id",
+      "reason": "privileged: cgroup id matches kernfs id via witness walk",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_start_activates_on_host",
+      "reason": "privileged: live witness start on the host",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_finalize_clears_clean_start",
+      "reason": "privileged: live witness finalize on the host",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness.rs",
+      "path": "attach::prearm_witness::tests::privileged_finalize_settles_under_churn",
+      "reason": "privileged: witness quiesce under maps churn",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/prearm_witness_tests.rs",
+      "path": "attach::prearm_witness::prearm_witness_tests::witness_fixture_entrypoint",
+      "reason": "private witness fixture helper; invoked by P2-7 cells",
+      "cell": "helper"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_pid_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_cgroup_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_system_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_metrics_system_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_profile_pid_prearm_twin_exact_window",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/prearm_witness_cli.rs",
+      "path": "privileged_trace_system_prearm_clean_exact_counts",
+      "reason": "privileged: pre-arm witness P2-8 cell (root BPF capture, runtime SoftHSM workload + token, ~7-15 s)",
+      "cell": "live-kernel"
     }
   ]
 }

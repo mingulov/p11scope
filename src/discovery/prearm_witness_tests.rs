@@ -617,3 +617,77 @@ fn witness_sentinel_values_reach_no_render_or_stderr() {
         }
     }
 }
+
+#[test]
+fn witness_clear_path_emits_no_sentinel_or_reason() {
+    // Clear-path twin of the refusal sentinel above: the planted
+    // proof passes every ordering condition, so the record publishes
+    // the explicitly empty window list, and the distinctive stamps
+    // still reach no render or diagnostic. Distinctive but
+    // order-valid: active before the scope start, the walk after
+    // attach; real monotonic stamps are large, so these decimals
+    // cannot collide with scripted small numbers.
+    let fixture = DiscoveryLifecycleFixture::start();
+    let provider = fixture.provider_path().to_path_buf();
+    let mut engine = discover_prearm_never_mapped(&fixture, &[provider], false);
+    let scope_start = engine
+        .prearm
+        .scope_start_ns()
+        .expect("discover stamps the scope start");
+    let attached_at = scope_start + 1000;
+    let mut session = ScriptedSession::default();
+    stamp_all_slots(&engine, &mut session, attached_at);
+    let object = watched_object(&engine);
+    let mut proof = clean_proof(&engine, object, scope_start, attached_at);
+    proof.active_ns = scope_start - 101;
+    proof.walk_started_ns = attached_at + 202;
+    plant(&mut engine, object, proof);
+    let dir = tempfile::tempdir().expect("sentinel dir");
+    let stderr_path = dir.path().join("stderr.log");
+    let (_capture, _file) = StderrCapture::start(&stderr_path);
+    finish(&mut engine, &session, false);
+    let published = watched_prearm_record(&engine);
+    assert_eq!(published.unobserved_windows, Some(Vec::new()));
+    // Profile: the full discovery evidence as JSON.
+    let profile = serde_json::to_string_pretty(&engine.discovery).expect("profile JSON");
+    // JSONL: one compact record per line.
+    let mut jsonl = String::new();
+    for record in &engine.discovery.modules {
+        jsonl.push_str(&serde_json::to_string(record).expect("record JSON"));
+        jsonl.push('\n');
+    }
+    // Trace shape: the compact discovery evidence plus the record Debug
+    // (what trace headers and diagnostic logs can carry).
+    let trace = format!(
+        "{}\n{:?}",
+        serde_json::to_string(&engine.discovery).expect("trace JSON"),
+        engine.discovery.modules,
+    );
+    drop(_capture);
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read stderr");
+    for value in [proof.active_ns, proof.walk_started_ns] {
+        let decimal = value.to_string();
+        for (name, text) in [
+            ("profile", profile.as_str()),
+            ("jsonl", jsonl.as_str()),
+            ("trace", trace.as_str()),
+            ("stderr", stderr.as_str()),
+        ] {
+            assert!(
+                !text.contains(&decimal),
+                "sentinel {decimal} leaks into {name}"
+            );
+        }
+    }
+    for reason in KeepReason::all() {
+        let word = reason.as_str();
+        for (name, text) in [
+            ("profile", profile.as_str()),
+            ("jsonl", jsonl.as_str()),
+            ("trace", trace.as_str()),
+            ("stderr", stderr.as_str()),
+        ] {
+            assert!(!text.contains(word), "reason {word} leaks into {name}");
+        }
+    }
+}

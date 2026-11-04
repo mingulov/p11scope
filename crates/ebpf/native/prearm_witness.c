@@ -761,7 +761,9 @@ static PW_INLINE int pw_walk_one(struct pw_iter_task_vma *ctx)
         key.s_dev = dev;
         key.i_ino = ino;
         slotp = pw_map_lookup(&PW_WATCHED, &key);
-        if (slotp && r->member && *slotp < PW_SLOTS)
+        if (slotp && *slotp >= PW_SLOTS)
+            pw_fault(s);
+        else if (slotp && r->member && *slotp < PW_SLOTS)
             pw_or(&s->found_slots, 1ULL << *slotp);
     }
     return 0;

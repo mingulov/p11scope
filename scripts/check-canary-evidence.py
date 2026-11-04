@@ -1903,6 +1903,9 @@ SAFE_PROFILE_TRACE_LANES = frozenset({
     "default-safe-profile", "feature-safe-profile",
     "default-safe-trace", "feature-safe-trace",
 })
+SAFE_TRACE_LANES = frozenset({
+    "default-safe-trace", "feature-safe-trace",
+})
 
 
 def strip_approved_unregistered_rows(content):
@@ -1963,6 +1966,13 @@ def assert_safe_lane_alias_privacy(lane, paths):
                 content = strip_approved_unregistered_rows(content)
             elif lane.endswith("-trace"):
                 content = strip_approved_mechanism_tokens(content)
+        elif (TARGET_BITS == 32 and lane in SAFE_TRACE_LANES
+                and path.name == f"{lane}.observer.log"):
+            # The stopped-phase harness merges the observer's stdout
+            # and stderr into this log, so it duplicates the approved
+            # trace lines byte-for-byte; diagnostics without tokens
+            # pass through to the unchanged scan below.
+            content = strip_approved_mechanism_tokens(content)
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
         if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
@@ -2368,6 +2378,15 @@ def main(argv=None):
         assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
         packed = struct.pack("<Q", UNKNOWN)
         assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
+        with tempfile.TemporaryDirectory() as tmp:
+            lane_log = Path(tmp) / "default-safe-trace.observer.log"
+            lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
+            assert_safe_lane_alias_privacy("default-safe-trace", [lane_log])
+            lane_log.write_bytes(
+                token_line + f"leak 0x{UNKNOWN:x}\n".encode())
+            reject("observer log misplaced mechanism value",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_log]))
         initialize(entry_bits)
 
         pss = [{

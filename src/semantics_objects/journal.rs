@@ -1458,6 +1458,18 @@ impl JournalAdapter {
         self.ingest_any_from_raw(item, None, false)
     }
 
+    /// Advance the consumption ordinal for one record disposed before
+    /// any key existed, without sighting its images: that interval is
+    /// fenced loss (the caller raises `voided_through`), so no later
+    /// birth answers for it as seen history.
+    fn note_disposed_without_sighting(&mut self) {
+        let Some(next) = self.consumed_through.checked_add(1) else {
+            self.invalidated = true;
+            return;
+        };
+        self.consumed_through = next;
+    }
+
     /// Assign the next original consumed position and record its actual
     /// sightings. Negative raw disposal uses this same accounting without
     /// interpreting a BEGIN/END as admitted H8 input.

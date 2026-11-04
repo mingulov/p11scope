@@ -2193,7 +2193,11 @@ impl RawJointQuantum {
         // There is no H8 dispatch, claim, grant or synthetic terminal. Keep
         // first-affecting sightings monotonic, including fork children.
         for (item, quiet, _) in self.classified_items() {
-            let _ = owner.adapter.note_consumed_item(item, quiet);
+            if pre_key {
+                owner.adapter.note_disposed_without_sighting();
+            } else {
+                let _ = owner.adapter.note_consumed_item(item, quiet);
+            }
         }
         if pre_key && affecting {
             // The disposed affecting records are lost history: fence

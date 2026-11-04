@@ -347,7 +347,14 @@ identity differs from every caller being tracked is reported under its own
 when exactly one live caller made them) and still counts in the stop line's
 shed count, but it no longer ends tracking for the other callers. A call
 without that identity, or from a tracked caller (including after its exec),
-still ends tracking as before.
+still ends tracking as before. Calls shed before any caller is tracked are
+reported at once in the `semantic calls unrouted` gap (`with 0 bindings`),
+and their effect is held (up to 1,024 distinct processes) until the first
+caller is tracked. If every one of them came from another process, a
+`pre-binding unrouted calls resolved to other callers` note says so and
+tracking continues; one from the tracked caller itself, one without an
+identity, a full hold, or a stop before any caller is tracked still counts
+as the loss that ends tracking.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are

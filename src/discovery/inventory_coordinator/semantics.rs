@@ -828,6 +828,11 @@ impl PublishedSemanticSuccessor {
     }
 }
 
+/// JK-18 note: calls already disclosed under `semantic calls unrouted`
+/// before the first binding, later proven other callers' (no new loss).
+pub(crate) const PRE_BINDING_OTHER_CALLERS: &str =
+    "pre-binding unrouted calls resolved to other callers";
+
 impl SemanticBindingSet {
     pub(crate) fn new() -> Self {
         Self {
@@ -3362,6 +3367,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // The one pid owning every such shed, or `Some(None)` once two
         // differ (no allocation: attribution is a label, never a proof).
         let mut other_pid: Option<Option<u32>> = None;
+        // JK-18: before the namespace's first binding, unrouted calls with
+        // a known image are held (counted now, disclosed and disposed or
+        // barriered when a binding or the stop resolves them).
+        let holding = self.semantic_bindings.len() == 0
+            && self
+                .semantic_finalizer
+                .as_ref()
+                .is_some_and(|state| state.domain == domain && !state.bound_once);
+        let mut stopped = false;
         // H3 disposition inputs collected across staging: every outcome
         // position this finalization disposes, the minimum shed
         // position, and whether any outcome lacked a position.
@@ -3391,6 +3405,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             .semantic_bindings
                             .proves_unbound_caller(domain, call.image()))
                     .then(|| (call.record().event.pid_tgid >> 32) as u32);
+                    let cookie = call.image().task_cookie;
+                    let call_pid = (call.record().event.pid_tgid >> 32) as u32;
                     match CallEvidence::from_routed(call) {
                         Some(evidence) => {
                             if calls.len() < MAX_INSTANCES {
@@ -3405,6 +3421,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         // Unjoined routes never stage: their positions
                         // are undisposable, so they shed.
                         None => {
+                            // JK-18: before the first binding, a positioned
+                            // call with a known image is disclosed and
+                            // counted as today, but only its barrier is
+                            // held until a binding can judge its caller.
+                            let mut held = false;
+                            if holding
+                                && other_caller.is_none()
+                                && cookie != 0
+                                && let (Some(at), Some(label)) = (token, shed_reason)
+                            {
+                                let state = self
+                                    .semantic_finalizer
+                                    .as_mut()
+                                    .expect("holding needs the live namespace");
+                                held = state.pre_binding.hold(cookie, at, label, call_pid);
+                                if !held {
+                                    // Overflow: everything held barriers
+                                    // now, and this call with it.
+                                    let flushed = state.pre_binding.take();
+                                    shed_min = Some(
+                                        shed_min
+                                            .map_or(flushed.min, |floor| floor.min(flushed.min)),
+                                    );
+                                }
+                            }
                             let reasons = if other_caller.is_some() {
                                 &mut other_shed_reasons
                             } else {
@@ -3427,6 +3468,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                         Some(_) => Some(None),
                                     };
                                 }
+                                (Some(_), None) if held => {}
                                 (Some(at), None) => {
                                     shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
                                 }
@@ -3436,6 +3478,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                 }
                 TickOutcome::Invalidation(invalidation) => {
+                    stopped |= matches!(invalidation.scope(), InvalidationScope::Stopped);
                     staged_positions.push(invalidation.position());
                     let image = match invalidation.scope() {
                         InvalidationScope::ImageRetired(image) => Some(*image),
@@ -3478,6 +3521,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     // finalization still disposes their positions.
                     staged_positions.push(other.position());
                 }
+            }
+        }
+        // Resolve the pre-binding hold at the first binding (or as loss at
+        // a stop before any binding); otherwise its floor keeps the held
+        // positions undisposed.
+        let bound = self.semantic_bindings.len() != 0;
+        let mut held_floor = None;
+        let mut resolved_other: Option<finalizer::PreBindingHold> = None;
+        if let Some(state) = self
+            .semantic_finalizer
+            .as_mut()
+            .filter(|state| state.domain == domain)
+        {
+            if bound {
+                state.bound_once = true;
+            }
+            if bound || stopped {
+                let held = state.pre_binding.take();
+                if !held.is_empty() {
+                    let forgiven = bound
+                        && held.cookies.iter().all(|cookie| {
+                            self.semantic_bindings.proves_unbound_caller(
+                                domain,
+                                ImageIdentity {
+                                    task_cookie: *cookie,
+                                    exec_id: 0,
+                                },
+                            )
+                        });
+                    if forgiven {
+                        staged_positions.push(Some(held.max));
+                        resolved_other = Some(held);
+                    } else {
+                        shed_min = Some(shed_min.map_or(held.min, |floor| floor.min(held.min)));
+                    }
+                }
+            } else {
+                held_floor = state.pre_binding.floor();
             }
         }
         if shed_calls != 0 {
@@ -3541,6 +3622,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
             lane.note_shed_calls(total);
+        }
+        // Pre-binding sheds were disclosed (and counted) when shed; the
+        // first binding proved them other callers', so their barrier is
+        // released. Say so: a note, never a second count.
+        if let Some(held) = resolved_other {
+            let total: u64 = held.labels.iter().map(|(_, count)| count).sum();
+            let caller = held
+                .pid
+                .flatten()
+                .and_then(|pid| self.adapter.live_id(pid))
+                .filter(|caller| self.semantic_bindings.get(*caller).is_none());
+            self.registry.record_gap(RegistryGap {
+                caller,
+                module: None,
+                pid: None,
+                subject: PRE_BINDING_OTHER_CALLERS.into(),
+                reason: format!(
+                    "{total} calls shed before the first binding came from callers other than the {} bound callers; their history is kept",
+                    self.semantic_bindings.len()
+                ),
+                budget: None,
+            });
         }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.
@@ -3649,7 +3752,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             PreparedH3 {
                 negatives,
                 staged_positions,
-                awaiting_floor: batch_awaiting,
+                awaiting_floor: batch_awaiting.into_iter().chain(held_floor).min(),
                 shed_floor: batch_shed.into_iter().chain(shed_min).min(),
                 exhausted: batch_exhausted || unpositioned,
             },
@@ -5199,6 +5302,238 @@ mod finalizer_history_tests {
             assert_eq!(lane.shed_calls_disclosed(), 2, "cookie {cookie}");
             assert_eq!(unrouted_gap_calls(&coordinator), 2, "cookie {cookie}");
         }
+    }
+
+    /// Gap reasons by subject for the two unrouted subjects.
+    fn unrouted_subject_calls(
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        subject: &str,
+    ) -> u64 {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == subject)
+            .map(|(gap, repeats)| {
+                let count: u64 = gap
+                    .reason
+                    .split_whitespace()
+                    .next()
+                    .and_then(|first| first.parse().ok())
+                    .unwrap();
+                count * repeats
+            })
+            .sum()
+    }
+
+    fn bind_cookie(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        domain: NativeDomainId,
+        cookie: u64,
+    ) {
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                CallerId(9),
+                ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                domain,
+                ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 1,
+                },
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+    }
+
+    fn commit_outcomes(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        lane: &mut AttestedSemanticLane,
+        domain: NativeDomainId,
+        outcomes: Vec<TickOutcome>,
+    ) -> crate::semantics_objects::journal::H3DispositionEvidence {
+        let report = TickReport::scripted_with_disposition(outcomes, Vec::new(), None, None, false);
+        let batch = SemanticBatch::from_tick_report(domain, report, Vec::new(), 130).unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(lane))
+            .unwrap();
+        coordinator.take_h3_disposition()
+    }
+
+    fn invalidation_at(
+        domain: NativeDomainId,
+        scope: crate::semantic_capture::InvalidationScope,
+        position: u64,
+    ) -> TickOutcome {
+        TickOutcome::Invalidation(crate::semantic_capture::Invalidation::scripted(
+            domain,
+            scope,
+            Some(position),
+        ))
+    }
+
+    const BLOCKING: &str = "semantic calls unrouted";
+    const OTHER: &str = "semantic calls unrouted from other callers";
+    const NOTE: &str = PRE_BINDING_OTHER_CALLERS;
+
+    /// Pre-binding hold: `cookies` are two unrouted calls at positions 2
+    /// and 3 before any binding exists; then the first binding (cookie
+    /// `bound`) appears and a quiet batch resolves the hold. Returns the
+    /// evidence before and after the binding.
+    fn pre_binding_case(
+        cookies: [u64; 2],
+        bound: u64,
+        limit: Option<usize>,
+    ) -> (
+        InventoryCoordinator<OsProcessSource>,
+        AttestedSemanticLane,
+        crate::semantics_objects::journal::H3DispositionEvidence,
+        crate::semantics_objects::journal::H3DispositionEvidence,
+    ) {
+        use crate::semantic_capture::InvalidationScope;
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        if let Some(limit) = limit {
+            coordinator
+                .semantic_finalizer
+                .as_mut()
+                .unwrap()
+                .reference_pre_binding_limit(limit);
+        }
+        let before = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(domain, InvalidationScope::CoverageFailed, 1),
+                unrouted_call(domain, cookies[0], 2),
+                unrouted_call(domain, cookies[1], 3),
+            ],
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 2, "held calls count at once");
+        bind_cookie(&mut coordinator, domain, bound);
+        let after = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(
+                domain,
+                InvalidationScope::CoverageFailed,
+                4,
+            )],
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 2, "resolution never recounts");
+        let total = unrouted_subject_calls(&coordinator, BLOCKING)
+            + unrouted_subject_calls(&coordinator, OTHER);
+        assert_eq!(total, 2, "every held call is disclosed exactly once");
+        (coordinator, lane, before, after)
+    }
+
+    #[test]
+    fn pre_binding_unrouted_calls_of_another_caller_are_forgiven_at_the_first_binding() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, before, after) = pre_binding_case([77, 78], 41, None);
+        assert!(
+            matches!(
+                before,
+                H3DispositionEvidence::Clean {
+                    staged_max: 1,
+                    pending_floor: Some(2)
+                }
+            ),
+            "held positions wait, neither certified nor lost: {before:?}"
+        );
+        assert!(
+            matches!(
+                after,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "the first binding proves another caller: {after:?}"
+        );
+        // Disclosed at once as shed, then noted as other callers'.
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 2);
+    }
+
+    #[test]
+    fn pre_binding_unrouted_calls_matching_the_first_binding_still_barrier() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, _before, after) = pre_binding_case([77, 41], 41, None);
+        assert!(
+            matches!(after, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "the bound caller's own pre-birth loss is never forgiven: {after:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+    }
+
+    #[test]
+    fn pre_binding_unrouted_calls_without_an_image_barrier_at_once() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, before, after) = pre_binding_case([0, 77], 41, None);
+        assert!(
+            matches!(before, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "an unknown image is never held: {before:?}"
+        );
+        assert!(
+            matches!(after, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "the unknown call's barrier stands after the binding: {after:?}"
+        );
+        // Only the call with a known, different image is noted.
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 1);
+    }
+
+    #[test]
+    fn pre_binding_hold_overflow_barriers() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, before, _after) = pre_binding_case([77, 78], 41, Some(1));
+        assert!(
+            matches!(before, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "past the hold limit everything held barriers: {before:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+    }
+
+    #[test]
+    fn pre_binding_hold_resolves_as_loss_when_the_lane_stops_unbound() {
+        use crate::semantic_capture::InvalidationScope;
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(domain, InvalidationScope::CoverageFailed, 1),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert_eq!(
+            unrouted_subject_calls(&coordinator, BLOCKING),
+            1,
+            "a held call is disclosed at once"
+        );
+        let stopped = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(domain, InvalidationScope::Stopped, 3)],
+        );
+        assert!(
+            matches!(stopped, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "{stopped:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 1);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+        assert_eq!(lane.shed_calls_disclosed(), 1);
     }
 }
 

@@ -2953,6 +2953,15 @@ class JointConservationGate(unittest.TestCase):
                                         "loss gap"):
                 self.run_joint(Path(tmp), self.prebinding_gaps(6, 5))
 
+    def test_prebinding_note_overcounting_the_sheds_fails(self):
+        # The NOTE counts a subset of the "with 0 bindings" sheds, so a
+        # NOTE above the shed count is a product miscount, not a
+        # resolution: it must stay a loss gap.
+        with tempfile.TemporaryDirectory(prefix="joint-pre3-") as tmp:
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), self.prebinding_gaps(6, 7))
+
     def test_slot_refused_setup_conserved(self):
         # The live keyed shape: the two COUNT_ONLY slot probes are
         # refused at conversion and disclosed, so operations and

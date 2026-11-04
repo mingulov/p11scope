@@ -896,7 +896,7 @@ def check_loss(selected, doc, events, joint=False):
     prebinding_resolved = False
     if joint:
         pre_shed, pre_noted = _prebinding_counts(gaps)
-        prebinding_resolved = pre_shed > 0 and pre_noted >= pre_shed
+        prebinding_resolved = pre_shed > 0 and pre_noted == pre_shed
         if prebinding_resolved:
             other_caller_unrouted += pre_shed
     for gap in gaps:

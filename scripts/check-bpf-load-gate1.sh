@@ -90,6 +90,10 @@ fi
 [ -f "$PROBE" ] || { echo "probe not found: $PROBE" >&2; exit 2; }
 [ -d "$OUTDIR" ] || { echo "output dir not found: $OUTDIR" >&2; exit 2; }
 [ -f "$REPORT" ] || { echo "report script not found: $REPORT" >&2; exit 2; }
+# Guest release match, shared with the kernels driver: sourced from
+# one file, never copied per driver.
+[ -f "$SCRIPT_DIR/bpf-guest-release.sh" ] || { echo "release match not found: $SCRIPT_DIR/bpf-guest-release.sh" >&2; exit 2; }
+. "$SCRIPT_DIR/bpf-guest-release.sh"
 if [ -n "$BUDGETS" ] && [ ! -f "$BUDGETS" ]; then
     echo "budgets not found: $BUDGETS" >&2
     exit 2
@@ -106,34 +110,6 @@ else
     echo "# budgets: none (gate is loaded + stats + 5% headroom)"
 fi
 
-# Guest release match: the tag without its leading v must equal uname -r
-# or prefix it, except release candidates, whose tag (v7.4-rc1) boots the
-# dotted triplet (7.4.0-070400rc1-generic): there the triplet prefix plus
-# the same rc marker must match, never another rc number.
-release_ok() {
-    _release_expected=${1#v}
-    _release_guest=$2
-    case "$_release_guest" in
-        "$_release_expected"|"$_release_expected"-*)
-            return 0
-            ;;
-    esac
-    case "$_release_expected" in
-        *-rc[0-9]*)
-            _release_base=${_release_expected%-rc*}
-            _release_tag=${_release_expected##*-rc}
-            case "$_release_guest" in
-                "$_release_base.0-"*rc"$_release_tag")
-                    return 0
-                    ;;
-                "$_release_base.0-"*rc"$_release_tag"[!0-9]*)
-                    return 0
-                    ;;
-            esac
-            ;;
-    esac
-    return 1
-}
 # Single-quote a path for the guest shell.
 q() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"

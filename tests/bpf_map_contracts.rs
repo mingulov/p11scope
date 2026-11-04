@@ -181,6 +181,7 @@ fn native_bpf_map_decoder_contracts() {
 #[test]
 fn embedded_birth_marker_twins_are_driven() {
     let cases = [
+        "JournalMarkerInventoryTests.test_gate_variant_accepts_gate_maps_with_markers",
         "JournalMarkerInventoryTests.test_release_detailed_marker_absence_accepts",
         "JournalMarkerInventoryTests.test_release_detailed_stale_marker_inventory_refused",
         "JournalMarkerInventoryTests.test_release_half_linked_marker_globals_refused",
@@ -216,6 +217,6 @@ fn embedded_birth_marker_twins_are_driven() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.status.success(), "birth marker twins: {report}");
-    assert!(report.contains("Ran 22 tests"), "zero selection: {report}");
+    assert!(report.contains("Ran 23 tests"), "zero selection: {report}");
     assert!(report.contains("\nOK\n"), "skipped marker proof: {report}");
 }

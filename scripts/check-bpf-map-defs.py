@@ -2299,6 +2299,17 @@ UNSAFE_MAPS = _DETAILED_BASE_MAPS | {
     "ATTR_BOOL_BITS": map_def(1, 4, 4, 16, 128),
     "PAIR_CALLS": map_def(3, 4, 4, 1),
 }
+# The loader-gate Detailed object: the default maps plus the bank-B
+# identity maps, the bank-select word and the gate rows/control. Gate
+# builds add no programs and no global helpers, so the program and
+# symbol contracts stay the default ones.
+GATE_MAPS = SAFE_MAPS | {
+    "TASK_COOKIE_B": map_def(29, 4, 8, 0, 1),
+    "COOKIE_CTL_B": map_def(2, 4, 40, 1),
+    "IMAGE_BANK_SELECT": map_def(2, 4, 96, 1),
+    "LOADER_GATE": map_def(2, 4, 32, 256),
+    "LOADER_GATE_CTL": map_def(2, 4, 72, 1),
+}
 WIDE_MAPS = _DETAILED_BASE_MAPS | {
     "STATS": map_def(6, 4, 296, 2_112),
     "RV_COUNTS": map_def(5, 16, 8, 8_192),
@@ -2402,6 +2413,7 @@ FROZEN_INVENTORY = {
     "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_CALLER_PROGRAMS),
     "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_CALLER_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
+    "default-gate": (GATE_MAPS, SAFE_PROGRAMS),
     "default-no-marker": (_DETAILED_BASE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide-default": (WIDE_MAPS, SAFE_PROGRAMS),
@@ -2421,6 +2433,7 @@ FROZEN_SYMBOLS = {
     "inventory-callers": (False, False, False, 0, 0, 0),
     "inventory-callers-small-discovery": (False, False, False, 0, 0, 0),
     "default": (False, False, False, 0, 0, 0),
+    "default-gate": (False, False, False, 0, 0, 0),
     "default-no-marker": (False, False, False, 0, 0, 0),
     "diagnostic": (True, True, True, 2, 2, 2),
     "wide-default": (False, False, False, 0, 0, 0),
@@ -2466,10 +2479,10 @@ def validate_inventory(variant, maps, programs, symbols):
             raise RuntimeError(f"journal object lacks required marker symbols: {sorted(missing)}")
     elif not inventory:
         markers = symbols & (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"})
-        if variant == "default":
+        if variant in ("default", "default-gate"):
             missing = (REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}) - symbols
             if missing:
-                raise RuntimeError(f"default object lacks required birth marker symbols: {sorted(missing)}")
+                raise RuntimeError(f"{variant} object lacks required birth marker symbols: {sorted(missing)}")
         elif markers:
             raise RuntimeError(f"release object contains forbidden birth marker symbols: {sorted(markers)}")
     if inventory:

@@ -30,7 +30,8 @@ as ``NAME/<root>`` against budget keys of that form, and the
 budgeted-but-missing check is scoped to ``NAME/`` keys, so two BPF
 objects sharing program names (the Detailed and Inventory objects
 share ten) are gated without mixing their counts, even from one mixed
-probe file.
+probe file. ``detailed-gate1`` names the loader-gate Detailed object,
+which shares Detailed's roots and selects the same groups.
 
 One refused shape is expected, never a failure: the 2-instruction
 ``bpf_loop`` (helper 181) capability probe that ``doctor`` runs for its

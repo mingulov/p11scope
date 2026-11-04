@@ -99,7 +99,7 @@ if name=='vng':
     out=pathlib.Path(args[args.index('--rwdir')+1])
     if os.environ.get('FAKE_BAD_HELPER')=='missing': (out/'guest-env.sh').unlink()
     if os.environ.get('FAKE_BAD_HELPER')=='bad': (out/'guest-env.sh').write_text('return 0\n')
-    release=kernel[1:]+'-test' if kernel.startswith('v') else kernel+'-test'
+    release=os.environ.get('FAKE_RELEASE_PIN') or (kernel[1:]+'-test' if kernel.startswith('v') else kernel+'-test')
     env={**os.environ,'FAKE_RELEASE':release}
     if os.environ.get('FAKE_STRIP_STAGED'):
         done=subprocess.run(['/bin/sh','-c',command],env=env,capture_output=True,text=True)
@@ -596,6 +596,42 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "nonqualifying")
         self.assertIn("workload never readied", row["detail"])
 
+    RC_KERNEL = "v7.4-rc1"
+    RC_RELEASE = "7.4.0-070400rc1-generic"
+
+    def write_guest_config(self, kernel, release):
+        config = self.cache / ("virtme-ng/%s/amd64/boot/config-%s"
+                               % (kernel, release))
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text("owned test config\n")
+
+    def test_release_candidate_guest_release_passes(self):
+        # An rc tag boots the dotted triplet: the shared release match
+        # accepts it and the linked leg runs like any other kernel.
+        self.write_guest_config(self.RC_KERNEL, self.RC_RELEASE)
+        result, out = self.run_gate(
+            self.RC_KERNEL, extra={"FAKE_RELEASE_PIN": self.RC_RELEASE})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
+        self.assertIn("linked sealed live", row["detail"])
+
+    def test_wrong_release_candidate_is_nonqualifying(self):
+        # ...rc2 does not match an rc1 tag: an infrastructure
+        # mismatch, never a product verdict.
+        self.write_guest_config(self.RC_KERNEL, self.RC_RELEASE)
+        wrong = "7.4.0-070400rc2-generic"
+        self.write_guest_config(self.RC_KERNEL, wrong)
+        result, out = self.run_gate(
+            self.RC_KERNEL, extra={"FAKE_RELEASE_PIN": wrong})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest booted %s, expected %s" % (wrong, self.RC_KERNEL),
+                      row["detail"])
+
     def test_garbled_staging_line_still_passes(self):
         # vng's console capture demonstrably garbles the boot-config
         # staging line while the leg runs fine; the gate keys on the
@@ -762,6 +798,14 @@ class ScriptContractTests(unittest.TestCase):
         for package in ("gcc", "softhsm2", "libsofthsm2", "python3",
                         "virtme-ng"):
             self.assertIn(package, self.text)
+
+    def test_reuses_the_shared_guest_release_match(self):
+        # The rc-aware match lives in exactly one place: the journal
+        # driver sources it and calls it at the guest-release gate.
+        self.assertIn('. "$SCRIPT_DIR/bpf-guest-release.sh"', self.text)
+        self.assertIn('if release_ok "$KERNEL" "$GUEST_RELEASE"; then',
+                      self.text)
+        self.assertNotIn("release_ok() {", self.text)
 
 
 if __name__ == "__main__":

@@ -6221,16 +6221,31 @@ fn frozen_policy_inventory_matches_embedded_object() {
     let wide = cfg!(feature = "wide-detailed-2112");
     let unsafe_build = cfg!(feature = "unsafe-unvalidated-metadata");
     let marker = artifact_expected_marker_enabled();
+    // The loader-gate selection is read from the embedded object
+    // itself (the bank-B map is present only in gate builds), never
+    // from ambient build environment.
+    let gate = aya_obj::Object::parse(p11scope::EBPF_OBJECT)
+        .expect("parse embedded object for gate selection")
+        .maps
+        .contains_key("TASK_COOKIE_B");
     if marker && (wide || unsafe_build) {
         eprintln!("explicit-marker test shape on a journalless build; no frozen variant covers it");
         return;
     }
-    let (variant, other_metadata, other_capacity) = match (wide, unsafe_build) {
-        (false, false) if marker => ("default", "diagnostic", "wide-default"),
-        (false, false) => ("default-no-marker", "default", "wide-default"),
-        (false, true) => ("diagnostic", "default", "wide-diagnostic"),
-        (true, false) => ("wide-default", "wide-diagnostic", "default"),
-        (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
+    if gate && (wide || unsafe_build) {
+        eprintln!("gate test shape on a wide/diagnostic build; no frozen variant covers it");
+        return;
+    }
+    let (variant, other_metadata, other_capacity) = if gate {
+        ("default-gate", "default", "diagnostic")
+    } else {
+        match (wide, unsafe_build) {
+            (false, false) if marker => ("default", "diagnostic", "wide-default"),
+            (false, false) => ("default-no-marker", "default", "wide-default"),
+            (false, true) => ("diagnostic", "default", "wide-diagnostic"),
+            (true, false) => ("wide-default", "wide-diagnostic", "default"),
+            (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
+        }
     };
     // Stage A plus image continuity: four additional private maps, one
     // pre-mm hook and one same-object task iterator. H7 slice B adds the
@@ -6242,8 +6257,11 @@ fn frozen_policy_inventory_matches_embedded_object() {
     // builds; journalless builds omit them, and the unsafe
     // decoder maps add two more maps with five extra programs.
     // The 7.3+ exec-release and 6/7-argument copy_vma variants add one
-    // program each; one of each pair loads.
-    let (maps, programs) = if unsafe_build {
+    // program each; one of each pair loads. The loader gate adds five
+    // maps (bank B, select word, gate rows/control) with no new program.
+    let (maps, programs) = if gate {
+        (48, 22)
+    } else if unsafe_build {
         (44, 27)
     } else if wide {
         (42, 22)

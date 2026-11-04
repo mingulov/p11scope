@@ -21,16 +21,28 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/bpf-load-report.py"
 DRIVER = ROOT / "scripts/check-bpf-load-kernels.sh"
+RELEASE_MATCH = ROOT / "scripts/bpf-guest-release.sh"
 BUDGETS_FILE = ROOT / "tests/bpf-verifier-budgets.json"
 COUNTER_BUDGETS_FILE = ROOT / "tests/counter-bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
 OBSERVER = "ab" * 32
 # The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
 # plus the 7.0 guest the budgets also cover. Variant-group members
-# split this set instead of carrying it whole (see below).
+# split this set instead of carrying it whole (see below). Each
+# budget-key namespace (prefix before "/") pins its own kernel set;
+# all four namespaces currently cover the same measured 5-kernel set.
 EXPECTED_BUDGET_KERNELS = frozenset({
     "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
 })
+EXPECTED_GATE1_BUDGET_KERNELS = frozenset({
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
+})
+EXPECTED_BUDGET_KERNELS_BY_NAMESPACE = {
+    "detailed": EXPECTED_BUDGET_KERNELS,
+    "inventory": EXPECTED_BUDGET_KERNELS,
+    "detailed-gate1": EXPECTED_GATE1_BUDGET_KERNELS,
+    "journal-gate1": EXPECTED_GATE1_BUDGET_KERNELS,
+}
 # Hook slots whose program loads only on some kernels: each kernel budgets
 # exactly one member of each group, and a missing row for the other member
 # is accepted (it simply does not load there). Mirrors
@@ -79,43 +91,63 @@ def budgets_files():
 
 
 def check_budgets_shape(path):
-    """Every budgeted program carries the same kernel set; a missing cell fails.
+    """Every namespace pins its own kernel set; a missing cell fails.
 
-    Variant-group members are the exception: each kernel budgets exactly
-    one member of each group, so a group member carries a strict subset
-    and the members partition the kernel set. The report's
-    budgeted-but-missing FAIL only fires for roots carrying a cell for
-    the requested kernel, so a root silently dropped from one kernel's
-    column would pass with no rows at all. This pin fails such a file.
-    Raises AssertionError naming the mismatch.
+    Each budget-key namespace (prefix before "/") carries one kernel
+    set for its non-variant programs, compared against that
+    namespace's pinned set. Variant-group members are the exception:
+    each kernel budgets exactly one member of each group, so a group
+    member carries a strict subset and the members partition their
+    namespace's kernel set. The report's budgeted-but-missing FAIL
+    only fires for roots carrying a cell for the requested kernel, so
+    a root silently dropped from one kernel's column would pass with
+    no rows at all. This pin fails such a file, including a dropped
+    namespace. Raises AssertionError naming the mismatch.
     """
     document = json.loads(Path(path).read_text(encoding="ascii"))
     programs = document["programs"]
     assert programs, "budgets file names no programs"
+    observed = {name.split("/", 1)[0] if "/" in name else ""
+              for name in programs}
+    assert observed == set(EXPECTED_BUDGET_KERNELS_BY_NAMESPACE), (
+        f"budget namespaces {sorted(observed)} differ from "
+        f"{sorted(EXPECTED_BUDGET_KERNELS_BY_NAMESPACE)}")
     grouped = set().union(*EXCLUSIVE_VARIANT_GROUPS)
-    kernel_sets = {name: frozenset(cells) for name, cells in programs.items()
-                   if name not in grouped}
-    first, *rest = sorted(kernel_sets)
-    for name in rest:
-        assert kernel_sets[name] == kernel_sets[first], (
-            f"{name} kernels {sorted(kernel_sets[name])} differ from "
-            f"{first} {sorted(kernel_sets[first])}")
-    assert kernel_sets[first] == EXPECTED_BUDGET_KERNELS, (
-        f"budget kernels {sorted(kernel_sets[first])} differ from "
-        f"{sorted(EXPECTED_BUDGET_KERNELS)}")
+    by_namespace = {}
+    for name, cells in programs.items():
+        if name in grouped:
+            continue
+        namespace = name.split("/", 1)[0]
+        by_namespace.setdefault(namespace, {})[name] = frozenset(cells)
+    for namespace in sorted(by_namespace):
+        expected = EXPECTED_BUDGET_KERNELS_BY_NAMESPACE[namespace]
+        kernel_sets = by_namespace[namespace]
+        first, *rest = sorted(kernel_sets)
+        for name in rest:
+            assert kernel_sets[name] == kernel_sets[first], (
+                f"{name} kernels {sorted(kernel_sets[name])} differ from "
+                f"{first} {sorted(kernel_sets[first])}")
+        assert kernel_sets[first] == expected, (
+            f"{namespace} budget kernels {sorted(kernel_sets[first])} "
+            f"differ from {sorted(expected)}")
     for group in EXCLUSIVE_VARIANT_GROUPS:
         for member in sorted(group):
             assert member in programs, (
                 f"variant group {sorted(group)} is missing {member}")
+        namespaces = {member.split("/", 1)[0] for member in group}
+        assert len(namespaces) == 1, (
+            f"variant group {sorted(group)} spans namespaces "
+            f"{sorted(namespaces)}")
+        expected = EXPECTED_BUDGET_KERNELS_BY_NAMESPACE[next(iter(namespaces))]
         covered = {}
         for member in sorted(group):
             for kernel in programs[member]:
                 assert kernel not in covered, (
                     f"{kernel} budgets two members of {sorted(group)}")
                 covered[kernel] = member
-        assert set(covered) == EXPECTED_BUDGET_KERNELS, (
+        assert set(covered) == expected, (
             f"variant group {sorted(group)} covers {sorted(covered)}, "
-            f"expected {sorted(EXPECTED_BUDGET_KERNELS)}")
+            f"expected {sorted(expected)}")
 
 
 def check_budgets_cap(path):
@@ -512,16 +544,22 @@ class ReportTests(unittest.TestCase):
         # release only; a bare prefix also matches a different kernel
         # (6.1.1880 for 6.1.188). A release-candidate tag (v7.4-rc1) boots
         # the dotted triplet (7.4.0-070400rc1-generic) and must match only
-        # its own rc number. Run the driver's own release_ok function.
+        # its own rc number. Run the shared release_ok function.
+        self.assertTrue(RELEASE_MATCH.is_file(),
+                        "scripts/bpf-guest-release.sh is missing")
+        match_text = RELEASE_MATCH.read_text(encoding="ascii")
+        start = match_text.index("release_ok() {\n")
+        end = match_text.index("\n}\n", start) + 3
+        function = match_text[start:end]
+        self.assertEqual(match_text.count("release_ok() {"), 1)
         self.assertTrue(DRIVER.is_file(),
                         "scripts/check-bpf-load-kernels.sh is missing")
         text = DRIVER.read_text(encoding="ascii")
-        start = text.index("release_ok() {\n")
-        end = text.index("\n}\n", start) + 3
-        function = text[start:end]
-        self.assertEqual(text.count("release_ok() {"), 1)
+        # The match lives in the shared file, never copied per driver.
+        self.assertIn('. "$SCRIPT_DIR/bpf-guest-release.sh"', text)
+        self.assertNotIn("release_ok() {", text)
         # The doctor, inventory and counter guests all use it.
-        self.assertEqual(text[end:].count('if release_ok "$KERNEL" '), 3)
+        self.assertEqual(text.count('if release_ok "$KERNEL" '), 3)
         cases = [
             ("v6.1.188", "6.1.188", True),
             ("v6.1.188", "6.1.188-0601188-generic", True),
@@ -545,20 +583,19 @@ class ReportTests(unittest.TestCase):
     def test_gate1_and_journal_drivers_share_the_release_match(self):
         # The gate-1 and journal drivers boot the same kernel tags, so
         # a release-candidate guest (v7.4-rc1 boots 7.4.0-070400rc1-*)
-        # must match there too, through the identical release_ok, and
-        # each driver's one guest must use it.
-        text = DRIVER.read_text(encoding="ascii")
-        start = text.index("release_ok() {\n")
-        reference = text[start:text.index("\n}\n", start) + 3]
-        for name in ("check-bpf-load-gate1.sh", "check-bpf-load-journal.sh"):
+        # must match there too, through the one shared release_ok, and
+        # each driver's guest must use it. No driver keeps a local
+        # copy: divergence is impossible by construction.
+        shared = (ROOT / "scripts" / "bpf-guest-release.sh").read_text(encoding="ascii")
+        self.assertEqual(shared.count("release_ok() {"), 1)
+        for name in ("check-bpf-load-kernels.sh", "check-bpf-load-gate1.sh",
+                     "check-bpf-load-journal.sh"):
             other = (ROOT / "scripts" / name).read_text(encoding="ascii")
             with self.subTest(driver=name):
-                self.assertEqual(other.count("release_ok() {"), 1)
-                start = other.index("release_ok() {\n")
-                end = other.index("\n}\n", start) + 3
-                self.assertEqual(other[start:end], reference)
-                self.assertEqual(
-                    other[end:].count('if release_ok "$KERNEL" "$GUEST_RELEASE"; then'), 1)
+                self.assertIn('. "$SCRIPT_DIR/bpf-guest-release.sh"', other)
+                self.assertNotIn("release_ok() {", other)
+                self.assertGreaterEqual(
+                    other.count('if release_ok "$KERNEL" "$GUEST_RELEASE"; then'), 1)
                 self.assertNotIn('"${KERNEL#v}"|"${KERNEL#v}-"*)', other)
 
     def test_driver_scores_inventory_side_against_budgets(self):
@@ -1127,6 +1164,69 @@ class ReportTests(unittest.TestCase):
                                  budgets=budgets, object_name="journal")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("journal/p11_entry_journal", result.stdout)
+
+    def mixed_gate1_loads(self):
+        # One file holding gate-1 Detailed rows (BTF 77, with a
+        # Detailed-only root) and Inventory rows (BTF 48) under
+        # different BTF ids, as a gate-1 doctor probe file does. The
+        # shared names carry different counts per object so
+        # cross-object max mixing is visible.
+        detailed = [
+            load_row("p11_image_query", processed=445, btf_id=77),
+            load_row("interface_entry", processed=5606, btf_id=77),
+            load_row("interface_return", processed=352188, btf_id=77),
+        ]
+        inventory = [
+            load_row("p11_usage_entry_lp64", processed=873, btf_id=48),
+            load_row("interface_entry", processed=84937, btf_id=48),
+        ]
+        return detailed + inventory
+
+    def mixed_gate1_budgets(self):
+        # Test-only budgets above the fixture counts (grouping, not
+        # the real per-kernel pins, is under test here).
+        return self.write_budgets({
+            "detailed-gate1/p11_image_query": {KERNEL: 512},
+            "detailed-gate1/interface_entry": {KERNEL: 6500},
+            "detailed-gate1/interface_return": {KERNEL: 405017},
+            "inventory/p11_usage_entry_lp64": {KERNEL: 1025},
+            "inventory/interface_entry": {KERNEL: 97386},
+        })
+
+    def test_mixed_gate1_inventory_file_scores_gate1_only(self):
+        # A gate-1 doctor run loads the gate-1 Detailed object and the
+        # ordinary Inventory object in one probed process; the scorer
+        # must group by BTF id and score the gate-1 object from its
+        # own rows only, namespaced as detailed-gate1/.
+        loads = self.mixed_gate1_loads()
+        budgets = self.mixed_gate1_budgets()
+        result = self.run_report(self.write_loads("gate1.jsonl", loads),
+                                 budgets=budgets,
+                                 object_name="detailed-gate1")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("result=PASS", result.stdout)
+        self.assertIn("detailed-gate1/p11_image_query", result.stdout)
+        self.assertIn("detailed-gate1/interface_entry", result.stdout)
+        self.assertIn("5606", result.stdout)
+        self.assertNotIn("84937", result.stdout)
+        self.assertNotIn("p11_usage_entry", result.stdout)
+
+    def test_gate1_missing_root_fails(self):
+        # The Detailed-only root never loaded, leaving a shared-only
+        # group: scoring as detailed-gate1 keeps that group's rows
+        # (like detailed) but FAILs the budgeted root missing.
+        loads = [load for load in self.mixed_gate1_loads()
+                 if load["root"] != "p11_image_query"]
+        budgets = self.mixed_gate1_budgets()
+        result = self.run_report(self.write_loads("gate1.jsonl", loads),
+                                 budgets=budgets,
+                                 object_name="detailed-gate1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("result=FAIL", result.stdout)
+        self.assertIn("detailed-gate1/p11_image_query", result.stdout)
+        self.assertIn("missing from probe rows", result.stdout)
+        self.assertIn("detailed-gate1/interface_entry", result.stdout)
+        self.assertIn("5606", result.stdout)
 
 
 # The FNV-1a 64 of `call 181; exit` (BPF_LOOP_PROBE_INSNS), cross-checked

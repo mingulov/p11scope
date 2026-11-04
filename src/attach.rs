@@ -12245,7 +12245,7 @@ mod tests {
 
     #[test]
     fn identity_inventory_rejects_missing_extra_and_wrong_variants() {
-        let valid = [
+        let bank_a = [
             ("TASK_COOKIE", true),
             ("THREAD_OWNER", true),
             ("ROOT_AFFILIATION", true),
@@ -12253,27 +12253,61 @@ mod tests {
             ("OWNER_CTL", false),
             ("ROOT_CTL", false),
         ];
-        validate_identity_inventory(valid.into_iter(), false).unwrap();
-        for index in [0, 1, 2] {
-            assert!(
-                validate_identity_inventory(
-                    valid
-                        .into_iter()
-                        .enumerate()
-                        .filter_map(|(i, v)| (i != index).then_some(v)),
-                    false
-                )
-                .is_err()
-            );
-            let mut wrong = valid;
-            wrong[index].1 = false;
-            assert!(validate_identity_inventory(wrong.into_iter(), false).is_err());
-        }
-        for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
-            assert!(
-                validate_identity_inventory(valid.into_iter().chain([(extra, true)]), false)
+        // Both arms hold in every build: a gate-1 object requires the
+        // second ticket bank on top of the bank-A set, while a gate-0
+        // object (counter, inventory, journal, or any default object)
+        // refuses it as an unexpected gate-1 map.
+        for gate in [false, true] {
+            let valid: Vec<(&str, bool)> = if gate {
+                bank_a
+                    .into_iter()
+                    .chain([("TASK_COOKIE_B", true)])
+                    .collect()
+            } else {
+                bank_a.into_iter().collect()
+            };
+            validate_identity_inventory(valid.iter().copied(), gate).unwrap();
+            let mut covered = 0;
+            for index in 0..valid.len() {
+                if !valid[index].1 {
+                    continue;
+                }
+                covered += 1;
+                assert!(
+                    validate_identity_inventory(
+                        valid
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .filter_map(|(i, v)| (i != index).then_some(v)),
+                        gate,
+                    )
                     .is_err()
-            );
+                );
+                let mut wrong = valid.clone();
+                wrong[index].1 = false;
+                assert!(validate_identity_inventory(wrong.into_iter(), gate).is_err());
+            }
+            assert_eq!(covered, if gate { 4 } else { 3 });
+            for extra in ["OTHER", "COOKIE_CTL", "OWNER_CTL", "ROOT_CTL"] {
+                assert!(
+                    validate_identity_inventory(valid.iter().copied().chain([(extra, true)]), gate)
+                        .is_err()
+                );
+            }
+            if gate {
+                // The bank-A set alone is incomplete for a gate-1 object.
+                assert!(validate_identity_inventory(bank_a.into_iter(), gate).is_err());
+            } else {
+                // Gate-0 objects refuse the bank-B map as unexpected.
+                assert!(
+                    validate_identity_inventory(
+                        valid.iter().copied().chain([("TASK_COOKIE_B", true)]),
+                        gate
+                    )
+                    .is_err()
+                );
+            }
         }
     }
 
@@ -12700,6 +12734,36 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn embedded_object_identity_inventory_matches_build_selection() {
+        // The doctor prepares identity from the real embedded Detailed
+        // object: every task-storage map in it must be an accepted
+        // identity map, or the load fails before any program runs. Aya
+        // surfaces task-storage maps as Unsupported; mirror that
+        // classification here without kernel syscalls.
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        let unsupported = MapType::TaskStorage as u32;
+        let inventory: Vec<(&str, bool)> = detailed
+            .maps
+            .iter()
+            .map(|(name, map)| (name.as_str(), map.map_type() == unsupported))
+            .collect();
+        assert!(
+            inventory.iter().any(|(name, _)| *name == "TASK_COOKIE"),
+            "embedded object names no TASK_COOKIE"
+        );
+        // The preparation selects the bank-B steps from the object in
+        // hand, mirroring prepare_identity; the embedded Detailed
+        // bytes must agree with the build that embedded them.
+        let banked = inventory.iter().any(|(name, _)| *name == "TASK_COOKIE_B");
+        assert_eq!(
+            banked, LOADER_GATE_BUILD,
+            "embedded Detailed bank selection disagrees with the build"
+        );
+        validate_identity_inventory(inventory.into_iter(), banked)
+            .expect("embedded identity inventory must validate");
     }
 
     #[test]

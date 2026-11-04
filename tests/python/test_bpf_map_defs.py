@@ -1014,6 +1014,31 @@ class JournalMarkerInventoryTests(unittest.TestCase):
         self.quiet(checker.validate_inventory, "default", checker.SAFE_MAPS,
                    checker.SAFE_PROGRAMS, self.detailed_symbols())
 
+    def test_gate_variant_accepts_gate_maps_with_markers(self):
+        # The loader-gate object carries the five gate maps with the
+        # default programs and symbols; like default it requires the
+        # birth marker symbols, and the default maps alone are not a
+        # gate object.
+        self.quiet(checker.validate_inventory, "default-gate",
+                   checker.GATE_MAPS, checker.SAFE_PROGRAMS,
+                   self.detailed_symbols())
+        maps = {name: value for name, value in checker.GATE_MAPS.items()
+                if name != "TASK_COOKIE_B"}
+        reason = self.refused(checker.validate_inventory, "default-gate",
+                              maps, checker.SAFE_PROGRAMS,
+                              self.detailed_symbols())
+        self.assertIn("map removed: TASK_COOKIE_B", reason)
+        reason = self.refused(checker.validate_inventory, "default-gate",
+                              checker.SAFE_MAPS, checker.SAFE_PROGRAMS,
+                              self.detailed_symbols())
+        self.assertIn("map removed: TASK_COOKIE_B", reason)
+        full = set(checker.REQUIRED_GLOBAL_MARKER_HELPERS) | {"JOURNAL_MARKER_CTL"}
+        with self.assertRaisesRegex(RuntimeError,
+                                    "lacks required birth marker symbols"):
+            checker.validate_inventory(
+                "default-gate", checker.GATE_MAPS, checker.SAFE_PROGRAMS,
+                self.detailed_symbols(missing=full))
+
     def test_release_detailed_stale_marker_inventory_refused(self):
         maps = {name: value for name, value in checker.SAFE_MAPS.items()
                 if name != "JOURNAL_MARKER_CTL"}

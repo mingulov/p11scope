@@ -51,7 +51,10 @@ def population_diagnostic(error: BaseException) -> str | None:
 
 
 IMAGE_HASH_NAMES = ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS")
-OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS", "JOURNAL_MARKER_CTL")
+# The loader-gate select word exceeds BPF_OBJ_NAME_LEN like the other
+# arrays here; default builds carry no such map, so the remap only
+# fires on gate objects.
+OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS", "JOURNAL_MARKER_CTL", "IMAGE_BANK_SELECT")
 # The frozen Task 2 D2 qualification surface: the seed fixture creates and
 # seeds exactly these three maps, and the reader serves it without PROC_EPOCH
 # (its iterator object then neither creates nor reads that map). Every owned

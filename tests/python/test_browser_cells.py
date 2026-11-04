@@ -324,7 +324,7 @@ class BrowserCells(unittest.TestCase):
                 "FF-STARTUP", "firefox", self.work / "cell", flow.url,
                 flows.make_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
-                duration_seconds=ATTACH_DURATION, attach_grace_seconds=30,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=cells.ATTACH_GRACE_SECONDS,
                 wait_for_map=(store.lib.name,),
                 extra_prefs=FIREFOX_STABLE_PREFS,
                 expect_attached=True)
@@ -355,7 +355,7 @@ class BrowserCells(unittest.TestCase):
                 "CR-PLAIN", "chromium", self.work / "cell", flow.url,
                 flows.make_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
-                duration_seconds=ATTACH_DURATION, attach_grace_seconds=30,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=cells.ATTACH_GRACE_SECONDS,
                 wait_for_map=(store.lib.name,),
                 extra_browser_args=CHROMIUM_STABLE_ARGS,
                 expect_attached=True)
@@ -401,7 +401,7 @@ class BrowserCells(unittest.TestCase):
                 "FF-PINBOUND", "firefox", self.work / "cell", flow.url,
                 flows.make_client_cert_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
-                duration_seconds=ATTACH_DURATION, attach_grace_seconds=30,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=cells.ATTACH_GRACE_SECONDS,
                 wait_for_map=(store.lib.name,),
                 extra_prefs=FIREFOX_STABLE_PREFS,
                 expect_attached=True)
@@ -429,7 +429,7 @@ class BrowserCells(unittest.TestCase):
                 "CR-PINBOUND", "chromium", self.work / "cell", flow.url,
                 flows.make_client_cert_visit(flow.url), store.lib,
                 register_module=store.lib, browser_env=store.env,
-                duration_seconds=ATTACH_DURATION, attach_grace_seconds=30,
+                duration_seconds=ATTACH_DURATION, attach_grace_seconds=cells.ATTACH_GRACE_SECONDS,
                 wait_for_map=(store.lib.name,),
                 extra_browser_args=CHROMIUM_STABLE_ARGS,
                 auto_select_cert=False,

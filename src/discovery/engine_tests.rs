@@ -3025,6 +3025,164 @@ fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
     assert!(!reverse, "a whole refusal never replaces a prefix");
 }
 
+/// An awaiting-publication gap ranks below a counted capacity refusal in the
+/// engine history the report renders. A closure that starts unpublished
+/// records "nothing published yet"; when it later publishes tables but the
+/// published set is refused for capacity, the capacity refusal replaces the
+/// stale gap — and a later unpublished gap never clobbers the counted
+/// high-water mark back.
+#[test]
+fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
+    let published_source = p11kit_like_64_table_module();
+    let mut closure = published_source.clone();
+    // Nothing published: every table is an unresolved lookalike.
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+    assert!(
+        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "starts unpublished: {}",
+        plan.modules_skipped[0].reason
+    );
+    engine.plan = plan;
+    engine.modules = modules;
+    engine.counters = counters;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    assert!(
+        plan::is_closure_awaiting_publication(&engine.discovery.modules_skipped[0].reason),
+        "the unpublished gap is published: {}",
+        engine.discovery.modules_skipped[0].reason
+    );
+
+    // The closure publishes its linked table while a provider crowds the
+    // budget: the published 104 no longer fit beside the provider's hold.
+    let crowded = p11scope_ebpf_common::MAX_SLOTS - 62;
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(crowded));
+    let mut published = closure.clone();
+    published.interfaces = published_source.interfaces.clone();
+    let mut candidate_pins = engine.pinned.clone();
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let candidate = engine
+        .live_candidate(
+            candidate_pins,
+            vec![published.clone(), provider.clone()],
+            skipped,
+        )
+        .expect("the crowded rebuild");
+    let provider_object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    let slots_of = |object| {
+        candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| slot.object == object)
+            .count()
+    };
+    assert_eq!(
+        slots_of(provider_object),
+        crowded as usize,
+        "the provider crowds the budget"
+    );
+    let refusal = candidate
+        .plan
+        .modules_skipped
+        .iter()
+        .find(|skip| plan::is_closure_array_refusal(&skip.reason))
+        .expect("the crowded closure is refused");
+    assert_eq!(
+        plan::whole_refusal_needed_count(&refusal.reason),
+        Some(104),
+        "published but crowded is a counted capacity refusal: {}",
+        refusal.reason
+    );
+    engine.plan = candidate.plan;
+    engine.pinned = candidate.pinned;
+    engine.modules = candidate.modules;
+    engine.publish_current_capture_facts().unwrap();
+    assert_eq!(
+        engine.discovery.modules_skipped.len(),
+        1,
+        "{:?}",
+        engine.discovery.modules_skipped
+    );
+    assert!(
+        engine.discovery.modules_skipped[0]
+            .reason
+            .starts_with("module needs 104 more;"),
+        "the capacity refusal replaces the stale unpublished gap: {}",
+        engine.discovery.modules_skipped[0].reason
+    );
+
+    // And not the reverse: when the closure unpublishes again, the counted
+    // high-water mark stays published.
+    let mut unpublished = published.clone();
+    unpublished.interfaces.clear();
+    let candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            vec![unpublished, provider],
+            Vec::new(),
+        )
+        .expect("the unpublished rebuild");
+    let refusal = candidate
+        .plan
+        .modules_skipped
+        .iter()
+        .find(|skip| plan::is_closure_array_refusal(&skip.reason))
+        .expect("the closure gap stays named");
+    assert!(
+        plan::is_closure_awaiting_publication(&refusal.reason),
+        "unpublished again in the live plan: {}",
+        refusal.reason
+    );
+    engine.plan = candidate.plan;
+    engine.pinned = candidate.pinned;
+    engine.modules = candidate.modules;
+    engine.publish_current_capture_facts().unwrap();
+    assert!(
+        engine.discovery.modules_skipped[0]
+            .reason
+            .starts_with("module needs 104 more;"),
+        "the counted refusal is the high-water mark: {}",
+        engine.discovery.modules_skipped[0].reason
+    );
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);

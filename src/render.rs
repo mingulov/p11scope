@@ -9074,6 +9074,53 @@ pub(crate) mod tests {
         assert_eq!(ghost.completeness, "PARTIAL");
     }
 
+    /// The 0-hit ghost with a single initial-set context never saw its EXEC
+    /// acknowledged (a second live context would exist otherwise), so BPF
+    /// delivered no loader or lifecycle records for the run. The report names
+    /// that delivery failure instead of generic unproven timing.
+    #[test]
+    fn a_never_fired_single_context_loader_names_bpf_delivery_failure() {
+        let mut ghost = evidence();
+        ghost.loader_discovery.strategies.debug_state_every_hit = 1;
+        ghost.loader_discovery.hits = 0;
+        ghost.loader_discovery.initial_set_timing.unproven = 1;
+        ghost.loader_discovery.initial_set_capture.none = 1;
+        ghost.pause_partial = 1;
+        ghost.verdict();
+        let reasons = verdict_reasons(&ghost);
+        assert!(
+            reasons.contains("BPF delivery failure") && reasons.contains("no EXEC acknowledgment"),
+            "ghost names the delivery failure, got: {reasons:?}",
+        );
+    }
+
+    /// Zero hits with two bound contexts means the EXEC was acknowledged
+    /// (the live context exists) but the loader uprobe itself never fired:
+    /// a loader-specific miss, not a silent run. The report names that.
+    #[test]
+    fn a_never_fired_acked_loader_names_uprobe_miss() {
+        let mut miss = evidence();
+        miss.loader_discovery.strategies.debug_state_every_hit = 2;
+        miss.loader_discovery.hits = 0;
+        miss.loader_discovery.initial_set_timing.unproven = 1;
+        miss.loader_discovery.initial_set_capture.none = 1;
+        miss.pause_partial = 1;
+        miss.verdict();
+        assert!(
+            miss.gap_classes(true)
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "{:?}",
+            miss.gap_classes(true)
+        );
+        let reasons = verdict_reasons(&miss);
+        assert!(
+            reasons.contains("uprobe miss") && reasons.contains("EXEC acknowledg"),
+            "acked 0-hit loader names the uprobe miss, got: {reasons:?}",
+        );
+    }
+
     /// An owned run whose pause held every loader hit and table publication
     /// until the probes were attached is not an observation gap for its
     /// loader timing, even with the empty catalog; the same run with one

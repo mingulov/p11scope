@@ -212,7 +212,7 @@ Kernel/event loss:
 | `rv_update_failures` | Failed `RV_COUNTS` updates. |
 | `cgroup_scope_failures` | Native cgroup-membership helper failures. |
 | `semantic_capture_failures` | Descriptor-selected argument or bounded user-memory reads that failed. |
-| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Counts every occurrence under `allowlisted`, including any lost later (unsafe diagnostic builds keep it at 0). v3 documents also list each such id with its counts in `mechanisms[]` rows with `registered: false`. Forces `PARTIAL`. |
+| `unregistered_mechanisms` | Calls for mechanism ids that are readable but unapproved: not in the allowlisted capture policy, so never decoded. Counts every occurrence under `allowlisted`, including any lost later (unsafe diagnostic builds keep it at 0). v3 documents also list each such 32-bit id with its counts in `mechanisms[]` rows with `registered: false` (ids above `0xFFFFFFFF` count in the total only). Forces `PARTIAL`. |
 | `template_tail_failures` | Internal second-template handoff failed; the first template may remain available, but the key-pair request is incomplete. |
 | `malformed_records` | Event records rejected for ABI size mismatch. |
 

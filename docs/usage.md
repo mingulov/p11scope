@@ -89,7 +89,8 @@ mechanism id and call count, including named vendor key-generation
 mechanisms (for example NSS `CKM_NSS_*` ids); parameters and key material
 are never decoded. Mechanism ids outside the registry are shown as bare
 hex numbers with their call/error counts, marked unregistered
-(`registered: false` in JSON), instead of only a total. Profile, trace
+(`registered: false` in JSON), instead of only a total. Ids above
+`0xFFFFFFFF` count in the total only. Profile, trace
 and metrics publish no object handles
 or object attribute facts. `evidence.object_capture`
 reports build availability, not an observed attribute. The unsafe diagnostic
@@ -102,7 +103,8 @@ values in that field are dropped even when
 a caller aliases a metadata pointer into unrelated readable memory.
 Mechanism ids are public constants: registered ids resolve by registry
 membership, and unregistered ids publish as numeric id plus counts
-only, never decoded into parameters. `metrics`
+only, never decoded into parameters. Ids above `0xFFFFFFFF` count in
+the total only. `metrics`
 mode uses `aggregate-only`, which reads no call arguments in the kernel at all.
 
 Release builds default to FULL. For attested object calls under `allowlisted`,

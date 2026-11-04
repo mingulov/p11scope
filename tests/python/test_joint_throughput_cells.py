@@ -98,11 +98,11 @@ class CellScriptLibrary(unittest.TestCase):
         self.assertEqual(head, "#!/bin/sh")
 
     def test_rate_hz_maps_ceiling_labels(self):
-        proc = run_sourced('rate_hz 2.5k; rate_hz 5k; rate_hz 7.5k; '
-                           'rate_hz 7.5; echo "rc=$?"')
+        proc = run_sourced('rate_hz 2.5k; rate_hz 5k; rate_hz 6.25k; '
+                           'rate_hz 7.5k; rate_hz 7.5; echo "rc=$?"')
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.split(), ["2500", "5000", "7500",
-                                               "rc=0"])
+        self.assertEqual(proc.stdout.split(), ["2500", "5000", "6250",
+                                               "7500", "rc=0"])
 
     def test_rate_hz_maps_labels(self):
         proc = run_sourced('rate_hz 1k; rate_hz 10k; rate_hz 100k; '

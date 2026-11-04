@@ -7,7 +7,7 @@
  *   MODE        single (one worker) or churn (waves of short-lived threads),
  *               or keyed / keyed-churn (the same shapes over one HMAC key
  *               per worker instead of digest calls)
- *   RATE        1k, 2.5k, 5k, 7.5k, 10k or 100k (paced PKCS#11 calls per second)
+ *   RATE        1k, 2.5k, 5k, 6.25k, 7.5k, 10k or 100k (paced PKCS#11 calls per second)
  *   DURATION_S  hot-loop seconds, 1..3600 (gated cells need >= 2)
  *   LEDGER      single/keyed: hot-loop ledger JSONL path; churn/keyed-churn:
  *               filename prefix, one PREFIX.t<nn>.jsonl per worker thread.
@@ -234,8 +234,9 @@ static int parse_rate(const char *text, unsigned long *out) {
     static const struct {
         const char *label;
         unsigned long hz;
-    } rates[] = {{"1k", 1000},   {"2.5k", 2500}, {"5k", 5000},
-                 {"7.5k", 7500}, {"10k", 10000}, {"100k", 100000}};
+    } rates[] = {{"1k", 1000},     {"2.5k", 2500}, {"5k", 5000},
+                 {"6.25k", 6250}, {"7.5k", 7500}, {"10k", 10000},
+                 {"100k", 100000}};
     for (size_t index = 0; index < sizeof(rates) / sizeof(rates[0]); index++) {
         if (strcmp(text, rates[index].label) == 0) {
             *out = rates[index].hz;
@@ -252,7 +253,7 @@ static void usage(const char *name) {
            "              keyed / keyed-churn run the same shapes over one\n"
            "              HMAC key per worker (GenerateKey, paced SignInit +\n"
            "              Sign under CKM_SHA256_HMAC, DestroyObject)\n"
-           "  RATE        1k, 2.5k, 5k, 7.5k, 10k or 100k paced calls per second\n"
+           "  RATE        1k, 2.5k, 5k, 6.25k, 7.5k, 10k or 100k paced calls per second\n"
            "  DURATION_S  hot-loop seconds, 1..3600; gated cells need >= 2\n"
            "              (1 s runs are --min-rate 0 smoke only)\n"
            "  LEDGER      single/keyed: hot-loop ledger path;\n"
@@ -949,7 +950,7 @@ int main(int argc, char **argv) {
     }
     unsigned long rate = 0, duration = 0;
     if (parse_rate(argv[first + 2], &rate) != 0) {
-        fprintf(stderr, "gen-calls: RATE must be 1k, 2.5k, 5k, 7.5k, 10k or 100k\n");
+        fprintf(stderr, "gen-calls: RATE must be 1k, 2.5k, 5k, 6.25k, 7.5k, 10k or 100k\n");
         return 2;
     }
     if (parse_duration(argv[first + 3], &duration) != 0) {

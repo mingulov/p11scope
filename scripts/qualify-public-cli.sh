@@ -11,7 +11,8 @@
 # gcc builds are skipped. Setting only one, or a missing file, fails
 # closed before any campaign starts.
 # Every terminal result has cell/pass/detail/qualification. Exit 1 means failed
-# evidence, 2 means valid smoke/nonqualifying evidence, 0 qualifies the subset.
+# evidence (including unexpected passes), 2 means valid smoke/nonqualifying or
+# expected-failure evidence, 0 qualifies the subset with no caveats.
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
 # runner noise on the system cell only; default 0 keeps every cell strict.
 set -u
@@ -80,6 +81,8 @@ publish_output() {
 : > results.jsonl
 # PID generations limit cleanup to children created in this invocation.
 declare -A CHILDREN
+# Owned cgroups for EXIT cleanup (prevents leaks if a cell fails before rmdir).
+CGROUPS=()
 register() { local gen; gen=$(generation "$1") || return 1; CHILDREN[$1]=$gen; }
 generation() {
   local line rest; IFS= read -r line 2>/dev/null < "/proc/$1/stat" || return 1
@@ -104,7 +107,11 @@ terminate() {
   wait "$pid" 2>/dev/null; LAST_EXIT=$?
   unset 'CHILDREN[$pid]'
 }
-cleanup() { local pid; for pid in "${!CHILDREN[@]}"; do terminate "$pid"; done; }
+cleanup() {
+  local pid cg
+  for pid in "${!CHILDREN[@]}"; do terminate "$pid"; done
+  for cg in "${CGROUPS[@]:-}"; do rmdir "$cg" 2>/dev/null || true; done
+}
 trap cleanup EXIT
 trap 'exit 1' HUP TERM INT
 waitfor() {
@@ -165,6 +172,13 @@ import json,sys
 print(json.dumps({'cell':sys.argv[1],'pass':sys.argv[2]=='1','detail':sys.argv[3],'qualification':sys.argv[4]}))
 PY
 }
+# Expected-failure reasons for known product gaps. Each names the gap and the
+# product fix lane. Unexpected passes fail via summary() and the WP-1 template.
+REASON_RUN="run exact loss (discovery_truncated/lossy observation); product fix lane for run pause/discovery"
+REASON_CGROUP="cgroup fork observation gaps; product fix lane for cgroup fork"
+REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup trace"
+REASON_INVENTORY_7X="inventory cgroup owned-module gaps on 7.x (native endpoint attach failed, 68 deferred); product fix lane for inventory 7.x"
+REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
 asuser() {
   if [ "$CONTROL" = 1 ]; then exec "$@"; fi
   exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$SOFTHSM2_CONF" "$@"
@@ -187,6 +201,58 @@ print(json.dumps({'schema':'p11scope/public-cli-receipt/v1','cell':cell,'scope':
  'provider_before':json.loads(before),'provider_after':json.loads(after)}))
 PY
 }
+# Emit the final row for an oracle-judged cell, converting known product gaps
+# to expected-failure. Args: cell oracle_rc oracle_json_line. Unknown failure
+# signatures are never masked: they stay failed. Oracle passes and (for
+# trace-cgroup) smoke where a gap was expected become unexpected passes.
+emit_judged() {
+  local cell=$1 rc=$2 line=$3
+  local reason=""
+  case "$cell" in
+    run-short|run-cover) reason=$REASON_RUN ;;
+    profile-cgroup|metrics-cgroup) reason=$REASON_CGROUP ;;
+    trace-cgroup) reason=$REASON_TRACE_CGROUP ;;
+  esac
+  if [ -z "$reason" ]; then
+    printf '%s\n' "$line" | tee -a results.jsonl
+    return "$rc"
+  fi
+  if [ -z "$line" ]; then
+    result "$cell" 0 "oracle produced no output rc=$rc" failed; return 1
+  fi
+  local qual detail
+  qual=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qualification"])') || qual=failed
+  detail=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.load(sys.stdin)["detail"])') || detail="$line"
+  if [ "$rc" = 0 ]; then
+    result "$cell" 1 "UNEXPECTED PASS ($reason may have landed): [$qual] $detail" expected-failure
+    return 1
+  fi
+  if [ "$rc" = 2 ]; then
+    result "$cell" 1 "UNEXPECTED PASS ($reason may have landed): smoke [$qual] $detail" expected-failure
+    return 1
+  fi
+  local known=0
+  case "$cell" in
+    run-short|run-cover)
+      case "$detail" in
+        *discovery_truncated*|*lossy\ or\ unknown\ observation*|*run\ pause*) known=1 ;;
+      esac ;;
+    profile-cgroup|metrics-cgroup)
+      case "$detail" in
+        *lossy\ or\ unknown\ observation\ gap\ class*) known=1 ;;
+      esac ;;
+    trace-cgroup)
+      case "$detail" in
+        *trace\ lossy\ or\ unknown\ observation*) known=1 ;;
+      esac ;;
+  esac
+  if [ "$known" = 1 ]; then
+    result "$cell" 0 "$reason: [$qual] $detail" expected-failure
+    return 0
+  fi
+  printf '%s\n' "$line" | tee -a results.jsonl
+  return 1
+}
 judge() {
   # Ruling CI-GAP-1: P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 discloses hosted
   # runner noise on the system cell only. Every other cell stays strict,
@@ -195,8 +261,9 @@ judge() {
   if [ "${4:-}" = system ] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
     extra=(--allow-pid-descendant-gaps)
   fi
-  python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" "${extra[@]}" | tee -a results.jsonl
-  return "${PIPESTATUS[0]}"
+  local out rc
+  out=$(python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" "${extra[@]}"); rc=$?
+  emit_judged "$4" "$rc" "$out"
 }
 # The real lifecycle is also the unprivileged seam: clean every prior artifact,
 # require both processes alive and capture readiness, then release exactly once.
@@ -252,10 +319,13 @@ import json,sys
 rows=[json.loads(line) for line in open('results.jsonl')]
 expected=sys.argv[1:]; ids=[row['cell'] for row in rows]
 valid=len(ids)==len(set(ids)) and set(ids)==set(expected)
-failed=[r['cell'] for r in rows if not r['pass'] and r['qualification']!='nonqualifying']
+failed=[r['cell'] for r in rows if not r['pass'] and r['qualification'] not in ('nonqualifying','expected-failure')]
+failed+= [r['cell'] for r in rows if r['pass'] and r['qualification']=='expected-failure']
+failed+= [r['cell'] for r in rows if r['pass'] and r['qualification']=='failed']
 nonqual=[r['cell'] for r in rows if r['qualification']=='nonqualifying']
-print('SUMMARY pass=%d fail=%d nonqualifying=%d failed=%s terminal_rows_valid=%s' % (sum(r['pass'] for r in rows),len(failed),len(nonqual),failed,valid))
-sys.exit(1 if failed or not valid else 2 if nonqual else 0)
+expectedfails=[r['cell'] for r in rows if r['qualification']=='expected-failure' and not r['pass']]
+print('SUMMARY pass=%d fail=%d nonqualifying=%d expected=%d failed=%s terminal_rows_valid=%s' % (sum(r['pass'] for r in rows),len(failed),len(nonqual),len(expectedfails),failed,valid))
+sys.exit(1 if failed or not valid else 2 if nonqual or expectedfails else 0)
 PY
   return "${PIPESTATUS[0]}"
 }
@@ -362,7 +432,14 @@ cgroup_capture() {
   local before after gen='' readygen='' inside='' outside='' child='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   local scope=cgroup wl=''
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
+  if [ -e "$CG" ]; then
+    if [ -s "$CG/cgroup.procs" ]; then
+      result "$cell" 0 "stale owned cgroup not empty $CG (prior leak, manual cleanup required)" failed; return 1
+    fi
+    rmdir "$CG" 2>/dev/null || { result "$cell" 0 "stale owned cgroup not removable $CG" failed; return 1; }
+  fi
   mkdir -p "$CG" || { result "$cell" 0 "cgroup mkdir failed $CG" failed; return 1; }
+  CGROUPS+=("$CG")
   asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
   asuser "$GATED" "$MODULE" 500 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
   local inside_ready=0 outside_ready=0 in_cgroup=0
@@ -409,8 +486,18 @@ cgroup_capture() {
   if [ -n "$child" ] && [ -n "${CHILDREN[$child]:-}" ]; then terminate "$child" || true; fi
   after=$(pin) || after='null'
   rmdir "$CG" 2>/dev/null || true
+  if [ -e "$CG" ]; then
+    local leftover
+    leftover=$(cat "$CG/cgroup.procs" 2>/dev/null || true)
+    if [ -n "$leftover" ]; then
+      # shellcheck disable=SC2086
+      kill -KILL $leftover 2>/dev/null || true
+      sleep 1
+    fi
+    rmdir "$CG" 2>/dev/null || true
+  fi
   local cg_gone=0; [ ! -e "$CG" ] && cg_gone=1
-  if [ "$cg_gone" != 1 ]; then result "$cell" 0 "owned cgroup not removed $CG" failed; return 1; fi
+  if [ "$cg_gone" != 1 ]; then result "$cell" 0 "owned cgroup not removed $CG (force cleanup attempted)" failed; return 1; fi
   if [ "$kind" = inventory ]; then
     publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
     python3 - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" <<'PY' > "$cell.detail" 2>&1
@@ -449,8 +536,16 @@ print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s gaps=%
 PY
     rc=$?
     detail=$(cat "$cell.detail" 2>/dev/null || echo "inventory check failed rc=$rc")
-    if [ "$rc" = 0 ] && [ "$observer_rc" = 0 ]; then result "$cell" 1 "$detail"
-    else result "$cell" 0 "$detail observer_rc=$observer_rc" failed; fi
+    detail="$detail observer_rc=$observer_rc"
+    if [ "$rc" = 0 ] && [ "$observer_rc" = 0 ]; then
+      result "$cell" 1 "$detail"
+    else
+      case "$detail" in
+        *inventory\ gaps\ about\ owned\ module*)
+          result "$cell" 0 "$REASON_INVENTORY_7X: [failed] $detail" expected-failure ;;
+        *) result "$cell" 0 "$detail" failed ;;
+      esac
+    fi
     return 0
   fi
   if ! grep -qa '^LEDGER ' "$cell-outside.wl" 2>/dev/null; then result "$cell" 0 'outside ledger missing (leak test invalid)' failed; return 1; fi
@@ -596,6 +691,28 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
   done
   summary "$@"; exit $?
 fi
+# Ia32-only job (P11SCOPE_PUBLIC_CLI_ONLY_IA32=1): run only the two ia32 cells.
+# The ia32 job installs libsofthsm2:i386 (which cannot coexist with amd64 in the
+# main job) and must have the prereq; missing prereq here is a harness failure.
+if [ "${P11SCOPE_PUBLIC_CLI_ONLY_IA32:-0}" = 1 ]; then
+  IA32_MODULE=${IA32_MODULE:-/usr/lib/i386-linux-gnu/softhsm/libsofthsm2.so}
+  IA32_OK=0
+  if [ -r "$IA32_MODULE" ] && gcc -m32 -O1 -o "$FIX/gated32" "$SRC/gated.c" -ldl 2>/dev/null; then
+    chmod 755 "$FIX/gated32"
+    IA32_OK=1
+  fi
+  if [ "$IA32_OK" = 1 ]; then
+    MODULE_BAK=$MODULE; MODULE=$IA32_MODULE
+    gated profile-pid-ia32 pid "$FIX/gated32" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid-ia32.json"
+    run_exact run-ia32 "$FIX/gated32" 3
+    MODULE=$MODULE_BAK
+  else
+    for cell in profile-pid-ia32 run-ia32; do
+      result "$cell" 0 "ia32-only job missing prereq: $IA32_MODULE not readable or -m32 build failed" failed
+    done
+  fi
+  summary profile-pid-ia32 run-ia32; exit $?
+fi
 "$P" doctor > doctor.out 2>&1; rc=$?
 result doctor "$([ "$rc" = 0 ] && grep -q 'capture available' doctor.out && grep -qE '^uprobe-multi attach \(own libc\) \.+ ok([ \t].*)?$' doctor.out && grep -qE '^uretprobe vs seccomp \.+ ok([ \t].*)?$' doctor.out && echo 1 || echo 0)" "rc=$rc"
 gated profile-pid pid "$GATED" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid.json"
@@ -664,8 +781,10 @@ gated counter-timestamps-system system "$GATED" profile --mode metrics --counter
 gated counter-latency-system system "$GATED" profile --mode metrics --counter-mode latency --system --module "$MODULE" --duration 25 -o "$OUT/counter-latency-system.json"
 gated select-endpoint-pid pid "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --pid @PID@ --duration 12 -o "$OUT/select-endpoint-pid.json"
 gated select-endpoint-system system "$GATED" profile --mode metrics --counter-mode counts --select-endpoint C_Digest --module "$MODULE" --system --duration 25 -o "$OUT/select-endpoint-system.json"
-# WP-4 breadth: ia32 through the public command (S12).
-IA32_MODULE=/usr/lib/i386-linux-gnu/softhsm/libsofthsm2.so
+# WP-4 breadth: ia32 through the public command (S12). IA32_MODULE allows an
+# unpacked i386 copy (apt i386 cannot coexist with amd64 in the main job); the
+# ia32-only job (P11SCOPE_PUBLIC_CLI_ONLY_IA32=1 above) installs via apt.
+IA32_MODULE=${IA32_MODULE:-/usr/lib/i386-linux-gnu/softhsm/libsofthsm2.so}
 IA32_OK=0
 if [ -r "$IA32_MODULE" ] && gcc -m32 -O1 -o "$FIX/gated32" "$SRC/gated.c" -ldl 2>/dev/null; then
   chmod 755 "$FIX/gated32"
@@ -679,13 +798,17 @@ if [ "$IA32_OK" = 1 ]; then
   MODULE=$MODULE_BAK
 else
   for cell in profile-pid-ia32 run-ia32; do
-    result "$cell" 0 "prerequisite missing (exit 77 equivalent): $IA32_MODULE not readable or -m32 build failed; CI apt: dpkg --add-architecture i386 && apt-get update && apt-get install -y libsofthsm2:i386 gcc-multilib libc6-dev-i386" failed
+    result "$cell" 0 "$REASON_IA32: $IA32_MODULE not readable or -m32 build failed; CI: ia32-only job with dpkg --add-architecture i386 && apt-get update && apt-get install -y libsofthsm2:i386 gcc-multilib libc6-dev-i386" expected-failure
   done
 fi
 # WP-4 breadth: startup latency as its own cell (S15). Bound is a harness
 # parameter, not a user promise; record the three measured values.
+# Default 45s: 7.2 guests measured 22213/23471/24553 ms (max 24.6s); 30s gives
+# only 18% margin ((30-24.6)/30) and flakes on 7.3.1/busy runners. 45s gives
+# 45% margin with 20s headroom, still far below the 180s capture ticks so hangs
+# are caught. Override per environment with P11SCOPE_STARTUP_BOUND_S.
 startup_cell() {
-  local cell=startup-to-capturing bound_s=${P11SCOPE_STARTUP_BOUND_S:-${STARTUP_BOUND_S:-30}}
+  local cell=startup-to-capturing bound_s=${P11SCOPE_STARTUP_BOUND_S:-${STARTUP_BOUND_S:-45}}
   local gate=$OUT/startup.gate
   rm -f -- "$gate" startup-to-capturing.json startup.wl startup.stderr startup.stdout
   local -a samples=()

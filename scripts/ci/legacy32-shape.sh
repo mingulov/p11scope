@@ -5,8 +5,9 @@
 # Cell (a) of the S2 package: a synthetic 68-slot provider labelled {3,2}
 # with no interface exports (tests/fixtures/legacy32-provider/) runs the
 # existing public-CLI exact cells (profile-pid, system) through
-# scripts/qualify-public-cli.sh's MODULE= override, which this script uses
-# but does not modify. Until the scan fix lane (exec-scan-legacy32) lands,
+# scripts/qualify-public-cli.sh's MODULE= override and its
+# P11SCOPE_PUBLIC_CLI_CELLS filter, so each leg runs two cells instead of
+# the full campaign. Until the scan fix lane (exec-scan-legacy32) lands,
 # p11scope walks the mislabelled table as known_prefix and render marks
 # observation lossy, so both cells fail; they are reported as
 # expected-failure, and an unexpected pass flips the exit code so the
@@ -120,10 +121,12 @@ started=$(date +%s)
 run_qualify() {
   local module=$1 dest=$2 rc=0
   mkdir -p "$dest"
+  # The filter must stay exactly the cells wrap_cell reads below; a drift
+  # fails loudly as a missing oracle cell (harness error), never silently.
   if [ -n "$module" ]; then
-    MODULE=$module "$QUALIFY" "$P" "$dest" >"$dest/qual.log" 2>&1 || rc=$?
+    P11SCOPE_PUBLIC_CLI_CELLS='profile-pid system' MODULE=$module "$QUALIFY" "$P" "$dest" >"$dest/qual.log" 2>&1 || rc=$?
   else
-    env -u MODULE "$QUALIFY" "$P" "$dest" >"$dest/qual.log" 2>&1 || rc=$?
+    P11SCOPE_PUBLIC_CLI_CELLS='profile-pid system' env -u MODULE "$QUALIFY" "$P" "$dest" >"$dest/qual.log" 2>&1 || rc=$?
   fi
   [ "$rc" = 0 ] || [ "$rc" = 1 ] || [ "$rc" = 2 ] || {
     echo "qualify-public-cli.sh exited $rc (log: $dest/qual.log)" >&2

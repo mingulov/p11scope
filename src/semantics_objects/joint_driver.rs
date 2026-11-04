@@ -281,6 +281,44 @@ impl JointCaptureOwner {
         self.adapter.ledger_mut()
     }
 
+    /// End Joint after a linked stream broke while ingesting (not by a
+    /// raw disposal), so S1 can continue. The break may leave staged
+    /// custody across the hole, so the lane is first brought to exactly
+    /// the state an unlocalized raw disposal leaves: every key refused
+    /// (later seals end their feeds as `DomainTainted`), all staged
+    /// custody voided, the stream invalidated. The next collect then
+    /// re-syncs above a fence on the consumed history, like any
+    /// unlocalized loss. The disposal's storage is prepaid from the
+    /// ledger's reserver as in `dispose_without_ingest`; a refusal keeps
+    /// the fail-closed refusal. Returns whether the lane was voided.
+    pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
+        let adapter = &self.adapter;
+        if !adapter.stream_broken
+            || adapter.invalidated
+            || adapter.stopped
+            || adapter.consumed_through == u64::MAX
+        {
+            return Ok(false);
+        }
+        let bytes = super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+            .ok_or(RawQuantumRefusal::Capacity)?;
+        let _storage = self
+            .adapter
+            .ledger
+            .resource_reserver()
+            .ok_or(RawQuantumRefusal::ForeignLedger)?
+            .reserve(bytes)
+            .map_err(RawQuantumRefusal::Resource)?;
+        let _failure = self.adapter.refuse_disposed_raw(
+            &mut self.model,
+            std::iter::empty(),
+            true,
+            JournalGap::AdapterInvalidated,
+        );
+        self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+        Ok(true)
+    }
+
     /// The capture's one object model, with its retained history (read
     /// side): seal delivery and projection borrow this identity.
     #[cfg_attr(not(test), allow(dead_code))] // Seal delivery borrows the owner once the tick lands.

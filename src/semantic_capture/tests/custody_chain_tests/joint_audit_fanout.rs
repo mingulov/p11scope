@@ -7966,8 +7966,8 @@ fn joint_machine_negative_dispositions_are_finite() {
 /// the next collect re-syncs above a fence on exactly the consumed
 /// history, and the follow-up call still publishes its S1 edge. The
 /// machine never parks in a disposition. (A break taken through
-/// ingest after a grant keeps the fail-closed Gap; see
-/// `joint_machine_linked_break_refuses_gap_without_resync`.)
+/// ingest after a grant first ends Joint for every existing key; see
+/// `joint_machine_linked_break_ends_joint_and_keeps_s1`.)
 #[test]
 fn joint_machine_linked_resync_followup_publishes() {
     use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
@@ -8289,17 +8289,18 @@ fn joint_machine_unlinked_followup_publishes_without_break() {
     assert!(no_progress_gaps(&fixture).is_empty());
 }
 
-/// A linked lane never re-syncs: the malformed quantum publishes
-/// its counted negative, and every follow-up collect refuses the
-/// fail-closed Gap finitely in Idle, publishing nothing past it.
-/// (The 6 s cut-off itself stays pinned by the posed bound tests.)
+/// A Joint fault never stops S1: after a granted linked lane breaks
+/// its stream while ingesting a malformed quantum, the break quantum
+/// publishes its counted negative and ends the Joint feed with its
+/// named gap; the next collect ends Joint for every existing key and
+/// re-syncs above a fence on the consumed history, so the follow-up
+/// call still publishes its S1 edge.
 #[test]
-fn joint_machine_linked_break_refuses_gap_without_resync() {
-    use crate::inventory_semantics::JointServiceProgress;
+fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     let mut fixture = MachineScene::new(1);
     assert!(
         fixture.scene.producers.journal_linked(),
-        "only a linked lane keeps the fail-closed Gap"
+        "the break is taken on a linked lane"
     );
     fixture.prime(1);
     let revision = fixture
@@ -8359,42 +8360,69 @@ fn joint_machine_linked_break_refuses_gap_without_resync() {
             "the malformed quantum breaks the stream"
         );
     }
-    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
-    let mut refused = false;
-    for n in 0..8 {
-        match fixture.service(1) {
-            Ok(JointServiceProgress::Published) => {
-                panic!("nothing publishes past the linked Gap (service {n})")
-            }
-            Ok(JointServiceProgress::Pending) => {}
-            Err(SemanticRefusal::Unavailable) => {
-                refused = true;
-                break;
-            }
-            Err(reason) => panic!("the Gap refuses Unavailable, not {reason:?}"),
-        }
-    }
-    assert!(refused, "the follow-up collect refuses the Gap finitely");
-    assert_eq!(
-        fixture.machine.diagnostic_snapshot_for_test().0,
-        "Idle",
-        "the Gap refuses before any frame is retained"
-    );
-    assert_eq!(
+    let lost_through = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .consumed_through_for_test();
+    let api_returns = |fixture: &MachineScene| -> u64 {
         fixture
             .scene
             .real
             .scene
             .coordinator
             .registry()
-            .published_revision(),
-        revision + 1,
-        "the refused follow-up publishes nothing"
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    // Step to the re-sync: the fence lands exactly on the history
+    // consumed before the follow-up (later voids may only raise it).
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            assert_eq!(
+                adapter.voided_through_for_test(),
+                lost_through,
+                "the fence is exactly the consumed history"
+            );
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    fixture.published_labeled("linked-break-followup", None);
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision()
+            > revision + 1,
+        "the follow-up publishes past the break"
     );
-    // The Gap is not consumed by one refusal: the lane stays
-    // fail-closed, refusing again instead of re-syncing.
-    assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
-    assert_eq!(fixture.service(1), Err(SemanticRefusal::Unavailable));
+    assert_eq!(
+        api_returns(&fixture),
+        before + 1,
+        "S1 joins the follow-up call"
+    );
     {
         let adapter = fixture
             .scene
@@ -8404,10 +8432,47 @@ fn joint_machine_linked_break_refuses_gap_without_resync() {
             .joint_capture()
             .adapter();
         assert!(
-            adapter.stream_broken_for_test() || adapter.invalidated_for_test(),
-            "a linked lane never clears the break"
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "the stream stays re-synced after the follow-up"
         );
+        assert!(adapter.voided_through_for_test() >= lost_through);
     }
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_seal_malformed_history_loss".to_string()
+        )),
+        "Joint ends with its named gap: {gaps:?}"
+    );
+    assert!(
+        gaps.contains(&(
+            "semantic receipt refused".to_string(),
+            "partition".to_string()
+        )),
+        "the malformed negative stays disclosed: {gaps:?}"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the pre-break key never resumes Joint; its calls stay S1"
+    );
 }
 
 /// A mid-call call straddling an unlinked break still completes:

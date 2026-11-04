@@ -830,6 +830,10 @@ impl PublishedSemanticSuccessor {
 
 /// JK-18 note: calls already disclosed under `semantic calls unrouted`
 /// before the first binding, later proven other callers' (no new loss).
+/// The reason a binding names when its image is already refused in the
+/// Joint journal: it stays S1.
+pub(crate) const JOINT_IMAGE_REFUSED: &str = "joint_image_refused";
+
 pub(crate) const PRE_BINDING_OTHER_CALLERS: &str =
     "pre-binding unrouted calls resolved to other callers";
 
@@ -2198,7 +2202,9 @@ impl InventoryCoordinator<OsProcessSource> {
             suspension_cut: false,
             providers: SemanticProviderAssociations::new(),
             reference_module: Some(module),
-        })
+        })?;
+        self.name_refused_image_binding(caller, image);
+        Ok(())
     }
 
     /// Bind one semantic caller through H0 refresh custody: identical proof
@@ -2217,16 +2223,42 @@ impl InventoryCoordinator<OsProcessSource> {
     ) -> Result<(), SemanticBindingRefusal> {
         match self.checked_binding_pid(caller, &module, domain, image, identity)? {
             None => Ok(()),
-            Some(_) => self.semantic_bindings.insert(SemanticCallerBinding {
-                caller,
-                domain,
-                image,
-                pin,
-                scope_current: true,
-                suspension_cut: false,
-                providers: SemanticProviderAssociations::new(),
-                reference_module: Some(module),
-            }),
+            Some(_) => {
+                self.semantic_bindings.insert(SemanticCallerBinding {
+                    caller,
+                    domain,
+                    image,
+                    pin,
+                    scope_current: true,
+                    suspension_cut: false,
+                    providers: SemanticProviderAssociations::new(),
+                    reference_module: Some(module),
+                })?;
+                self.name_refused_image_binding(caller, image);
+                Ok(())
+            }
+        }
+    }
+
+    /// A new binding whose image the Joint journal already refused (for
+    /// example a process whose earlier calls were shed as another
+    /// caller's) can never enter Joint: its refused history is a hole.
+    /// It stays S1; name that once, at the binding, so it never depends
+    /// on a birth being offered.
+    fn name_refused_image_binding(&mut self, caller: CallerId, image: ImageIdentity) {
+        if self
+            .joint_capture
+            .adapter()
+            .image_refused((image.task_cookie, image.exec_id))
+        {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: None,
+                subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+                reason: JOINT_IMAGE_REFUSED.into(),
+                budget: None,
+            });
         }
     }
 
@@ -3382,6 +3414,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut staged_positions: Vec<Option<u64>> = Vec::new();
         let mut shed_min: Option<u64> = None;
         let mut unpositioned = false;
+        // Images whose shed calls proved another caller: the Joint journal
+        // refuses them so their staging never holds a bound key's seal.
+        let mut refuse_images: BTreeSet<(u64, u64)> = BTreeSet::new();
         for outcome in outcomes.into_iter().chain(validation_outcomes) {
             match outcome {
                 TickOutcome::Call(call) => {
@@ -3405,7 +3440,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             .semantic_bindings
                             .proves_unbound_caller(domain, call.image()))
                     .then(|| (call.record().event.pid_tgid >> 32) as u32);
-                    let cookie = call.image().task_cookie;
+                    let call_image = call.image();
+                    let cookie = call_image.task_cookie;
                     let call_pid = (call.record().event.pid_tgid >> 32) as u32;
                     match CallEvidence::from_routed(call) {
                         Some(evidence) => {
@@ -3435,7 +3471,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                     .semantic_finalizer
                                     .as_mut()
                                     .expect("holding needs the live namespace");
-                                held = state.pre_binding.hold(cookie, at, label, call_pid);
+                                held = state.pre_binding.hold(
+                                    (cookie, call_image.exec_id),
+                                    at,
+                                    label,
+                                    call_pid,
+                                );
                                 if !held {
                                     // Overflow: everything held barriers
                                     // now, and this call with it.
@@ -3462,6 +3503,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 // for the bound callers' history.
                                 (Some(at), Some(pid)) => {
                                     staged_positions.push(Some(at));
+                                    refuse_images.insert((cookie, call_image.exec_id));
                                     other_pid = match other_pid {
                                         None => Some(Some(pid)),
                                         Some(Some(seen)) if seen == pid => Some(Some(pid)),
@@ -3547,7 +3589,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let held = state.pre_binding.take();
                 if !held.is_empty() {
                     let forgiven = bound
-                        && held.cookies.iter().all(|cookie| {
+                        && held.images.iter().all(|(cookie, _)| {
                             self.semantic_bindings.proves_unbound_caller(
                                 domain,
                                 ImageIdentity {
@@ -3557,11 +3599,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             )
                         });
                     if forgiven {
+                        refuse_images.extend(held.images.iter().copied());
                         resolved_other = Some(held);
                     } else {
                         shed_min = Some(shed_min.map_or(held.min, |floor| floor.min(held.min)));
                     }
                 }
+            }
+        }
+        // JK-19: a process S1 proved to be another caller is refused in the
+        // Joint journal: its staged entries drop and it never gains Joint
+        // authority later (a later binding stays S1, named). An image the
+        // journal already keys is left alone; its staging keeps holding
+        // the seal, which the no-progress bound ends by name.
+        if !refuse_images.is_empty() {
+            let adapter = self.joint_capture.adapter_mut();
+            for image in &refuse_images {
+                adapter.refuse_other_caller_image(*image);
             }
         }
         if shed_calls != 0 {

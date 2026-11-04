@@ -60,15 +60,15 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     pub(super) bound_once: bool,
 }
 
-/// Unrouted calls shed before any binding existed: their distinct image
-/// cookies, lowest position and route labels. They are disclosed and counted
+/// Unrouted calls shed before any binding existed: their distinct images,
+/// lowest position and route labels. They are disclosed and counted
 /// when shed, and their positions are provisionally disposed (no bound key
 /// can seal before a binding). The first finalize that sees a binding keeps
 /// them disposed when every cookie proves another caller, and otherwise
 /// (any match, overflow, or a stop before any binding) barriers at the
-/// lowest held position. Bounded by distinct cookies.
+/// lowest held position. Bounded by distinct images.
 pub(in crate::discovery::engine::inventory_coordinator) struct PreBindingHold {
-    pub(super) cookies: BTreeSet<u64>,
+    pub(super) images: BTreeSet<(u64, u64)>,
     pub(super) min: u64,
     pub(super) labels: Vec<(&'static str, u64)>,
     pub(super) pid: Option<Option<u32>>,
@@ -78,7 +78,7 @@ pub(in crate::discovery::engine::inventory_coordinator) struct PreBindingHold {
 impl PreBindingHold {
     fn new() -> Self {
         Self {
-            cookies: BTreeSet::new(),
+            images: BTreeSet::new(),
             min: u64::MAX,
             labels: Vec::new(),
             pid: None,
@@ -93,19 +93,19 @@ impl PreBindingHold {
     }
 
     /// Hold one positioned call. Refuses (holding nothing) when a new
-    /// cookie would pass the limit.
+    /// image would pass the limit.
     pub(super) fn hold(
         &mut self,
-        cookie: u64,
+        image: (u64, u64),
         position: u64,
         label: &'static str,
         pid: u32,
     ) -> bool {
-        if !self.cookies.contains(&cookie) {
-            if self.cookies.len() >= self.limit {
+        if !self.images.contains(&image) {
+            if self.images.len() >= self.limit {
                 return false;
             }
-            self.cookies.insert(cookie);
+            self.images.insert(image);
         }
         self.min = self.min.min(position);
         match self.labels.iter_mut().find(|(known, _)| *known == label) {

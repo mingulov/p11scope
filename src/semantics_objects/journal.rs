@@ -1301,6 +1301,11 @@ impl JournalAdapter {
             .is_some_and(|held| held.same_producers(producers))
     }
 
+    #[cfg(test)]
+    pub(crate) fn image_tainted_for_test(&self, image: (u64, u64)) -> bool {
+        self.is_tainted(image)
+    }
+
     /// Images with unconverted staging (open or refused) that no bound
     /// key accounts for: the input `has_unbound_staging` refuses on.
     #[cfg(test)]
@@ -1879,6 +1884,27 @@ impl JournalAdapter {
         for refused in &dropped {
             self.retained_refused_dec(refused);
         }
+    }
+
+    /// Refuse an image S1 proved to be another caller's (its calls shed
+    /// unrouted while every bound key has a different image): its staged
+    /// entries drop, its later records refuse, and a later birth or
+    /// attestation for it refuses as tainted, so it never enters Joint
+    /// with a hole. An image the journal already keys is left alone (fail
+    /// closed: its staging keeps holding the seal). Returns whether the
+    /// image is refused.
+    pub(crate) fn refuse_other_caller_image(&mut self, image: (u64, u64)) -> bool {
+        if self.image_keys.contains_key(&image) {
+            return false;
+        }
+        self.taint_image(image);
+        true
+    }
+
+    /// Whether the journal refuses future proof for this image (tainted,
+    /// or untracked past taint saturation).
+    pub(crate) fn image_refused(&self, image: (u64, u64)) -> bool {
+        self.is_tainted(image)
     }
 
     /// Record only the irreversible image evidence. A raw batch marks its

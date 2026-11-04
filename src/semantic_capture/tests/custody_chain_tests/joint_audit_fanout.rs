@@ -2951,28 +2951,45 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
     }
 }
 
-/// Stage a finished call from a foreign process that never becomes a
-/// caller: its image (cookie 184) is known only while the call is
-/// encoded, so S1 sheds the call as unobserved and the journal keeps it
-/// as staging no bound key accounts for (the live step-3 shape).
-fn push_unbound_foreign_call(fixture: &mut MachineScene, sequence: u64) -> OwnedStoppedChild {
+/// The foreign image of the step-3 shape: a short-lived process that is
+/// never a caller.
+const FOREIGN: ImageIdentity = ImageIdentity {
+    task_cookie: 184,
+    exec_id: 0,
+};
+
+/// Stage a call from a foreign process that never becomes a caller: its
+/// image is known only while the call is encoded. A finished call reaches
+/// S1, which sheds it as unobserved; an in-flight call (BEGIN only) is
+/// journal staging S1 never sees.
+fn push_unbound_foreign_call(
+    fixture: &mut MachineScene,
+    sequence: u64,
+    finished: bool,
+) -> OwnedStoppedChild {
     let foreign = OwnedStoppedChild::new();
     let pin = fixture.scene.real.h0.0.borrow().io.targets[&std::process::id()]
         .0
         .clone();
-    fixture.scene.real.h0.0.borrow_mut().io.targets.insert(
-        foreign.id(),
-        (
-            pin,
-            ImageIdentity {
-                task_cookie: 184,
-                exec_id: 0,
-            },
-        ),
-    );
     fixture
         .scene
-        .push(foreign.id(), 0, "C_CreateObject", sequence);
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .insert(foreign.id(), (pin, FOREIGN));
+    if finished {
+        fixture
+            .scene
+            .push(foreign.id(), 0, "C_CreateObject", sequence);
+    } else {
+        let (begin, _) = fixture
+            .scene
+            .encoded(foreign.id(), 0, "C_CreateObject", sequence);
+        fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    }
     fixture
         .scene
         .real
@@ -2983,6 +3000,17 @@ fn push_unbound_foreign_call(fixture: &mut MachineScene, sequence: u64) -> Owned
         .targets
         .remove(&foreign.id());
     foreign
+}
+
+fn unbound_staging(fixture: &MachineScene) -> std::collections::BTreeSet<(u64, u64)> {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .unbound_staging_images_for_test()
 }
 
 /// A seal that can only be retried, with nothing delivered, is no
@@ -2997,7 +3025,9 @@ fn joint_machine_retry_without_delivery_trips_the_running_bound() {
     fixture.prime(1);
     // The foreign child starts well after the lane attached.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let _foreign = push_unbound_foreign_call(&mut fixture, 2);
+    // A foreign call still in flight: no S1 call to shed, so the journal
+    // keeps unbound staging that no bound key can account for.
+    let _foreign = push_unbound_foreign_call(&mut fixture, 2, false);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
     fixture.reach_phase("Audited");
     for n in 0..64 {
@@ -3007,16 +3037,9 @@ fn joint_machine_retry_without_delivery_trips_the_running_bound() {
         }
     }
     assert_eq!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture()
-            .adapter()
-            .unbound_staging_images_for_test(),
+        unbound_staging(&fixture),
         std::collections::BTreeSet::from([(184, 0)]),
-        "the foreign finished call is the only unbound staging"
+        "the foreign call is the only unbound staging"
     );
     assert!(audit_no_progress_gaps(&fixture).is_empty());
     fixture
@@ -3035,6 +3058,84 @@ fn joint_machine_retry_without_delivery_trips_the_running_bound() {
     assert_eq!(
         fixture.machine.disposition_reason(),
         Some(SemanticRefusal::Unavailable)
+    );
+}
+
+/// The live step-3 shape: a foreign process's finished call that S1 sheds
+/// as another caller's no longer holds the bound key's seal. The journal
+/// refuses that image, its staging drops, and the transaction publishes
+/// with the bound Joint feed intact.
+#[test]
+fn joint_machine_other_caller_finished_call_does_not_hold_the_bound_seal() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-finished-call", None);
+    let adapter = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter();
+    assert!(
+        adapter.image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "the other caller's image is refused in the journal"
+    );
+    assert!(unbound_staging(&fixture).is_empty(), "its staging dropped");
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(registry.joint_feeds(), 1, "the bound Joint feed continues");
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "semantic calls unrouted from other callers"),
+        "the foreign call stays disclosed"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// A process refused as another caller that binds later never enters
+/// Joint with the hole its refused history left: it stays S1, named, and
+/// the existing bound feed is untouched.
+#[test]
+fn joint_machine_refused_other_caller_binding_later_stays_s1_named() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-refused", None);
+    let caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("late-binding", None);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(
+        registry.joint_feeds(),
+        1,
+        "the refused process never gains a Joint feed"
+    );
+    assert!(
+        registry.gaps().iter().any(|gap| gap.caller == Some(caller)
+            && gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+            && gap.reason == "joint_image_refused"),
+        "the late binding names why it stays S1: {:?}",
+        registry.gaps()
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "the refusal is never lifted"
     );
 }
 

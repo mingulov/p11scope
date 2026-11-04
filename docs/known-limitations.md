@@ -354,7 +354,14 @@ caller is tracked. If every one of them came from another process, a
 `pre-binding unrouted calls resolved to other callers` note says so and
 tracking continues; one from the tracked caller itself, one without an
 identity, a full hold, or a stop before any caller is tracked still counts
-as the loss that ends tracking.
+as the loss that ends tracking. A process whose calls were reported as
+another caller's is excluded from key-operation tracking for the rest of
+the run: if it later becomes a tracked caller, it keeps the plain
+per-call view and a `Joint birth unavailable; retained S1` gap names
+`joint_image_refused`. A call from an untracked process that is still in
+progress when key operations are sealed cannot be accounted for; tracking
+then ends after about 6 s with a `joint audit made no progress` gap
+instead of waiting for the run deadline.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are

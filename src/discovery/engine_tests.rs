@@ -15138,6 +15138,65 @@ pub(crate) fn truncate_executable_via_waited_child(target: &std::path::Path, siz
     );
 }
 
+/// Render a caught panic payload for message assertions: the loud-failure
+/// path must name its operands, not merely panic.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|message| message.to_string())
+        })
+        .expect("panic payload carries a message")
+}
+
+#[test]
+fn copy_executable_via_waited_child_reports_source_destination_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("missing-source");
+    let target = dir.path().join("destination");
+    let outcome = std::panic::catch_unwind(|| copy_executable_via_waited_child(&source, &target));
+    let payload = outcome.expect_err("copying a missing source must fail loudly");
+    let message = panic_message(&payload);
+    assert!(
+        message.contains(&source.display().to_string()),
+        "failure names the source: {message:?}"
+    );
+    assert!(
+        message.contains(&target.display().to_string()),
+        "failure names the destination: {message:?}"
+    );
+    assert!(
+        message.contains("exit status"),
+        "failure names the exit status: {message:?}"
+    );
+}
+
+#[test]
+fn truncate_executable_via_waited_child_reports_target_size_and_status() {
+    let dir = tempfile::tempdir().unwrap();
+    // `truncate` creates a missing file, so the failure needs a missing
+    // parent: the target can never be opened for writing.
+    let target = dir.path().join("missing-parent").join("destination");
+    let outcome = std::panic::catch_unwind(|| truncate_executable_via_waited_child(&target, 4096));
+    let payload = outcome.expect_err("truncating an unopenable target must fail loudly");
+    let message = panic_message(&payload);
+    assert!(
+        message.contains(&target.display().to_string()),
+        "failure names the target: {message:?}"
+    );
+    assert!(
+        message.contains("4096"),
+        "failure names the size: {message:?}"
+    );
+    assert!(
+        message.contains("exit status"),
+        "failure names the exit status: {message:?}"
+    );
+}
+
 impl TabledSeedProvider {
     fn grow_function_table(&mut self) {
         use std::io::Read as _;

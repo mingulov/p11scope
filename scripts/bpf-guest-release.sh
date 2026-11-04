@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Shared vng guest-release match for the BPF load drivers.
 #
-# Sourced by scripts/check-bpf-load-kernels.sh and
-# scripts/check-bpf-load-journal.sh; the match lives here once, never
-# copied per driver.
+# Sourced by scripts/check-bpf-load-kernels.sh,
+# scripts/check-bpf-load-journal.sh and scripts/check-bpf-load-gate1.sh;
+# the match lives here once, never copied per driver.
 
 # Guest release match: the tag without its leading v must equal uname -r
 # or prefix it, except release candidates, whose tag (v7.4-rc1) boots the

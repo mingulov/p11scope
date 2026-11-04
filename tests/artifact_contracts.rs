@@ -9750,6 +9750,40 @@ fn operator_docs_preserve_semantic_authority_limits() {
     }
 }
 
+/// The reload-disclosure linkage publication has its own allowlist-v3 row: the
+/// status paragraph lists the section, its anchor matches the heading, and the
+/// row names the exact field, its ledger source, the labels-and-counts output
+/// and the never-published subjects.
+#[test]
+fn allowlist_v3_names_the_reload_disclosure_linkage_row() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## Reload-disclosure linkage publication (B17 leg 2, 2026-11-04)";
+    assert!(
+        text.lines().any(|line| line == heading),
+        "allowlist-v3 lost the reload-disclosure linkage section"
+    );
+    assert!(
+        text.contains(
+            "[reload-disclosure linkage publication](#reload-disclosure-linkage-publication-b17-leg-2-2026-11-04)"
+        ),
+        "the status paragraph must list the reload-disclosure linkage section"
+    );
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in [
+        "instance_reload_not_excluded",
+        "reload_not_excluded",
+        "continued_across_global",
+        "`mN`/`iN`",
+        "No router ID, file slot",
+        "absent (never null)",
+    ] {
+        assert!(
+            flat.contains(marker),
+            "the linkage row must name {marker:?}"
+        );
+    }
+}
+
 /// The release docs describe one version: the CHANGELOG has exactly one heading
 /// for the version Cargo.toml builds (other headings are older releases or an
 /// `[Unreleased]` section), and README/usage point at its known limitations and

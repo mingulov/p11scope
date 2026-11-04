@@ -4,9 +4,10 @@
 //! The BPF return path publishes a mechanism id only on exact membership
 //! in the `MECH_SHAPE` approval union (`shapes::approved_mechanisms`):
 //! the official PKCS#11 3.2 catalog plus the ids registered in the
-//! `pkcs11-types` mechanism registry. Anything else is counted as
-//! `unregistered_mechanisms` and withheld, by the allowlist-v1 finite
-//! published set rule.
+//! `pkcs11-types` mechanism registry. Anything else stays out of the
+//! approval union: unregistered ids are unnamed and never decoded, and
+//! reach output only as bare numbers with counts through the
+//! allowlist-v3 unregistered publication (32-bit bound).
 //!
 //! NSS softoken performs TLS ephemeral key generation under vendor ids
 //! (`CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN` for every ECDHE share
@@ -17,7 +18,8 @@
 //! This module extends the registry with a fixed, named, p11scope-owned
 //! set of well-known vendor key-creation/derivation mechanisms. Every
 //! overlay id is published with `shape::NONE`: counted and named, never
-//! parameter-decoded. Unknown vendor ids stay withheld.
+//! parameter-decoded. Unknown vendor ids stay out of the approval
+//! union (unnamed, never decoded; published only as unregistered counts).
 
 use pkcs11_types::mechanism_registry::MechanismRegistry;
 
@@ -142,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn unassigned_vendor_ids_stay_withheld() {
+    fn unassigned_vendor_ids_stay_out_of_the_approval_union() {
         let registry = load_registry().expect("overlay registry loads");
         let approved = crate::shapes::approved_mechanisms(&registry);
         // Unassigned NSS gap (+89) and the codebase's unknown-vendor

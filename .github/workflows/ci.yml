@@ -502,7 +502,8 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 3681a1ab7, the integrated keygen pick (last BPF input change),
+      # Pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
+      # b27149d51; the pin commit itself only guards the canary strip),
       # on top of 873adf5c4:
       # the round-10 inventory lifecycle ring raise (805a596ae, 2 MiB to
       # 8 MiB) changes one word in each Inventory object's `maps` (the

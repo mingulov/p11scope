@@ -34,7 +34,9 @@ and [unregistered mechanism id publication](#unregistered-mechanism-id-publicati
 which publishes unregistered mechanism ids with counts only,
 and [pre-arm mapping-instant witness](#pre-arm-mapping-instant-witness-v060),
 which loads the short-lived kernel witness behind `--prearm-module` and
-publishes no new field.**
+publishes no new field,
+and [reload-disclosure linkage publication](#reload-disclosure-linkage-publication-b17-leg-2-2026-11-04),
+which names the `instance_reload_not_excluded` labels-and-counts projection.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1474,3 +1476,19 @@ output field.
 | Cgroup out-migration latch (`--cgroup` only) | `fentry/cgroup_migrate`: whether the moved task was in the scope cgroup subtree before the move. | One counter. | Any member migration while the witness is active: today's window. Evidence: migration-out privileged cell. |
 | Presence walk | One `iter/task_vma` pass after attach-complete: `--pid` over the target process (pidfd), otherwise over every task in the initial PID namespace; per VMA it reads `vm_mm`, `mm->map_count`, `vm_file`, `f_inode`, `i_ino`, `i_sb->s_dev` (any protection), and membership as above; no leader gate. It sets one bit per watched file found in a member address space, and resolves departure entries. | Per-file found bits, an END count and fault counters; no range, address, PID or inode is emitted (the iterator writes no bytes). | No END, read error, deadline, observer outside the initial PID namespace, or found bit: today's window. Evidence: zombie-leader, read-only-mapping, non-member, observer and 1M-VMA cells. |
 | Published result | Userspace combines the bits and counters above with the existing attach-complete stamps and scope-start stamp, plus hook health (`recursion_misses`, `ftrace_enabled`). | Only the existing `unobserved_windows` value of the pre-armed module's discovery record: an explicitly empty list only when every witness fact is clean and the R2-D1-6 interval matches exactly; otherwise unchanged. The `--system` result is exact for all tasks; `--pid`/`--cgroup` results can show a window caused by removals outside the scope (multi-threaded or remote unmaps), never an empty list caused by them. | Any missing, failed or dirty fact keeps today's window (or today's absent key for a never-mapped module). Evidence: engine twins for every fact; sentinel test that no witness bit, counter, key or pointer reaches JSON, JSONL, trace output, stderr diagnostics or logs. |
+
+## Reload-disclosure linkage publication (B17 leg 2, 2026-11-04)
+
+**Status: REVIEWED in the batch-11a integration review (2026-11-04):
+the inventory `instance_reload_not_excluded` object publishes only
+capture-local module/instance labels with two saturating router counts,
+projected from the already-retained reload ledger. No new capture exists;
+allowlist-v1 bytes are unchanged.** The linkage fact — *these instances
+were not excluded across a reload* — rests on the "Public identities and
+derived facts" and "Mapping continuity epoch and state" rows above; this
+section names the exact field so a future reader does not reconstruct
+authority from the generic rows.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Reload-disclosure linkage (`instance_reload_not_excluded`) | A pure projection of the staged reload-disclosure ledger in the semantic finalizer (the `reload_not_excluded` map plus the `continued_across_global`/`joined_across_global` counters). No target-memory, argument, pointer, map or file read happens for this field: each ledger identity's router IDs resolve through their registered instances and group by the one module conversion the ledger recorded — never a second lookup — so the named module is always the recorded one. Router IDs that never registered are omitted; identities with nothing nameable are dropped. The key stays absent (never null) when the capture produced no disclosure. | Public inventory JSON only: the two capture-monotonic saturating u64 router totals plus `identities`, one entry per affected registry module in numeric module order with its disclosed instance references in numeric instance order (`{"module": "mN", "instances": ["iN", ...]}`), same-module entries merged into one sorted union. Labels are the monotonic capture-local `mN`/`iN` allocation, never a raw handle, address or digest. An empty `identities` list with nonzero counts means continuations projected to no nameable identity (mint exhaustion, an all-unregistered identity, or ledger-cap shed); the counts stay exact in each case. | No router ID, file slot, native domain, task cookie, exec ID, address, session, slot, async handle, argv, environ, PIN, key or payload value reaches output. Registration refusals disclose under the existing `instance semantics refused` gap, conversion refusals under `semantic input refused`, and ledger-cap shed under `reload disclosure identities shed`. Required evidence: the 12-instance reverse-order merge/sort twins with the `m10`/`m11` lexicographic-separation guard, the mint-exhaustion empty-with-counts twin, the unregistered-omission and no-private-identity pins at the reload-disclosure seam, and the matching shape in `docs/schema/inventory-v1.md`. |

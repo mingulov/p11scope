@@ -7930,7 +7930,7 @@ pub(crate) mod tests {
 
     /// Unassigned NSS vendor gap (`CKM_NSS` + 89), the codebase's
     /// unknown-vendor sentinel: exact registry membership never admits
-    /// it (see `vendor_mechanisms::unassigned_vendor_ids_stay_withheld`).
+    /// it (see `vendor_mechanisms::unassigned_vendor_ids_stay_out_of_the_approval_union`).
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
     fn profile_mechanisms(state: &crate::semantics::State) -> serde_json::Value {

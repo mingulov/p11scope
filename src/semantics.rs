@@ -62,7 +62,7 @@ mod corrective_tests {
     use crate::plan::{AttachPlan, Slot};
 
     /// Unassigned NSS vendor gap, the codebase's unknown-vendor
-    /// sentinel (see `vendor_mechanisms::unassigned_vendor_ids_stay_withheld`).
+    /// sentinel (see `vendor_mechanisms::unassigned_vendor_ids_stay_out_of_the_approval_union`).
     const UNREGISTERED_SENTINEL: u64 = 0xCE53_43A9;
 
     #[test]

@@ -828,12 +828,12 @@ impl PublishedSemanticSuccessor {
     }
 }
 
-/// JK-18 note: calls already disclosed under `semantic calls unrouted`
-/// before the first binding, later proven other callers' (no new loss).
 /// The reason a binding names when its image is already refused in the
 /// Joint journal: it stays S1.
 pub(crate) const JOINT_IMAGE_REFUSED: &str = "joint_image_refused";
 
+/// JK-18 note: calls already disclosed under `semantic calls unrouted`
+/// before the first binding, later proven other callers' (no new loss).
 pub(crate) const PRE_BINDING_OTHER_CALLERS: &str =
     "pre-binding unrouted calls resolved to other callers";
 
@@ -1319,12 +1319,37 @@ pub(crate) enum JointRetireRefusal {
     PendingWork,
 }
 
+/// A new binding whose image the Joint journal already refused (for
+/// example a process whose earlier calls were shed as another caller's)
+/// can never enter Joint: its refused history is a hole. It stays S1;
+/// name that once, at the binding, so it never depends on a birth being
+/// offered.
+fn name_refused_image_binding(
+    registry: &mut CallerRegistry,
+    journal: &crate::semantics_objects::journal::JournalAdapter,
+    caller: CallerId,
+    image: ImageIdentity,
+) {
+    if journal.image_refused((image.task_cookie, image.exec_id)) {
+        registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+            reason: JOINT_IMAGE_REFUSED.into(),
+            budget: None,
+        });
+    }
+}
+
 /// One existing promotion/diagnostic consumer for owned refreshes and
 /// borrowed collected Current receipts. Only these disjoint coordinator
 /// fields are borrowed; the original receipt stays with its sole owner.
+#[allow(clippy::too_many_arguments)] // Disjoint coordinator fields plus the original admission inputs.
 fn consume_current_admission<Source: ProcessSource>(
     adapter: &CallerAdapter<Source>,
     registry: &mut CallerRegistry,
+    journal: &crate::semantics_objects::journal::JournalAdapter,
     bindings: &mut SemanticBindingSet,
     candidate: SemanticAdmissionCandidate,
     receipt: &crate::semantic_capture::CurrentPartitionReceipt,
@@ -1337,9 +1362,13 @@ fn consume_current_admission<Source: ProcessSource>(
         .as_ref()
         .ok()
         .and_then(|provider| registry.module_id_for(provider.module()));
+    let fresh = bindings.get(caller).is_none();
     let result = promotion::consume(
         adapter, registry, bindings, candidate, receipt, provider, permit,
     );
+    if result.is_ok() && fresh {
+        name_refused_image_binding(registry, journal, caller, receipt.image());
+    }
     if let Err(reason) = result {
         // A provider-side Unavailable has exactly one source: the
         // provider-subject attachment check found no live owner (every
@@ -2077,6 +2106,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let result = consume_current_admission(
             &self.adapter,
             &mut self.registry,
+            self.joint_capture.adapter(),
             &mut self.semantic_bindings,
             candidate,
             &receipt,
@@ -2203,7 +2233,12 @@ impl InventoryCoordinator<OsProcessSource> {
             providers: SemanticProviderAssociations::new(),
             reference_module: Some(module),
         })?;
-        self.name_refused_image_binding(caller, image);
+        name_refused_image_binding(
+            &mut self.registry,
+            self.joint_capture.adapter(),
+            caller,
+            image,
+        );
         Ok(())
     }
 
@@ -2234,31 +2269,14 @@ impl InventoryCoordinator<OsProcessSource> {
                     providers: SemanticProviderAssociations::new(),
                     reference_module: Some(module),
                 })?;
-                self.name_refused_image_binding(caller, image);
+                name_refused_image_binding(
+                    &mut self.registry,
+                    self.joint_capture.adapter(),
+                    caller,
+                    image,
+                );
                 Ok(())
             }
-        }
-    }
-
-    /// A new binding whose image the Joint journal already refused (for
-    /// example a process whose earlier calls were shed as another
-    /// caller's) can never enter Joint: its refused history is a hole.
-    /// It stays S1; name that once, at the binding, so it never depends
-    /// on a birth being offered.
-    fn name_refused_image_binding(&mut self, caller: CallerId, image: ImageIdentity) {
-        if self
-            .joint_capture
-            .adapter()
-            .image_refused((image.task_cookie, image.exec_id))
-        {
-            self.registry.record_gap(RegistryGap {
-                caller: Some(caller),
-                module: None,
-                pid: None,
-                subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
-                reason: JOINT_IMAGE_REFUSED.into(),
-                budget: None,
-            });
         }
     }
 
@@ -3300,6 +3318,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             let _ = consume_current_admission(
                                 &self.adapter,
                                 &mut self.registry,
+                                self.joint_capture.adapter(),
                                 &mut self.semantic_bindings,
                                 candidate,
                                 receipt,

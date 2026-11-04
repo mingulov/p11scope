@@ -460,12 +460,32 @@ def assert_safe_profile(doc):
             assert row["params"] is None and row.get("params_omitted") == "policy", row
             assert row["calls"] == 1, row
             assert "name" not in row, row
+            assert row.get("mechanism_hex") == f"0x{value:x}", row
+        assert {mid for mid, row in mechanisms.items()
+                if row.get("registered") is False} == {UNKNOWN, MAXIMUM}, \
+            mechanisms.keys()
     else:
         # Wider-than-32-bit words are counted, never published.
         assert UNKNOWN not in mechanisms and MAXIMUM not in mechanisms, mechanisms.keys()
+        assert all(row.get("registered") is not False for row in mechanisms.values()), \
+            mechanisms
     # F-21: the policy null names its cause.
     assert all(item["params"] is None and item.get("params_omitted") == "policy"
                for item in mechanisms.values()), mechanisms
+    cgroups = doc.get("cgroups", [])
+    assert isinstance(cgroups, list), doc.get("cgroups")
+    for entry in cgroups:
+        rows = entry.get("mechanisms", [])
+        assert isinstance(rows, list), entry
+        for row in rows:
+            assert set(row) == {"mechanism", "mechanism_hex", "registered",
+                                "calls", "errors"}, row
+            assert row["mechanism_hex"] == f"0x{row['mechanism']:x}", row
+            if TARGET_BITS == 32:
+                if row["registered"] is False:
+                    assert row["mechanism"] in (UNKNOWN, MAXIMUM), row
+            else:
+                assert row["registered"] is True, row
     assert doc["templates"]["operations"] == [], doc["templates"]
     ev = doc["evidence"]
     assert ev["unregistered_mechanisms"] == 2, ev
@@ -1408,7 +1428,7 @@ def assert_event_records(raw_records, lane, workload_pid):
         if TARGET_BITS == 32:
             # The narrow unknown ids publish as event mechanisms; the
             # packed bytes may touch only the mechanism field and the
-            # two frozen-constant artifact offsets below — the final
+            # three frozen-constant artifact offsets below — the final
             # alias scan exempts this approved spill on 32-bit
             # safe-lane EVENTS dumps (see
             # assert_safe_lane_alias_privacy), so this oracle pins
@@ -1431,16 +1451,17 @@ def assert_event_records(raw_records, lane, workload_pid):
                         # boundary artifact (MECH_NONE followed by
                         # zeros spells packed MAXIMUM at 52); anything
                         # else there would corrupt the mechanism value
-                        # the set assertion pins above. The two exact
+                        # the set assertion pins above. The three exact
                         # (offset, value) pairs are the frozen
                         # 0xFFFFFFFF constants abutting zeros:
-                        # FUNCTION_NONE target beside a zero user_type
-                        # (108, synthetic zero-fields) and
-                        # USER_TYPE_NONE beside zero shape (112,
-                        # live). A different value at those offsets,
-                        # or anything elsewhere, is a leak.
+                        # SESSION_NONE beside a small slot_id (36,
+                        # session-less calls), FUNCTION_NONE target
+                        # beside a zero user_type (108, synthetic
+                        # zero-fields) and USER_TYPE_NONE beside zero
+                        # shape (112, live). A different value at those
+                        # offsets, or anything elsewhere, is a leak.
                         approved = (41 <= found_at < 56) or (
-                            value == MAXIMUM and found_at in (108, 112))
+                            value == MAXIMUM and found_at in (36, 108, 112))
                         assert approved, (lane, hex(value), found_at)
                         start = found_at + 1
         else:
@@ -1902,32 +1923,61 @@ SAFE_PROFILE_TRACE_LANES = frozenset({
     "default-safe-profile", "feature-safe-profile",
     "default-safe-trace", "feature-safe-trace",
 })
+SAFE_TRACE_LANES = frozenset({
+    "default-safe-trace", "feature-safe-trace",
+})
 
 
 def strip_approved_unregistered_rows(content):
-    """Drop approved registered:false rows from a profile document.
+    """Remove only the approved id fields from approved rows.
 
-    Only rows whose mechanism is UNKNOWN or MAXIMUM and whose
-    registered flag is False are removed; anything else (a parameter
-    alias as a mechanism, a True flag, a corrupt document) is left
-    for the unchanged alias scan. A removed row carries only the
-    numeric id, counts, null params and fixed strings, so no other
-    alias spelling can hide in it.
+    Only `mechanism` and `mechanism_hex` are removed, and only from
+    rows whose mechanism is UNKNOWN or MAXIMUM, whose registered flag
+    is False, and whose hex spelling exactly matches the id. Every
+    other field (calls, errors, ops, params, note, any future key)
+    stays for the unchanged alias scan, in the top-level mechanisms[]
+    breakdown and in each cgroups[] entry's own breakdown. A duplicated
+    JSON key refuses the strip: the raw content is scanned instead.
     """
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+
     try:
-        doc = json.loads(content)
+        doc = json.loads(content, object_pairs_hook=unique_object)
     except ValueError:
         return content
+    approved = {UNKNOWN, MAXIMUM}
+
+    def strip_row(row):
+        if (isinstance(row, dict) and row.get("mechanism") in approved
+                and row.get("registered") is False
+                and row.get("mechanism_hex") == f"0x{row['mechanism']:x}"):
+            return {key: value for key, value in row.items()
+                    if key not in ("mechanism", "mechanism_hex")}
+        return row
+
+    def strip_rows(rows):
+        return [strip_row(row) for row in rows]
+
     mechanisms = doc.get("mechanisms")
     if not isinstance(mechanisms, list):
         return content
-    approved = {UNKNOWN, MAXIMUM}
-    kept = [row for row in mechanisms
-            if not (isinstance(row, dict) and row.get("mechanism") in approved
-                    and row.get("registered") is False)]
-    if len(kept) == len(mechanisms):
-        return content
-    return json.dumps({**doc, "mechanisms": kept}).encode()
+    stripped = dict(doc)
+    stripped["mechanisms"] = strip_rows(mechanisms)
+    cgroups = stripped.get("cgroups")
+    if isinstance(cgroups, list):
+        stripped["cgroups"] = [
+            {**entry, "mechanisms": strip_rows(entry["mechanisms"])}
+            if isinstance(entry, dict) and isinstance(entry.get("mechanisms"), list)
+            else entry
+            for entry in cgroups
+        ]
+    return json.dumps(stripped).encode()
 
 
 def strip_approved_mechanism_tokens(content):
@@ -1949,6 +1999,13 @@ def assert_safe_lane_alias_privacy(lane, paths):
                 content = strip_approved_unregistered_rows(content)
             elif lane.endswith("-trace"):
                 content = strip_approved_mechanism_tokens(content)
+        elif (TARGET_BITS == 32 and lane in SAFE_TRACE_LANES
+                and path.name == f"{lane}.observer.log"):
+            # The stopped-phase harness merges the observer's stdout
+            # and stderr into this log, so it duplicates the approved
+            # trace lines byte-for-byte; diagnostics without tokens
+            # pass through to the unchanged scan below.
+            content = strip_approved_mechanism_tokens(content)
         reconstructed = reconstruct(content) if path.suffix == ".json" else b""
         found = alias_hits(content, reconstructed)
         if (TARGET_BITS == 32 and lane in SAFE_PROFILE_TRACE_LANES
@@ -2247,6 +2304,33 @@ def main(argv=None):
         bad_safe = json.loads(json.dumps(safe))
         bad_safe["evidence"]["semantic_capture_failures"] = 4
         reject("safe profile failure total", lambda: assert_safe_profile(bad_safe))
+        # 64-bit targets publish no unregistered row at all.
+        extra_unreg = json.loads(json.dumps(safe))
+        extra_unreg["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        reject("safe profile 64-bit extra unregistered row",
+               lambda: assert_safe_profile(extra_unreg))
+        cgroup_unreg64 = json.loads(json.dumps(safe))
+        cgroup_unreg64["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+            ],
+        }]
+        reject("safe profile 64-bit cgroup unregistered row",
+               lambda: assert_safe_profile(cgroup_unreg64))
+        cgroup_extra64 = json.loads(json.dumps(safe))
+        cgroup_extra64["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 1, "errors": 0,
+            "mechanisms": [
+                {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
+                 "registered": True, "calls": 1, "errors": 0, "note": "x"},
+            ],
+        }]
+        reject("safe profile 64-bit cgroup extra key",
+               lambda: assert_safe_profile(cgroup_extra64))
 
         # 32-bit targets publish the narrow unknown ids as approved
         # registered:false rows; 64-bit targets keep them absent (the
@@ -2280,6 +2364,36 @@ def main(argv=None):
         }]
         reject("safe profile parameter value inside a registered:false row",
                lambda: assert_safe_profile(param_leak))
+        # The 32-bit unregistered set is exactly {UNKNOWN, MAXIMUM}.
+        extra32 = json.loads(json.dumps(safe32))
+        extra32["mechanisms"].append(
+            {"mechanism": ALIASES["pss_hash"], "params": None,
+             "params_omitted": "policy", "registered": False, "calls": 1})
+        reject("safe profile 32-bit extra unregistered row",
+               lambda: assert_safe_profile(extra32))
+        wrong_hex = json.loads(json.dumps(safe32))
+        wrong_hex["mechanisms"][1]["mechanism_hex"] = "0x0"
+        reject("safe profile 32-bit unregistered hex mismatch",
+               lambda: assert_safe_profile(wrong_hex))
+        cgood = json.loads(json.dumps(safe32))
+        cgood["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+                {"mechanism": REGISTERED, "mechanism_hex": f"0x{REGISTERED:x}",
+                 "registered": True, "calls": 1, "errors": 0},
+            ],
+        }]
+        assert_safe_profile(cgood)
+        cextra = json.loads(json.dumps(cgood))
+        cextra["cgroups"][0]["mechanisms"][0]["note"] = "x"
+        reject("safe profile 32-bit cgroup extra key",
+               lambda: assert_safe_profile(cextra))
+        cwrong = json.loads(json.dumps(cgood))
+        cwrong["cgroups"][0]["mechanisms"][0]["mechanism"] = ALIASES["pss_hash"]
+        reject("safe profile 32-bit cgroup unregistered id",
+               lambda: assert_safe_profile(cwrong))
         initialize(64)
 
         initialize(64)
@@ -2336,12 +2450,96 @@ def main(argv=None):
              "params_omitted": "policy", "registered": False, "calls": 1})
         assert alias_hits(strip_approved_unregistered_rows(
             json.dumps(smuggled).encode())) == {"pss_hash"}
+        cgrouped = json.loads(json.dumps(safe32))
+        cgrouped["cgroups"] = [{
+            "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+            "mechanisms": [
+                {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                 "registered": False, "calls": 1, "errors": 0},
+                {"mechanism": ALIASES["pss_hash"], "params": None,
+                 "params_omitted": "policy", "registered": False, "calls": 1},
+            ],
+        }]
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(cgrouped).encode())) == {"pss_hash"}
+        # A leak inside an approved row survives the strip: only the id
+        # fields are removed, never the whole row.
+        for label, mutate in (
+            ("top-level calls", lambda doc: doc["mechanisms"][1].update(
+                calls=ALIASES["pss_hash"])),
+            ("top-level extra key", lambda doc: doc["mechanisms"][1].update(
+                note=f"0x{ALIASES['pss_hash']:x}")),
+        ):
+            leaky = json.loads(json.dumps(safe32))
+            mutate(leaky)
+            assert alias_hits(strip_approved_unregistered_rows(
+                json.dumps(leaky).encode())) == {"pss_hash"}, label
+        for label, mutate in (
+            ("cgroup calls", lambda row: row.update(calls=ALIASES["pss_hash"])),
+            ("cgroup extra key", lambda row: row.update(
+                note=f"0x{ALIASES['pss_hash']:x}")),
+        ):
+            cleaky = json.loads(json.dumps(safe32))
+            cleaky["cgroups"] = [{
+                "cgroup_id": 13377, "label": None, "calls": 3, "errors": 0,
+                "mechanisms": [
+                    {"mechanism": UNKNOWN, "mechanism_hex": f"0x{UNKNOWN:x}",
+                     "registered": False, "calls": 1, "errors": 0},
+                ],
+            }]
+            mutate(cleaky["cgroups"][0]["mechanisms"][0])
+            assert alias_hits(strip_approved_unregistered_rows(
+                json.dumps(cleaky).encode())) == {"pss_hash"}, label
+        # A wrong hex spelling is not the approved shape: the row stays
+        # whole, so the mechanism decimal still fails the scan.
+        bad_hex = json.loads(json.dumps(safe32))
+        bad_hex["mechanisms"][1]["mechanism_hex"] = "0x0"
+        assert alias_hits(strip_approved_unregistered_rows(
+            json.dumps(bad_hex).encode())) == {"mechanism"}
+        # A duplicated JSON key refuses the strip: the raw bytes are
+        # scanned, so the approved decimal still fails.
+        dup = ('{"mechanisms": [{"mechanism": %d, "mechanism": %d, '
+               '"mechanism_hex": "0x%x", "registered": false, "calls": 1}]}'
+               % (UNKNOWN, UNKNOWN, UNKNOWN)).encode()
+        assert alias_hits(strip_approved_unregistered_rows(dup)) == {"mechanism"}
         token_line = f"op C_EncryptInit 0x{UNKNOWN:x} → CKR_OK\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(token_line)) == set()
         misplaced = token_line + f"note 0x{UNKNOWN:x}\n".encode()
         assert alias_hits(strip_approved_mechanism_tokens(misplaced)) == {"mechanism"}
         packed = struct.pack("<Q", UNKNOWN)
         assert alias_hits(strip_approved_mechanism_tokens(packed)) == {"mechanism"}
+        with tempfile.TemporaryDirectory() as tmp:
+            lane_log = Path(tmp) / "default-safe-trace.observer.log"
+            lane_log.write_bytes(token_line + b"p11scope: capture ended\n")
+            assert_safe_lane_alias_privacy("default-safe-trace", [lane_log])
+            lane_log.write_bytes(
+                token_line + f"leak 0x{UNKNOWN:x}\n".encode())
+            reject("observer log misplaced mechanism value",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-trace", [lane_log]))
+        # The EVENTS.raw final scan zeroes only the approved mechanism
+        # field: a packed parameter alias, or UNKNOWN outside [48,56),
+        # still fails.
+        def framed(mechanism, extra=()):
+            record = bytearray(EVENT_SIZE)
+            struct.pack_into("<Q", record, 48, mechanism)
+            for offset, value in extra:
+                struct.pack_into("<Q", record, offset, value)
+            return struct.pack("<II", EVENT_SIZE, 0) + bytes(record)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path = Path(tmp) / "default-safe-profile.EVENTS.raw"
+            raw_path.write_bytes(framed(UNKNOWN))
+            assert_safe_lane_alias_privacy(
+                "default-safe-profile", [raw_path])
+            raw_path.write_bytes(framed(REGISTERED, [(72, ALIASES["pss_hash"])]))
+            reject("events raw packed parameter alias",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [raw_path]))
+            raw_path.write_bytes(framed(REGISTERED, [(56, UNKNOWN)]))
+            reject("events raw mechanism outside its field",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [raw_path]))
         initialize(entry_bits)
 
         pss = [{
@@ -2753,7 +2951,7 @@ def main(argv=None):
                    assert_event_records(mutated, "default-safe-profile", 0x555))
         # 32-bit safe lanes publish the narrow ids as event mechanisms;
         # their packed bytes may touch only the mechanism field and
-        # two frozen-constant artifact offsets (see the oracle rule).
+        # three frozen-constant artifact offsets (see the oracle rule).
         initialize(32)
         safe32_events = [event_bytes(index) for index in range(28)]
         safe32_events[0] = event_bytes(0, root_affiliation=1)
@@ -2762,6 +2960,9 @@ def main(argv=None):
         live_user_type = bytearray(safe32_events[6])
         struct.pack_into("<I", live_user_type, 112, 0xFFFFFFFF)
         safe32_events[6] = bytes(live_user_type)
+        no_session = bytearray(safe32_events[9])
+        struct.pack_into("<Q", no_session, 32, 0xFFFFFFFFFFFFFFFF)
+        safe32_events[9] = bytes(no_session)
         assert_event_records(safe32_events, "default-safe-profile", 0x555)
         reject("raw 32-bit safe events without published ids",
                lambda: assert_event_records(
@@ -2780,6 +2981,13 @@ def main(argv=None):
         reject("raw 32-bit wrong value at an artifact offset",
                lambda mistyped=mistyped: assert_event_records(
                    mistyped, "default-safe-profile", 0x555))
+        forged_session = list(safe32_events)
+        record = bytearray(forged_session[10])
+        struct.pack_into("<Q", record, 32, (UNKNOWN & 0xFFFFFFFF) << 32 | 0x101)
+        forged_session[10] = bytes(record)
+        reject("raw 32-bit wrong value at the session artifact offset",
+               lambda forged_session=forged_session: assert_event_records(
+                   forged_session, "default-safe-profile", 0x555))
         initialize(entry_bits)
         print("raw policy oracle self-test: OK")
 

@@ -4552,6 +4552,22 @@ fn cgroup_still_holds(members: &str, pid: u32) -> bool {
         .any(|member| member == pid)
 }
 
+/// True when `cmdline` (a `/proc/cmdline` snapshot) carries a virtme
+/// argument: virtme-ng boots every guest with `virtme_*`/`virtme.*`
+/// parameters (`virtme_hostname=`, `virtme_console=`, ...), so any
+/// such argument proves a virtme-ng guest.
+fn cmdline_is_virtme_guest(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .any(|arg| arg.starts_with("virtme"))
+}
+
+/// Whether this test itself runs inside a virtme-ng guest (an
+/// unreadable command line reads as host: fail onto the TMPDIR path).
+fn running_in_virtme_guest() -> bool {
+    std::fs::read_to_string("/proc/cmdline").is_ok_and(|cmdline| cmdline_is_virtme_guest(&cmdline))
+}
+
 /// The cgroup guards move the test back to the cgroup it started in
 /// (parsed from `/proc/self/cgroup`), never to the root: a test
 /// running under a CI or lane cgroup must not escape it for the rest
@@ -4585,6 +4601,26 @@ fn exit_mapping_cgroup_kill_is_skipped_while_self_is_still_inside() {
     assert!(!cgroup_still_holds("456\n789\n", 123));
     assert!(!cgroup_still_holds("", 123));
     assert!(!cgroup_still_holds("garbage\n456\n", 123));
+}
+
+/// W8B-66: the virtme-guest predicate fires on the parameters
+/// virtme-ng unconditionally sets (`virtme_hostname=`,
+/// `virtme_console=`, bare `virtme.*` flags), never on host command
+/// lines or on a mere `virtme` mention inside an argument value.
+#[test]
+fn exit_mapping_virtme_guest_predicate_matches_only_virtme_args() {
+    assert!(cmdline_is_virtme_guest(
+        "virtme_hostname=virtme-ng TERM=xterm console=hvc0 virtme_console=hvc0 \
+         virtme_user=root earlyprintk=serial nokaslr audit=off"
+    ));
+    assert!(cmdline_is_virtme_guest(
+        "BOOT_IMAGE=/boot/vmlinuz root=/dev/vda1 ro virtme.sound"
+    ));
+    assert!(!cmdline_is_virtme_guest(
+        "BOOT_IMAGE=/vmlinuz-6.12.0 root=/dev/sda3 ro quiet splash"
+    ));
+    assert!(!cmdline_is_virtme_guest(""));
+    assert!(!cmdline_is_virtme_guest("init=/sbin/init foo=virtme"));
 }
 
 /// Privileged live cell (6.14 Option A): a real extensive capture
@@ -4807,10 +4843,21 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
     }
 
     // Fixtures compile before capture: no forks inside the window.
-    let dir = tempfile::Builder::new()
-        .prefix("exit-mappings-live-")
-        .tempdir()
-        .expect("disk-backed TMPDIR must accept the fixture dir");
+    // W8B-66: inside a virtme-ng guest the fixtures live on guest
+    // tmpfs (/tmp is guest-local there), never under a host TMPDIR
+    // naming the shared 9p tree, whose remapped ownership and device
+    // identity the observer's checks rightly refuse.
+    let dir = if running_in_virtme_guest() {
+        tempfile::Builder::new()
+            .prefix("exit-mappings-live-")
+            .tempdir_in("/tmp")
+            .expect("guest tmpfs must accept the fixture dir")
+    } else {
+        tempfile::Builder::new()
+            .prefix("exit-mappings-live-")
+            .tempdir()
+            .expect("disk-backed TMPDIR must accept the fixture dir")
+    };
     // The discover helper drops privileges before executing provider
     // code and writing -o, so its output dir must stay writable to
     // the dropped user; the sticky bit keeps the helper's own

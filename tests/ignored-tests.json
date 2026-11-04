@@ -794,6 +794,12 @@
       "cell": "performance"
     },
     {
+      "file": "src/discovery/engine_tests.rs",
+      "path": "discovery::engine::tests::exit_mappings_live_cgroup_split_and_default_twin",
+      "reason": "6.14A exit-mapping lane; privileged: live BPF exit-mapping split over owned short-lived children with a default twin (cgroup scope, host BTF + gcc, ~25 s). Known-fail on 6.6.157: pre-existing planner scan/manifest merge divergence (candidate contains the same exact provider more than once), reproduced at the lane base; green on host/6.12/6.18/Fedora",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/identity.rs",
       "path": "discovery::identity::tests::map_files_name_timing_per_thousand",
       "reason": "manual: indicative map_files-name timing loop, no pass/fail bar; run by hand single-threaded",
@@ -1159,6 +1165,12 @@
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_system_many_endpoints_lp64",
       "reason": "root-owned live BPF lane; native --system over 400+ endpoints retires closed",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_prearm_reaches_armed_pid",
+      "reason": "pre-arm live cell (pid scope); declared proved set attaches through the activating extend, watch reaches armed live, ends terminally; privileged lock + sudo -n (~4 s)",
       "cell": "privileged"
     },
     {

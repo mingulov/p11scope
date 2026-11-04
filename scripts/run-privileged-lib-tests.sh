@@ -291,6 +291,10 @@ discovery::confirm_shards::tests::privileged_sharded_confirmation_equals_the_ser
 # stamped 3.0/3.1/3.2 (the Fedora SoftHSM 2.7 shape) decodes to a complete
 # surface with no surface gap. BPF-free; scan, pin, reconcile, plan, verdict.
 discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap
+# 6.14A exit-mapping split: live BPF kind-7 split over owned short-lived
+# children with a default kind-6 twin (cgroup scope, ~25 s). Known-fail on
+# 6.6.157 (pre-existing planner merge divergence, reproduced at lane base).
+discovery::engine::tests::exit_mappings_live_cgroup_split_and_default_twin
 # T8 twin fullness control: the identical phase-1 arming with an empty
 # request map admits the same head with zero loss, proving the twin's
 # refusal pins the full blocked map rather than the head. Expected
@@ -356,6 +360,9 @@ inventory::privileged_tests::privileged_native_lane_sigint_during_extend_lp64
 inventory::privileged_tests::privileged_native_lane_stop_held_call_unsettled_lp64
 inventory::privileged_tests::privileged_native_lane_system_exec_churn_lp64
 inventory::privileged_tests::privileged_native_lane_system_late_dlopen_lp64
+# Pre-arm live cell (pid scope): the declared proved set attaches through
+# the activating extend and the watch reaches armed live (~4 s).
+inventory::privileged_tests::privileged_prearm_reaches_armed_pid
 # Task 6 C5.1 cell 4: A-then-B — a late second provider instance for a cached
 # caller publishes exactly one first count, holds it across idle passes,
 # then grows; ledger-exact finals. Prints C51_AB (about 20 s).

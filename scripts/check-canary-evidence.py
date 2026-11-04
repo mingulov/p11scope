@@ -1446,22 +1446,22 @@ def assert_event_records(raw_records, lane, workload_pid):
                         found_at = raw.find(packed, start)
                         if found_at < 0:
                             break
-                        # An occurrence touching the mechanism field
-                        # (bytes 48-55) is the approved value or its
-                        # boundary artifact (MECH_NONE followed by
-                        # zeros spells packed MAXIMUM at 52); anything
-                        # else there would corrupt the mechanism value
-                        # the set assertion pins above. The three exact
-                        # (offset, value) pairs are the frozen
-                        # 0xFFFFFFFF constants abutting zeros:
-                        # SESSION_NONE beside a small slot_id (36,
-                        # session-less calls), FUNCTION_NONE target
-                        # beside a zero user_type (108, synthetic
-                        # zero-fields) and USER_TYPE_NONE beside zero
-                        # shape (112, live). A different value at those
+                        # The mechanism-set assertion above pins the value,
+                        # so UNKNOWN can only match at 48 and MAXIMUM only
+                        # at 48 or 52-55 (MECH_NONE followed by zeros spells
+                        # packed MAXIMUM at 52). Anything else there would
+                        # corrupt the pinned value. The three exact (offset,
+                        # value) pairs are the frozen 0xFFFFFFFF constants
+                        # abutting zeros: SESSION_NONE beside a slot_id with
+                        # a zero low half (0 for session-less calls) at 36,
+                        # FUNCTION_NONE target beside a zero user_type at 108
+                        # (synthetic zero-fields) and USER_TYPE_NONE beside
+                        # zero shape at 112 (live). A different value at those
                         # offsets, or anything elsewhere, is a leak.
-                        approved = (41 <= found_at < 56) or (
-                            value == MAXIMUM and found_at in (36, 108, 112))
+                        if value == UNKNOWN:
+                            approved = (found_at == 48)
+                        else:
+                            approved = found_at in (36, 48, 52, 53, 54, 55, 108, 112)
                         assert approved, (lane, hex(value), found_at)
                         start = found_at + 1
         else:

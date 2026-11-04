@@ -2570,7 +2570,18 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                 count(ev.task_uprobe_link_losses, "task-uprobe links lost")
             }
             "pause_partial" => count(ev.pause_partial, "partial pauses"),
-            "loader_discovery" => "live loader timing unproven".to_string(),
+            "loader_discovery" => {
+                let loader = &ev.loader_discovery;
+                if loader.hits == 0 && loader.strategies.debug_state_every_hit == 1 {
+                    "loader BPF delivery failure suspected (0 hits, no EXEC acknowledgment)"
+                        .to_string()
+                } else if loader.hits == 0 && loader.strategies.debug_state_every_hit >= 2 {
+                    "loader uprobe never fired despite EXEC acknowledgment (uprobe miss suspected)"
+                        .to_string()
+                } else {
+                    "live loader timing unproven".to_string()
+                }
+            }
             "scheduling.terminal_drain_truncated" => "terminal drain truncated".to_string(),
             "scheduling.sink_dropped_bytes" => {
                 count(ev.scheduling.sink_dropped_bytes, "output bytes dropped")

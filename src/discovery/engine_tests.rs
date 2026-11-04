@@ -3030,7 +3030,9 @@ fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
 /// records "nothing published yet"; when it later publishes tables but the
 /// published set is refused for capacity, the capacity refusal replaces the
 /// stale gap — and a later unpublished gap never clobbers the counted
-/// high-water mark back.
+/// high-water mark back. The provider holds room for one published table
+/// (104) but not four (416), so the crowded rebuild refuses the published
+/// union while the unpublished rebuild still reports no demand.
 #[test]
 fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
     let published_source = p11kit_like_64_table_module();
@@ -3085,13 +3087,19 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
         engine.discovery.modules_skipped[0].reason
     );
 
-    // The closure publishes its linked table while a provider crowds the
-    // budget: the published 104 no longer fit beside the provider's hold.
-    let crowded = p11scope_ebpf_common::MAX_SLOTS - 62;
+    // The closure publishes four linked tables while a provider crowds the
+    // budget: the published 416 no longer fit beside the provider's hold,
+    // while one table still would.
+    let crowded = p11scope_ebpf_common::MAX_SLOTS - 312;
     let mut provider = overlay_module(overlay_key(58));
     provider.tables[0].entries = overlay_entries(&provider, first_offsets(crowded));
     let mut published = closure.clone();
-    published.interfaces = published_source.interfaces.clone();
+    let link = published_source.interfaces[0].clone();
+    published.interfaces = vec![link.clone(), link.clone(), link.clone(), link];
+    for (index, interface) in published.interfaces.iter_mut().enumerate() {
+        interface.index = index;
+        interface.table = Some(60 + index);
+    }
     let mut candidate_pins = engine.pinned.clone();
     let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
     let candidate = engine
@@ -3126,7 +3134,7 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
         .expect("the crowded closure is refused");
     assert_eq!(
         plan::whole_refusal_needed_count(&refusal.reason),
-        Some(104),
+        Some(416),
         "published but crowded is a counted capacity refusal: {}",
         refusal.reason
     );
@@ -3143,7 +3151,7 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
     assert!(
         engine.discovery.modules_skipped[0]
             .reason
-            .starts_with("module needs 104 more;"),
+            .starts_with("module needs 416 more;"),
         "the capacity refusal replaces the stale unpublished gap: {}",
         engine.discovery.modules_skipped[0].reason
     );
@@ -3177,7 +3185,7 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
     assert!(
         engine.discovery.modules_skipped[0]
             .reason
-            .starts_with("module needs 104 more;"),
+            .starts_with("module needs 416 more;"),
         "the counted refusal is the high-water mark: {}",
         engine.discovery.modules_skipped[0].reason
     );

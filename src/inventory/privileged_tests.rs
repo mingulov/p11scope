@@ -495,7 +495,15 @@ fn privileged_prearm_reaches_armed_pid() -> Result<()> {
     let target = workload.spawn(
         "target",
         &[
-            "mech", "--cell", "T", "--module", softhsm(), "--iters", "2", "--gate", &gate_arg,
+            "mech",
+            "--cell",
+            "T",
+            "--module",
+            softhsm(),
+            "--iters",
+            "2",
+            "--gate",
+            &gate_arg,
             "--hold",
         ],
     )?;

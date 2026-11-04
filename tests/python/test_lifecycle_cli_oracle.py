@@ -10,7 +10,6 @@ Run: python3 -I tests/python/test_lifecycle_cli_oracle.py -v
 """
 
 import json
-import runpy
 import subprocess
 import sys
 import tempfile

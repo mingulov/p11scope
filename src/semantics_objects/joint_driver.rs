@@ -2164,24 +2164,48 @@ impl RawJointQuantum {
             || overflow
             || self.affecting_images().any(|image| image.0 == 0);
         let affecting = self.affecting_images().next().is_some();
+        // Before any journal key exists, no image in a disposed quantum
+        // is provably another caller's (there is no bound caller to
+        // differ from), so the localized refusal must not taint it: the
+        // interval is fenced as loss below instead, and a process that
+        // binds later can still enter Joint above that fence.
+        let pre_key = !unlocalized && owner.adapter.keys.is_empty();
         let failure = (unlocalized || affecting).then(|| {
             let gap = if overflow {
                 JournalGap::CutExhausted
             } else {
                 self.disposal_gap(&owner.adapter, unlocalized)
             };
-            owner.adapter.refuse_disposed_raw(
-                &mut owner.model,
-                self.affecting_images(),
-                unlocalized,
-                gap,
-            )
+            if pre_key {
+                owner.adapter.refuse_disposed_raw(
+                    &mut owner.model,
+                    std::iter::empty(),
+                    false,
+                    gap,
+                )
+            } else {
+                owner.adapter.refuse_disposed_raw(
+                    &mut owner.model,
+                    self.affecting_images(),
+                    unlocalized,
+                    gap,
+                )
+            }
         });
         // Every increment corresponds to this original consumed wire item.
         // There is no H8 dispatch, claim, grant or synthetic terminal. Keep
         // first-affecting sightings monotonic, including fork children.
         for (item, quiet, _) in self.classified_items() {
             let _ = owner.adapter.note_consumed_item(item, quiet);
+        }
+        if pre_key && affecting {
+            // The disposed affecting records are lost history: fence
+            // the whole consumed interval so no later birth or seal
+            // can certify across it.
+            owner.adapter.voided_through = owner
+                .adapter
+                .voided_through
+                .max(owner.adapter.consumed_through);
         }
         if contiguous && !unlocalized {
             owner.adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());

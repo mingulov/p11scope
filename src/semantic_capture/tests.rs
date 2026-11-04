@@ -2006,6 +2006,10 @@ fn joint_pre_key_raw_disposal_does_not_taint_the_callers_own_image() {
         "the disposed affecting original is still a named loss, never hidden"
     );
     assert!(
+        owner.adapter().voids_through_for_test(negative.frontier()),
+        "the disposed interval is fenced: no later seal can certify across it"
+    );
+    assert!(
         !owner.adapter().image_tainted_for_test(image),
         "no binding existed to prove this image another caller's"
     );

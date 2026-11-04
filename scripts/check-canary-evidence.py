@@ -2517,6 +2517,29 @@ def main(argv=None):
             reject("observer log misplaced mechanism value",
                    lambda: assert_safe_lane_alias_privacy(
                        "default-safe-trace", [lane_log]))
+        # The EVENTS.raw final scan zeroes only the approved mechanism
+        # field: a packed parameter alias, or UNKNOWN outside [48,56),
+        # still fails.
+        def framed(mechanism, extra=()):
+            record = bytearray(EVENT_SIZE)
+            struct.pack_into("<Q", record, 48, mechanism)
+            for offset, value in extra:
+                struct.pack_into("<Q", record, offset, value)
+            return struct.pack("<II", EVENT_SIZE, 0) + bytes(record)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_path = Path(tmp) / "default-safe-profile.EVENTS.raw"
+            raw_path.write_bytes(framed(UNKNOWN))
+            assert_safe_lane_alias_privacy(
+                "default-safe-profile", [raw_path])
+            raw_path.write_bytes(framed(REGISTERED, [(72, ALIASES["pss_hash"])]))
+            reject("events raw packed parameter alias",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [raw_path]))
+            raw_path.write_bytes(framed(REGISTERED, [(56, UNKNOWN)]))
+            reject("events raw mechanism outside its field",
+                   lambda: assert_safe_lane_alias_privacy(
+                       "default-safe-profile", [raw_path]))
         initialize(entry_bits)
 
         pss = [{

@@ -793,6 +793,7 @@ jobs:
           UNRUN: scripts/docker-shared-layer-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/late-provider-negative.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-p11kit-pid-startup.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-p11kit-remote.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/ci/joint-throughput.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
@@ -891,6 +892,7 @@ jobs:
       - run: scripts/verify-discover-containers.sh --self-test
       - run: scripts/verify-capability-tier.sh --self-test
       - run: scripts/verify-live-discovery-preflight.sh --self-test
+      - run: scripts/verify-p11kit-pid-startup.sh --self-test
       - run: scripts/verify-p11kit-remote.sh --self-test
       - run: scripts/verify-canaries.sh --self-test
       - run: scripts/verify-provider-matrix.sh --self-test

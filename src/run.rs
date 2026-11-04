@@ -13879,6 +13879,43 @@ mod tests {
         );
     }
 
+    /// The owned-run startup wires the barrier-release bound into
+    /// `owned.prearm_release_ns` after the barrier release resolves and
+    /// before the post-release pause revalidation runs: the bound must be
+    /// the release the child actually crossed, and the revalidation must
+    /// see the wired claim. The startup needs a live child, so the order
+    /// is pinned statically (same `split_once` precedent as
+    /// `run_loop_reports_discovery_noise_before_returning_a_capture_error`).
+    #[test]
+    fn prearm_release_wiring_sits_between_release_and_revalidate() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("fn run_owned_inner_with_host(")
+            .unwrap()
+            .1
+            .split_once("fn preflight_uretprobe_hazard(")
+            .unwrap()
+            .0;
+        let released = body
+            .find(".release_until(")
+            .expect("owned startup releases the child barrier");
+        let wired = body
+            .find("owned.prearm_release_ns = ")
+            .expect("owned startup wires the pre-arm release bound");
+        let revalidated = body
+            .find("revalidate_after_release(")
+            .expect("owned startup revalidates after the release");
+        assert!(
+            released < wired && wired < revalidated,
+            "prearm_release_ns is wired after release_until and before revalidate_after_release"
+        );
+        assert_eq!(
+            body.matches("owned.prearm_release_ns = ").count(),
+            1,
+            "one wiring site feeds the terminal claim"
+        );
+    }
+
     #[test]
     fn prearm_terminal_pause_hold_empties_windows() {
         use crate::attach::BackendSelection;

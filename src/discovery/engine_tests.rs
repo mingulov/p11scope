@@ -11329,8 +11329,9 @@ fn prearm_pause_hold_late_start_keeps_window() {
     assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
 }
 
-/// A non-`run` scope with identical stamps and a complete scripted hold
-/// still keeps the window: only the owned child's hold proves exactness.
+/// A non-`run` scope with identical stamps, a complete scripted hold
+/// and a known release bound still keeps the window: only the owned
+/// child's hold proves exactness, so this test isolates the scope gate.
 #[test]
 fn prearm_non_run_scope_with_hold_keeps_window() {
     use crate::render::PrearmWatchEnd;
@@ -11346,7 +11347,7 @@ fn prearm_non_run_scope_with_hold_keeps_window() {
         0,
         Some(scripted_hold(Some(50), Some(900), true)),
         false,
-        None,
+        Some(1000),
     );
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
@@ -11354,9 +11355,9 @@ fn prearm_non_run_scope_with_hold_keeps_window() {
 }
 
 /// A declared first-stamp dated after the barrier release proves nothing:
-/// the child runs free between release and its first pause stop, so the
-/// window stays even when the frozen hold reaches the stamp. Release at
-/// 800 precedes the 900 stamps below.
+/// the child may run its command before the first *verified* pause stop,
+/// so the window stays even when the frozen hold reaches the stamp.
+/// Release at 800 precedes the 900 stamps below.
 #[test]
 fn prearm_pause_hold_post_release_stamp_keeps_window() {
     use crate::render::PrearmWatchEnd;
@@ -11377,6 +11378,31 @@ fn prearm_pause_hold_post_release_stamp_keeps_window() {
     let record = watched_prearm_record(&engine);
     assert_eq!(record.attached_at_ns, Some(Some(900)));
     assert_eq!(record.unobserved_windows, Some(pre_attach_window()));
+}
+
+/// A declared first-stamp exactly at the barrier release still proves:
+/// the bound withholds only strictly post-release stamps (`>` at the
+/// builder, not `>=`), so the window empties. Release and stamps at 900.
+#[test]
+fn prearm_release_equal_to_stamp_still_proves() {
+    use crate::render::PrearmWatchEnd;
+
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    engine.finish_prearm_capture(
+        &session,
+        PrearmWatchEnd::ScopeEnd,
+        &BTreeSet::new(),
+        &[],
+        Some(5000),
+        &crate::metrics::KernelEvidence::default(),
+        0,
+        Some(scripted_hold(Some(50), Some(900), true)),
+        true,
+        Some(900),
+    );
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.attached_at_ns, Some(Some(900)));
+    assert_eq!(record.unobserved_windows, Some(Vec::new()));
 }
 
 /// Synthetic two-slot plan: one declared stamp after the release

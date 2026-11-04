@@ -161,19 +161,20 @@ PUBLIC = {
     "doctor": "command-contract", "sigint": "command-contract",
     "second-sigint": "command-contract", "fifo-refused": "command-contract",
     "run-short": "nonqualifying", "run-cover": "nonqualifying",
-    "trace-pid": "nonqualifying",
+    "trace-pid": "nonqualifying", "run-prearm": "prearm-exactness",
 }
 BASE_IDS = ("version", "doctor", "inventory-native", "pid-filter", "backend-pid", "backend-system")
 EXITS = {"version.log": "version", "doctor.log": "doctor", "qual.log": "qual",
          "inv-native.log": "inv_native", "pidflt.log": "pidflt", "priv.log": "priv",
          "backend/inv-pid.stderr": "inv_pid", "backend/inv-sys.stderr": "inv_sys"}
-RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c")
+RUNTIME_SOURCES = ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
+                   "tests/fixtures/public-cli/prearm-first-use.c")
 SOURCE_FILES = ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                 "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
                 "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py",
                 "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                 "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
-                "tests/fixtures/public-cli/inventory-ledger.c")
+                "tests/fixtures/public-cli/inventory-ledger.c", "tests/fixtures/public-cli/prearm-first-use.c")
 CANARY_SOURCE_FILES = ("scripts/verify-canaries.sh", "scripts/product-build.sh", "scripts/lib.sh",
     "scripts/lane-lib-oracle-1.py", "scripts/cleanup-traps.sh", "scripts/_loader.py",
     "scripts/capture-stopped-canary.py", "scripts/canary_process_custody.py",

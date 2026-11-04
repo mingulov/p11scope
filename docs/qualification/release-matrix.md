@@ -198,6 +198,7 @@ The accepted public runner must produce each selected cell exactly once:
 | names-pid | semantic-names |
 | verdict-pid | verdict-consistency |
 | doctor, sigint, second-sigint, fifo-refused | command-contract |
+| run-prearm | prearm-exactness |
 | run-short, run-cover, trace-pid | nonqualifying, pass=false |
 
 Owned-provider counts do not authenticate system per-caller attribution.

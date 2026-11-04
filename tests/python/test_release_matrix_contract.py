@@ -57,7 +57,7 @@ PUBLIC = {
     "doctor": "command-contract", "sigint": "command-contract",
     "second-sigint": "command-contract", "fifo-refused": "command-contract",
     "run-short": "nonqualifying", "run-cover": "nonqualifying",
-    "trace-pid": "nonqualifying",
+    "trace-pid": "nonqualifying", "run-prearm": "prearm-exactness",
 }
 
 
@@ -69,7 +69,8 @@ def candidate_receipt(bins, path, source_root=ROOT):
              "source_revision": "a" * 40, "source_tree": "b" * 40, "source_clean": True,
              "build": {"argv": ["controlled-cargo", "test", "--lib", "--no-run"], "cwd": str(source_root), "exit": 0},
              "runtime_sources": {name: sha(source_root / name) for name in
-                                 ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c")}}
+                                 ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
+                                  "tests/fixtures/public-cli/prearm-first-use.c")}}
     path.write_text(json.dumps(value) + "\n")
     return path
 
@@ -133,7 +134,7 @@ class MatrixContract(unittest.TestCase):
         self.write("uname.txt", "6.1.188\n")
         self.log("version.log", "p11scope 0.4.0\n", "version", 0)
         self.log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok self-link attached and detached\n", "doctor", 0)
-        self.log("qual.log", "SUMMARY pass=10 fail=0 nonqualifying=3\n", "qual", 2)
+        self.log("qual.log", "SUMMARY pass=11 fail=0 nonqualifying=3\n", "qual", 2)
         self.public_rows = [{"cell": name, "pass": qualification != "nonqualifying",
                              "detail": "controlled assertion", "qualification": qualification}
                             for name, qualification in PUBLIC.items()]
@@ -471,7 +472,8 @@ class MatrixContract(unittest.TestCase):
                      "scripts/mapped-provider-pin.py", "scripts/public-cli-oracle.py", "scripts/check-capture-evidence.py",
                      "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                      "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
-                     "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
+                     "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
+                     "tests/fixtures/public-cli/prearm-first-use.c"):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / name, path)
         stage = self.base / "clone-stage"
         receipt = candidate_receipt(self.bins, self.base / "clone-build.json", repo)
@@ -793,7 +795,7 @@ class MatrixContract(unittest.TestCase):
         write("uname.txt", uname + "\n")
         log("version.log", "p11scope 0.4.0\n", "version", 0)
         log("doctor.log", "capability tier: T4\nuprobe-multi attach (own libc) .... ok self-link attached and detached\n", "doctor", 0)
-        log("qual.log", "SUMMARY pass=10 fail=0 nonqualifying=3\n", "qual", 2)
+        log("qual.log", "SUMMARY pass=11 fail=0 nonqualifying=3\n", "qual", 2)
         write("cells/results.jsonl", "".join(
             json.dumps({"cell": name, "pass": qualification != "nonqualifying",
                         "detail": "controlled assertion", "qualification": qualification}) + "\n"
@@ -2028,7 +2030,8 @@ class MatrixContract(unittest.TestCase):
 
     def test_compiled_fixture_root_is_bound_independently_of_current_runtime_root(self):
         builder = self.base / "actual-build-root"
-        for name in ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
+        for name in ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
+                     "tests/fixtures/public-cli/prearm-first-use.c"):
             path = builder / name; path.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / name, path)
         receipt = candidate_receipt(self.bins, self.base / "actual-build.json", builder)
         self.listing.write_text(CHURN + ": test\n")
@@ -2056,7 +2059,8 @@ class MatrixContract(unittest.TestCase):
 
     def test_compiled_source_drift_also_fails_actual_judge(self):
         builder = self.base / "judge-build-root"
-        for name in ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
+        for name in ("tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
+                     "tests/fixtures/public-cli/prearm-first-use.c"):
             path = builder / name; path.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(ROOT / name, path)
         receipt = candidate_receipt(self.bins, self.stage / "inputs/candidate-build.json", builder)
         contract = json.loads(self.contract.read_text())
@@ -2250,7 +2254,8 @@ class MatrixContract(unittest.TestCase):
             path.chmod(0o755)
         for name in ("scripts/inventory-native-oracle.py", "scripts/mapped-provider-pin.py",
                      "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
-                     "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
+                     "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c",
+                     "tests/fixtures/public-cli/prearm-first-use.c"):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("controlled external fixture\n")
         for name in ("p11scope", "p11scope-bpfmulti"):

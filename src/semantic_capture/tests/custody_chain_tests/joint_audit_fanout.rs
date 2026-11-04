@@ -8475,6 +8475,76 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     );
 }
 
+/// A void the pool cannot pay for is all-or-nothing: the lane stays
+/// broken and un-voided (no key refused, no custody dropped), and the
+/// refusal takes the machine's ordinary disposition gate like any other
+/// Idle refusal, so the owner ends Joint by its named S1 fallback.
+#[test]
+fn joint_machine_unpaid_linked_break_void_takes_the_disposition_gate() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("linked-break", None);
+    let pending = |fixture: &MachineScene| {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        (
+            adapter.stream_broken_for_test(),
+            adapter.invalidated_for_test(),
+        )
+    };
+    assert_eq!(pending(&fixture), (true, false), "the void is still due");
+    let api_returns = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum()
+    };
+    let before = api_returns(&fixture);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let bound = coordinator
+        .joint_capture()
+        .void_storage_bound_for_test()
+        .expect("finite void bound");
+    let reserve = coordinator.registry().semantic_storage_reserver();
+    let snapshot = coordinator.registry().semantic_resource_snapshot();
+    let room = snapshot.limit_bytes - snapshot.charged_bytes;
+    assert!(room >= bound, "the pool could pay before the hold");
+    let hold = reserve.reserve(room - (bound - 1)).unwrap();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut refused = None;
+    for _ in 0..64 {
+        let result = fixture.service(1);
+        assert_eq!(pending(&fixture), (true, false), "no partial void");
+        if let Err(reason) = result {
+            refused = Some(reason);
+            break;
+        }
+    }
+    assert_eq!(refused, Some(SemanticRefusal::Unavailable));
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the unpaid void takes the ordinary disposition gate"
+    );
+    assert_eq!(
+        api_returns(&fixture),
+        before,
+        "nothing joins before the disposition"
+    );
+    drop(hold);
+}
+
 /// A mid-call call straddling an unlinked break still completes:
 /// the BEGIN-only quantum publishes, the malformed quantum breaks
 /// the stream (voiding the retained START), the next collect

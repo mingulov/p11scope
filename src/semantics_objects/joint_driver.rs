@@ -281,6 +281,12 @@ impl JointCaptureOwner {
         self.adapter.ledger_mut()
     }
 
+    /// The storage a void prepays (`raw_disposition_storage_bound`).
+    #[cfg(test)]
+    pub(crate) fn void_storage_bound_for_test(&self) -> Option<usize> {
+        super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+    }
+
     /// End Joint after a linked stream broke while ingesting (not by a
     /// raw disposal), so S1 can continue. The break may leave staged
     /// custody across the hole, so the lane is first brought to exactly

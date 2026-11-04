@@ -1437,9 +1437,11 @@ The old bounds are measurements, not a product startup SLA.
   (`fault_era`), and key-operation tracking ends for keys that existed
   before the skip, with a named gap. Each running program's load is
   proven again; a load whose mapping is unchanged keeps its instance
-  row, which is then marked uncertain (`instance_reload_not_excluded`:
-  a same-address reload hidden by the skip would merge into that row).
-  A changed load gets a new row. Call totals stay exact.
+  row (and ID). In an inventory report that row reads `uncertain` /
+  `semantic_loss`, as any row crossing a coverage era does: a
+  same-address reload hidden by the skip would merge into it. The stop
+  line's `eras` count tells these runs apart from runs without skips. A
+  changed load gets a new row. Call totals stay exact.
 - Measured: under deliberate CPU contention (5 busy loops on a 5-vCPU
   VM, 1,000 calls/s, 60 s) about 1,700-2,800 map and 5,400-5,900 unmap
   misses; 91-93% of calls were joined and the rest were counted as

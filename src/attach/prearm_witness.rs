@@ -235,6 +235,19 @@ pub(crate) enum Unavailable {
     TooManyFiles,
 }
 
+impl Unavailable {
+    /// Reason class for the §6.1 diagnostic line (no values).
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Unavailable::Btf(_) => "btf",
+            Unavailable::Lto(_) => "lto",
+            Unavailable::Ftrace(_) => "ftrace",
+            Unavailable::Pidns(_) => "pidns",
+            Unavailable::TooManyFiles => "too-many-files",
+        }
+    }
+}
+
 /// Raw BTF prototype checker following the `instance.rs` precedent: exact
 /// FUNC name (exactly one), arity, return void/int, and for pointer params
 /// the pointee struct name; scalar params must be integers (typedefs
@@ -1297,8 +1310,7 @@ mod tests {
     #[test]
     fn witness_load_names_gates_migrate_on_cgroup() {
         // Spec §4.4: the migrate program loads only for `--cgroup`.
-        let depart: &[&'static str] =
-            &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC];
+        let depart: &[&'static str] = &[super::PROGRAM_DEPART_EXIT, super::PROGRAM_DEPART_EXEC];
         let with = super::witness_load_names(depart, true);
         assert!(
             with.contains(&super::PROGRAM_MIGRATE),
@@ -1606,6 +1618,16 @@ mod tests {
             gate_startup(0, true, Some("1".into()), None).unwrap_err(),
             Unavailable::TooManyFiles
         );
+    }
+
+    #[test]
+    fn unavailable_class_names_reason_without_values() {
+        use super::Unavailable;
+        assert_eq!(Unavailable::Btf("detail".into()).class(), "btf");
+        assert_eq!(Unavailable::Lto("detail".into()).class(), "lto");
+        assert_eq!(Unavailable::Ftrace("detail".into()).class(), "ftrace");
+        assert_eq!(Unavailable::Pidns("detail".into()).class(), "pidns");
+        assert_eq!(Unavailable::TooManyFiles.class(), "too-many-files");
     }
 
     /// Privileged: the cgroup id from `Scope::Cgroup` (directory inode)

@@ -6688,15 +6688,20 @@ fn discover_plan(
     let mut prearm_witness_live = if a.prearm_modules.is_empty() {
         None
     } else {
-        crate::attach::prearm_witness::start(
+        match crate::attach::prearm_witness::start(
             &a.prearm_modules,
             scope,
             matches!(
                 crate::pidns::observer(),
                 crate::pidns::ObserverPidNs::Initial
             ),
-        )
-        .ok()
+        ) {
+            Ok(witness) => Some(witness),
+            Err(reason) => {
+                eprintln!("p11scope: pre-arm witness unavailable: {}", reason.class());
+                None
+            }
+        }
     };
     // The capture's scope start, before any observation: the outer bound of
     // every unobserved window. (The `run` path overrides with its pre-spawn
@@ -29610,8 +29615,8 @@ impl Engine {
     }
 
     /// Keys a driver verdict's input-ordered slots to watched objects by
-    /// pin identity (condition 4): a slot names every object whose pinned
-    /// raw keys contain the witness fd's `(st_dev, st_ino)`. Identities no
+    /// pin identity (condition 4): a slot names every object whose pin's
+    /// held fd has the witness fd's `(st_dev, st_ino)`. Identities no
     /// object pins are dropped, never attributed.
     fn map_verdict_slots_to_objects(
         watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,

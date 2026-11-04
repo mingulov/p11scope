@@ -7958,6 +7958,79 @@ fn prearm_witness_native_harness_covers_every_path() {
 }
 
 #[test]
+fn prearm_witness_engine_wiring_source_order() {
+    // Spec P2-6 source-order contract (precedent: run.rs source-scan test).
+    // All reorder failure modes are fail-closed; this pins the order.
+    let engine = read("src/discovery/engine.rs");
+    let run = read("src/run.rs");
+    let plan = between(&engine, "fn discover_plan(", "fn resolve_prearm_pieces(");
+    require_before(
+        plan,
+        "prearm_witness::start(",
+        "set_scope_start_ns(",
+        "discover_plan",
+    )
+    .unwrap();
+    let session = between(&engine, "fn start_session_with(", "mod session_fixture");
+    require_before(
+        session,
+        "finish_start_capture_attempt(",
+        "finalize_prearm_witness(",
+        "start_session_with",
+    )
+    .unwrap();
+    let finalize = session
+        .find("finalize_prearm_witness(")
+        .expect("start_session_with finalizes the witness");
+    let ret = session
+        .rfind("Ok(session)")
+        .expect("start_session_with returns the session");
+    assert!(
+        finalize < ret,
+        "finalize must precede the return in start_session_with"
+    );
+    require_before(
+        run.as_str(),
+        "start_session(",
+        "capture_ready_line(",
+        "run.rs",
+    )
+    .unwrap();
+    // Inverted mutants must fail: each swapped order is out of order.
+    assert!(
+        require_before(
+            plan,
+            "set_scope_start_ns(",
+            "prearm_witness::start(",
+            "mutant",
+        )
+        .is_err(),
+        "swapped discover_plan order must fail"
+    );
+    assert!(
+        require_before(
+            session,
+            "finalize_prearm_witness(",
+            "finish_start_capture_attempt(",
+            "mutant",
+        )
+        .is_err(),
+        "swapped start_session_with order must fail"
+    );
+    assert!(
+        require_before(
+            run.as_str(),
+            "capture_ready_line(",
+            "start_session(",
+            "mutant",
+        )
+        .is_err(),
+        "swapped run.rs order must fail"
+    );
+    assert!(!(ret < finalize), "swapped finalize/return order must fail");
+}
+
+#[test]
 fn instance_epoch_journal_gap_selector_keeps_birth_and_exec_reads_separate() {
     let directory = tempfile::tempdir().expect("native selector objects");
     for (mode, flag, gap, birth) in [
@@ -14255,7 +14328,7 @@ const LICENSE_C_FIXTURES: &[&str] = &[
     "tests/fixtures/live-discovery-provider.c", // tests/python/test_live_freeze_prepared_dependencies.py
     "tests/fixtures/root-affiliation/birth_hook_tests.c", // tests/python/test_root_affiliation.py
     "tests/fixtures/root-affiliation/helper_tests.c", // tests/python/test_root_affiliation.py
-    "tests/fixtures/root-fence-runtime.c",     // orphan fixture (no consumer); exempt by location
+    "tests/fixtures/root-fence-runtime.c",      // orphan fixture (no consumer); exempt by location
     "tests/fixtures/task-owner/helper_tests.c", // tests/task_owner_contracts.rs (also included by root-affiliation/helper_tests.c)
 ];
 

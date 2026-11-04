@@ -682,3 +682,80 @@ fn joint_linked_broken_stream_without_disposal_keeps_gap_refusal() {
         );
     }
 }
+
+#[test]
+fn joint_linked_ingest_break_voids_then_resyncs_above_a_fence() {
+    // A linked stream broken while ingesting (no raw disposal) keeps
+    // the fail-closed Gap until the owner ends Joint for every key; the
+    // next collect then re-syncs above a fence on the consumed history.
+    let events = EventsDomain::test_standin(0x61ac);
+    let retained = producers(&events);
+    assert!(retained.journal_linked());
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let collect = |owner: &mut JointCaptureOwner| {
+        let mut drain =
+            EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 1), events.clone());
+        RawJointQuantum::collect_bounded_with_adapter(
+            &mut drain,
+            &publish_object_descriptors(),
+            4,
+            None,
+            &SteadyFault(Cell::new(None)),
+            &retained,
+            |bytes| pool.reserve(bytes),
+            owner.adapter_mut(),
+        )
+        .map(|_| ())
+    };
+    assert_eq!(
+        owner.void_ingest_break(),
+        Ok(false),
+        "a healthy stream is never voided"
+    );
+    owner.adapter.stream_broken = true;
+    owner.adapter.consumed_through = 7;
+    assert!(
+        matches!(
+            collect(&mut owner),
+            Err(RawQuantumRefusal::Cut(
+                crate::semantics_objects::journal::BirthCutRefusal::Gap
+            ))
+        ),
+        "the ingest break alone stays fail-closed"
+    );
+    assert_eq!(owner.void_ingest_break(), Ok(true));
+    assert!(
+        owner.adapter.invalidated,
+        "the break is now an unlocalized loss"
+    );
+    assert_eq!(owner.adapter.last_audit_failure, Some(7));
+    assert_eq!(
+        owner.void_ingest_break(),
+        Ok(false),
+        "an invalidated stream is not voided twice"
+    );
+    assert!(collect(&mut owner).is_ok(), "the next collect re-syncs");
+    assert_eq!(
+        owner.adapter.voided_through, 7,
+        "fenced at the consumed history"
+    );
+    assert!(!(owner.adapter.stream_broken || owner.adapter.invalidated));
+}
+
+#[test]
+fn joint_ingest_break_void_keeps_stopped_and_exhausted_lanes_fail_closed() {
+    let events = EventsDomain::test_standin(0x61ad);
+    let pool = SemanticResourcePool::default();
+    let _ = &events;
+    for (stopped, exhausted) in [(true, false), (false, true)] {
+        let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+        owner.adapter.stream_broken = true;
+        owner.adapter.stopped = stopped;
+        if exhausted {
+            owner.adapter.consumed_through = u64::MAX;
+        }
+        assert_eq!(owner.void_ingest_break(), Ok(false));
+        assert!(!owner.adapter.invalidated);
+    }
+}

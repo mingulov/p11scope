@@ -2792,6 +2792,15 @@ impl LiveJointMachine {
                 self.absence_after = None;
                 self.absence_entry = 0;
                 let work = budget.remaining_actions.min(MAX_PENDING);
+                // A Joint fault never stops S1: a linked stream broken
+                // while ingesting ends Joint for every existing key and
+                // re-syncs above a fence on this collect.
+                if self.producers.journal_linked() {
+                    let _voided = retain_on_refusal!(
+                        Phase::Idle,
+                        coordinator.joint_capture_mut().void_ingest_break()
+                    );
+                }
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(
                         lane,

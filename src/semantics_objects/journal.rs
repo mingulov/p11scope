@@ -3516,10 +3516,13 @@ impl JournalAdapter {
             // consumed interval makes every later birth name a cut at
             // or above it (births strictly below refuse), so nothing in
             // the lost window is ever certified. A break without that
-            // disposal (staged custody still held across the hole), a
-            // spent consumption ordinal (`consumed_through == MAX`,
-            // which leaves no frontier to fence) and a stopped adapter
-            // keep the fail-closed refusal.
+            // disposal (staged custody still held across the hole) keeps
+            // the fail-closed refusal here; the Joint machine first ends
+            // it through `JointCaptureOwner::void_ingest_break`, which
+            // performs that disposal, so S1 continues. A spent
+            // consumption ordinal (`consumed_through == MAX`, which
+            // leaves no frontier to fence) and a stopped adapter keep
+            // the fail-closed refusal.
             let linked = producers.journal_linked();
             let resyncs = !self.stopped
                 && (!linked || (self.invalidated && self.consumed_through != u64::MAX));

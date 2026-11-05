@@ -2640,6 +2640,42 @@ mod tests {
     }
 
     #[test]
+    fn inventory_default_covers_a_twenty_thousand_endpoint_host() {
+        let default = inventory_endpoint_budget(None).unwrap();
+        assert_eq!(default.endpoint_limit(), 32_768);
+        assert_eq!(default.payload_bytes(), 262_144);
+        // The LIM-1 target host: several p11-kit copies, about 20K endpoints.
+        assert!(default.validate_count(20_000).is_ok());
+        assert!(default.validate_count(32_768).is_ok());
+        let refusal = default.validate_count(32_769).unwrap_err();
+        assert!(
+            refusal.contains("raise --max-endpoints (up to 131072)"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn inventory_ceiling_is_131072_and_8192_stays_exact() {
+        assert_eq!(MAX_INVENTORY_ENDPOINT_LIMIT, 131_072);
+        assert_eq!(DEFAULT_INVENTORY_ENDPOINT_LIMIT, 32_768);
+        // The previous ceiling remains an exact, valid selection.
+        let previous = inventory_endpoint_budget(Some(8192)).unwrap();
+        assert_eq!(previous.endpoint_limit(), 8192);
+        assert_eq!(previous.payload_bytes(), 65_536);
+        assert!(previous.validate_count(8192).is_ok());
+        assert!(previous.validate_count(8193).is_err());
+        let maximum = inventory_endpoint_budget(Some(131_072)).unwrap();
+        assert_eq!(maximum.payload_bytes(), 1_048_576);
+        assert!(maximum.validate_count(131_072).is_ok());
+        let refusal = maximum.validate_count(131_073).unwrap_err();
+        assert!(!refusal.contains("--max-endpoints"), "{refusal}");
+        for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
+            let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
+            assert!(refusal.contains("1..=131072"), "{refusal}");
+        }
+    }
+
+    #[test]
     fn inventory_budget_requires_an_exact_checked_eight_byte_payload() {
         let budget = InventoryBudget::new(64, 512).unwrap();
         assert_eq!(budget.endpoint_limit(), 64);

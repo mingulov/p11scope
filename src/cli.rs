@@ -2513,6 +2513,35 @@ mod tests {
     }
 
     #[test]
+    fn inventory_endpoint_policy_admits_the_raised_ceiling() {
+        for endpoints in [20_000_u64, 32_768, 131_072] {
+            let value = endpoints.to_string();
+            let parsed = parse(args(&[
+                "inventory",
+                "--system",
+                "--max-endpoints",
+                &value,
+            ]));
+            let Ok(Command::Inventory(parsed)) = parsed else {
+                panic!("raised endpoint budget {endpoints}: {parsed:?}");
+            };
+            assert_eq!(parsed.max_endpoints, Some(endpoints));
+            let budget =
+                crate::capacity::inventory_endpoint_budget(parsed.max_endpoints).unwrap();
+            assert_eq!(budget.endpoint_limit(), endpoints);
+        }
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--max-endpoints", "131073"])),
+            Err(CliError::Usage { message, .. })
+                if message.contains("--max-endpoints") && message.contains("1..=131072")
+        ));
+        assert!(
+            INVENTORY_HELP.contains("1..=131072") && INVENTORY_HELP.contains("32768"),
+            "help must name the raised policy"
+        );
+    }
+
+    #[test]
     fn inventory_parses_scope_duration_and_output() {
         let Command::Inventory(i) = parse(args(&[
             "inventory",

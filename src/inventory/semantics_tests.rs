@@ -877,6 +877,68 @@ fn native_semantic_scan_subset_skips_cross_object_provider() {
     assert_eq!(subset.plan().slots.len(), 2);
 }
 
+/// The cross-object twin of the huge-incomplete regression: a
+/// cross-object provider can never mint, so it must not consume the
+/// 512-slot subset plan either. Created (and so planned) first, its
+/// 400 cross-object endpoints (into a third, host object, the
+/// libp11-kit shape) left less than the complete provider's 212
+/// slots and refused it whole.
+#[test]
+fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let cross = ProviderFixture::new();
+    let complete = ProviderFixture::new();
+    let host = ProviderFixture::new();
+    let mut good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = cross.source(["C_SignInit", "C_Sign"]);
+    let host_key = host.pins.raw_keys_for(host.pins.pinned().next().unwrap().id)[0];
+    fn grow(
+        module: &mut ReconciledModule,
+        key: p11scope_manifest::maps::ObjectKey,
+        object_path: Option<String>,
+        base: u64,
+        tables: usize,
+        per_table: u64,
+    ) {
+        let template = module.scanned.tables[0].clone();
+        let names: Vec<&'static str> = template.entries.iter().map(|entry| entry.name).collect();
+        let object_path = object_path.unwrap_or_else(|| template.entries[0].object_path.clone());
+        module.scanned.tables.clear();
+        for t in 0..tables {
+            let mut table = template.clone();
+            table.walk = "full";
+            table.entries.clear();
+            for j in 0..per_table {
+                table.entries.push(ScannedEntry {
+                    name: names[(j % 2) as usize],
+                    object: key,
+                    object_path: object_path.clone(),
+                    file_offset: base + (t as u64) * per_table + j,
+                });
+            }
+            module.scanned.tables.push(table);
+        }
+    }
+    let good_key = good.scanned.tables[0].entries[0].object;
+    grow(&mut bad, host_key, Some(host.manifest.module_path.clone()), host.offsets[0], 4, 100);
+    grow(&mut good, good_key, None, complete.offsets[0], 1, 212);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the cross-object provider stays a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("a complete provider mints beside a huge cross-object one");
+    assert_eq!(subset.required().len(), 1, "only the complete provider");
+    assert_eq!(subset.plan().slots.len(), 212);
+}
+
 /// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live
 /// `--system` capture the creation-time `engine.modules` snapshot
 /// stays empty; current scanned tables live in the per-view scan

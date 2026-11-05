@@ -1373,7 +1373,9 @@ changing capture behavior, it joins the table above and the `--help` list.
 
 - `0` — success. `--help` also exits 0. `run` exits 0 when its child exits 0,
   when a still-running child is handed back (without `--kill-on-timeout`),
-  or when a requested `--kill-on-timeout` kill reaped the child at timeout.
+  or when a requested `--kill-on-timeout` kill reaped a live child by the
+  observer's signal at timeout. A voluntary exit keeps its own status,
+  however high its code, as does a death before the observer's signal.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead. `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure

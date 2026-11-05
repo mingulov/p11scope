@@ -1470,6 +1470,17 @@ pub(crate) struct OwnedChild {
     exec_confirmed: bool,
     reaped: bool,
     reaped_exit_code: Option<i32>,
+    /// Whether the reap observed `CLD_KILLED`/`CLD_DUMPED` (a signal
+    /// death) rather than `CLD_EXITED` (a voluntary exit): the
+    /// flattened `reaped_exit_code` alone cannot tell a voluntary
+    /// 200 from a signal death. `None` until reaped.
+    reaped_signalled: Option<bool>,
+    /// Whether the observer's graceful settlement successfully sent
+    /// SIGTERM / SIGKILL before the reap: a pre-signal death (the
+    /// initial probe's reap, or a reap after a failed send) is never
+    /// the observer's kill, however signalled its code.
+    sent_term: bool,
+    sent_kill: bool,
     handed_off: bool,
     interrupt_count: u8,
     settlement_deadline: Option<Instant>,
@@ -1650,6 +1661,9 @@ impl OwnedChild {
             exec_confirmed: false,
             reaped: false,
             reaped_exit_code: None,
+            reaped_signalled: None,
+            sent_term: false,
+            sent_kill: false,
             handed_off: false,
             interrupt_count: 0,
             settlement_deadline: None,
@@ -1927,6 +1941,7 @@ impl OwnedChild {
             }
             return self.kill_and_reap_tail();
         }
+        self.sent_term = true;
         if self.wait_ready_until(Some(term_deadline))? {
             return self.try_reap_until(Some(term_deadline))?.ok_or_else(|| {
                 io::Error::other("pidfd was ready without a reapable child status after SIGTERM")
@@ -1942,6 +1957,9 @@ impl OwnedChild {
         }
         let group_error = signal_group(self.pid, libc::SIGKILL).err();
         let direct_error = self.pin.send_signal(libc::SIGKILL).err();
+        if group_error.is_none() || direct_error.is_none() {
+            self.sent_kill = true;
+        }
         if let Some(error) = direct_error {
             if let Some(code) = self.try_reap()? {
                 return if self.released
@@ -2095,9 +2113,9 @@ impl OwnedChild {
             return Ok(None);
         }
         let status = unsafe { info.si_status() };
-        let code = match info.si_code {
-            libc::CLD_EXITED => status,
-            libc::CLD_KILLED | libc::CLD_DUMPED => 128 + status,
+        let (code, signalled) = match info.si_code {
+            libc::CLD_EXITED => (status, false),
+            libc::CLD_KILLED | libc::CLD_DUMPED => (128 + status, true),
             other => {
                 return Err(io::Error::other(format!(
                     "unexpected waitid child status code {other}"
@@ -2106,6 +2124,7 @@ impl OwnedChild {
         };
         self.reaped = true;
         self.reaped_exit_code = Some(code);
+        self.reaped_signalled = Some(signalled);
         Ok(Some(code))
     }
 
@@ -3365,7 +3384,10 @@ fn settle_owned_child(
         .context("owned child missing during settlement")?;
     // A requested timeout kill of a live child is a normal end. Probe
     // liveness before the reap: a child that already exited keeps its
-    // own status unmarked, and only a signal death counts as our kill.
+    // own status unmarked. Only a death by the observer's own signal
+    // counts as our kill: a voluntary exit (however high its code)
+    // and a spontaneous signal death before our signal was sent both
+    // propagate unmarked.
     let requested = end == CaptureEnd::DurationExpired && kill_on_timeout;
     let was_alive = requested && child.still_running();
     let settled: Result<ChildOutcome> =
@@ -3378,7 +3400,10 @@ fn settle_owned_child(
                 .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
         };
     if let Ok(ChildOutcome::Exited(code)) = &settled {
-        *requested_kill = was_alive && *code > 128;
+        let signalled = child.reaped_signalled == Some(true);
+        let term_kill = *code == 128 + libc::SIGTERM && child.sent_term;
+        let kill_kill = *code == 128 + libc::SIGKILL && child.sent_kill;
+        *requested_kill = was_alive && signalled && (term_kill || kill_kill);
     }
     record_settlement_result(child, settled, exit_code, still_running)
 }

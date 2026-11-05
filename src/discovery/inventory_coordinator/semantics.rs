@@ -4165,6 +4165,105 @@ mod binding_window_tests {
             "a history entry of another domain is another ticket space"
         );
     }
+
+    fn refused_proof_image(task_cookie: u64, exec_id: u64) -> ImageIdentity {
+        ImageIdentity {
+            task_cookie,
+            exec_id,
+        }
+    }
+
+    fn refused_proof_history(
+        domain: NativeDomainId,
+        task_cookie: u64,
+        exec_id: u64,
+    ) -> SemanticAdmissionHistory {
+        SemanticAdmissionHistory {
+            domain,
+            image: refused_proof_image(task_cookie, exec_id),
+            incarnation: 1,
+            generation: crate::inspect_system::MemberGeneration {
+                start_time: None,
+                exe: None,
+            },
+            pin: Arc::new(PidPin::test_proc_only(1234)),
+            initial_scope_cut: false,
+            pending_gap: None,
+        }
+    }
+
+    fn refused_proof_bind(
+        set: &mut SemanticBindingSet,
+        caller: u32,
+        domain: NativeDomainId,
+        task_cookie: u64,
+        exec_id: u64,
+    ) {
+        set.insert(SemanticCallerBinding::scripted(
+            CallerId(caller),
+            ModuleKey::physical(7, 7, 777, None, "/window/provider.so"),
+            domain,
+            refused_proof_image(task_cookie, exec_id),
+            Arc::new(PidPin::test_proc_only(1234)),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn refused_proof_needs_every_same_cookie_history_refused() {
+        // The candidate (77, 3) and its exec successor (77, 9) are
+        // refused; an older same-cookie exec (77, 5) stays unrefused.
+        // One unrefused same-cookie admission-history entry must fail
+        // the proof even when the same-cookie binding is refused.
+        let domain = NativeDomainId::mint();
+        let refused =
+            |candidate: ImageIdentity| candidate.task_cookie == 77 && candidate.exec_id != 5;
+        let mut set = SemanticBindingSet::new();
+        refused_proof_bind(&mut set, 1, domain, 77, 9);
+        set.admission_images
+            .insert(CallerId(20), refused_proof_history(domain, 77, 9));
+        assert!(
+            set.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "a refused candidate with every same-cookie binding and history refused proves"
+        );
+        set.admission_images
+            .insert(CallerId(21), refused_proof_history(domain, 77, 5));
+        assert!(
+            !set.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "one unrefused same-cookie history entry keeps the barrier"
+        );
+        // Same verdict without any same-cookie binding: the history
+        // alone blocks.
+        let mut lone = SemanticBindingSet::new();
+        refused_proof_bind(&mut lone, 2, domain, 41, 1);
+        lone.admission_images
+            .insert(CallerId(20), refused_proof_history(domain, 77, 5));
+        assert!(
+            !lone.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "an unrefused same-cookie history blocks with no same-cookie binding"
+        );
+    }
+
+    #[test]
+    fn refused_proof_needs_the_candidate_image_refused() {
+        // Every same-cookie binding and history entry is refused, but
+        // the shed's own image (77, 3) is not: the proof must fail, so
+        // the shed barriers instead of disposing.
+        let domain = NativeDomainId::mint();
+        let refused = |candidate: ImageIdentity| candidate == refused_proof_image(77, 9);
+        let mut set = SemanticBindingSet::new();
+        refused_proof_bind(&mut set, 1, domain, 77, 9);
+        set.admission_images
+            .insert(CallerId(20), refused_proof_history(domain, 77, 9));
+        assert!(
+            !set.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "an unrefused candidate never proves, however refused its cookie-mates are"
+        );
+        assert!(
+            set.proves_refused_other_caller(domain, refused_proof_image(77, 9), refused),
+            "the refused image itself still proves against the same set"
+        );
+    }
 }
 
 #[cfg(test)]

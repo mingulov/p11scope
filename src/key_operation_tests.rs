@@ -20839,18 +20839,14 @@ fn key_operation_partial_publication_counts_unattributed() {
 /// The trip note is idempotent: a second note never recounts.
 #[test]
 fn key_operation_watchdog_unsealed_staged_calls_count() {
-    let instance = RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
-    let mut edge = EdgeSemantics::default();
-    let mut keyuse = KeyUseReducer::new();
-    let mut sink = Vec::new();
+    let keyuse = KeyUseReducer::new();
     // Two modeled calls stage; no seal ever settles them.
     for call in sign_flow()[1..3].iter() {
         prepare_call(&mut scene, &mut staging, call);
     }
-    let _ = (&mut edge, &mut sink, instance);
     assert_eq!(staging.staged_len(), 2, "both calls stay staged");
 
     staging.note_watchdog_trip();
@@ -20997,12 +20993,7 @@ fn key_operation_unattributed_conservation_across_all_staging_reasons() {
     };
     let origin_e = EffectOrigin::from(&unsealable);
     assert_eq!(
-        staging_e.stage(
-            unsealable,
-            origin_e,
-            1,
-            scene_e.adapter.ledger_mut()
-        ),
+        staging_e.stage(unsealable, origin_e, 1, scene_e.adapter.ledger_mut()),
         Err(crate::semantics_key_use::StagingRefusal::Unsealable)
     );
 
@@ -21036,8 +21027,8 @@ fn key_operation_unattributed_conservation_across_all_staging_reasons() {
             + staging.unsealable_direct()
             + staging.fallback_replayed()
             + staging.degraded_fallback_direct();
-        unclaimed_staged += (staging.staged_len() as u64)
-            .saturating_sub(staging.watchdog_unsealed());
+        unclaimed_staged +=
+            (staging.staged_len() as u64).saturating_sub(staging.watchdog_unsealed());
     }
     assert_eq!(unclaimed_staged, 0, "no staged call is left uncounted");
     // Hand-constructed observed key calls: A3 + B(3+2) + C(1+1)
@@ -21050,12 +21041,7 @@ fn key_operation_unattributed_conservation_across_all_staging_reasons() {
         "conservation across all staging reasons"
     );
 
-    let observations = commit(
-        72,
-        &stagings,
-        &scene_a.model.project(),
-        &keyuse_a,
-    );
+    let observations = commit(72, &stagings, &scene_a.model.project(), &keyuse_a);
     assert_eq!(
         observations.unattributed,
         vec![

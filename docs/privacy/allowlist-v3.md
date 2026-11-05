@@ -1247,7 +1247,7 @@ calls that carry no per-key row because no key could be proved:
 | `record_lost` | Staged calls disposed once as history after bounded loss, plus direct reductions in the degraded window after such a loss ended a segment, before its next clean point. |
 | `foreign_or_unproven_caller` | Calls refused before application for an unproven or unbound caller. |
 | `session_state_lost` | Reserved: calls whose session state was lost before a clean point. |
-| `watchdog_no_progress` | Reserved: calls left unsealed across a named no-progress interval. |
+| `watchdog_no_progress` | Staged calls left unsealed when the named no-progress watchdog trip ended the lane (finish or running audit), snapshotted once at the trip. |
 | `unmodelled_call_shape` | Affecting calls the frozen endpoint table cannot seal, reduced S1-direct. Proved-irrelevant info calls are not key operations and never count. |
 | `proof_refused_fallback` | Staged calls a proof-only or ordered fallback replayed S1-direct without object proof, plus direct reductions in the degraded window after such a fallback ended a segment, before its next clean point. |
 

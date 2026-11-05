@@ -2403,6 +2403,15 @@ impl CallerRegistry {
         observations.add_unattributed("foreign_or_unproven_caller", refused);
         observations
     }
+
+    /// Note the no-progress watchdog trip on every retained feed:
+    /// staged calls no seal will now settle count once as
+    /// `watchdog_no_progress` at publication. Idempotent per feed.
+    pub(crate) fn note_joint_watchdog_trip(&mut self) {
+        for record in self.instance_state.semantics.values_mut() {
+            record.feed.note_watchdog_trip();
+        }
+    }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
         self.staged.push(Mutation::ObserveInstanceSemantic(input));
     }

@@ -1106,7 +1106,7 @@ pub(crate) mod producer {
                 .iter()
                 .fold(0u64, |total, staging| total.saturating_add(pick(staging)))
         };
-        let counts: [(&str, u64); 4] = [
+        let counts: [(&str, u64); 5] = [
             (
                 "started_before_attach",
                 sum(&|staging| staging.pre_attach_direct()),
@@ -1118,6 +1118,10 @@ pub(crate) mod producer {
                         .history_disposed()
                         .saturating_add(staging.degraded_loss_direct())
                 }),
+            ),
+            (
+                "watchdog_no_progress",
+                sum(&|staging| staging.watchdog_unsealed()),
             ),
             (
                 "unmodelled_call_shape",

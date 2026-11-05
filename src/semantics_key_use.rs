@@ -307,6 +307,14 @@ pub(crate) struct JointStaging {
     /// The ending that opened the current degraded window, if a
     /// segment has ended and not yet resumed. Cleared on resume.
     degraded_window: Option<DegradedWindow>,
+    /// Staged calls left unsealed when the no-progress watchdog
+    /// tripped, snapshotted once at the trip: counted as not
+    /// attributed (`watchdog_no_progress`). The calls themselves
+    /// stay staged — never reduced, never replayed.
+    watchdog_unsealed: u64,
+    /// True once the watchdog trip has been noted for this feed:
+    /// the snapshot above is taken exactly once.
+    watchdog_tripped: bool,
     correlation_refusals: u64,
     /// True once real loss (not proof-only refusal) ended this
     /// feed's object authority: the projection reports
@@ -362,6 +370,8 @@ impl JointStaging {
             degraded_fallback_direct: 0,
             degraded_loss_direct: 0,
             degraded_window: None,
+            watchdog_unsealed: 0,
+            watchdog_tripped: false,
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
@@ -460,6 +470,22 @@ impl JointStaging {
     /// Direct reductions in the degraded window after real loss.
     pub(crate) fn degraded_loss_direct(&self) -> u64 {
         self.degraded_loss_direct
+    }
+
+    /// Staged calls counted under the watchdog reason at the trip.
+    pub(crate) fn watchdog_unsealed(&self) -> u64 {
+        self.watchdog_unsealed
+    }
+
+    /// Note the no-progress watchdog trip for this feed: snapshot
+    /// the staged calls no seal will now settle, exactly once.
+    /// They stay staged (never reduced, never replayed) and count
+    /// once as `watchdog_no_progress` at publication.
+    pub(crate) fn note_watchdog_trip(&mut self) {
+        if !self.watchdog_tripped {
+            self.watchdog_tripped = true;
+            self.watchdog_unsealed = self.staged.len() as u64;
+        }
     }
 
     /// End the current Joint segment: degrade to S1Only and open

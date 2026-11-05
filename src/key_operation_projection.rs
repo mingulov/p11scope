@@ -1031,10 +1031,13 @@ pub(crate) mod producer {
             .any(|staging| staging.mode() == FeedMode::Joint);
         // A tripped no-progress watchdog held the lane for exit: its
         // feeds left Joint for good, so the census is partial under
-        // lost authority, the exact rows kept beside the counts.
-        let lost = stagings
-            .iter()
-            .any(|staging| staging.degraded_loss() || staging.watchdog_tripped());
+        // lost authority, the exact rows kept beside the counts. A
+        // semantic loss that disposed staged history while the feed
+        // stays Joint is lost authority too: a counted `record_lost`
+        // never sits under `populated`.
+        let lost = stagings.iter().any(|staging| {
+            staging.degraded_loss() || staging.watchdog_tripped() || staging.history_disposed() > 0
+        });
         let fallback = stagings.iter().any(|staging| staging.fell_back());
         let unattributed = collect_unattributed(stagings);
         // Joint never stops as a whole: a feed that fell back or lost

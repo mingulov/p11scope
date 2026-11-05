@@ -1323,7 +1323,17 @@ fn run_with_terminal_budget(
     };
     validate_primary_destinations(out, event_log)?;
     if capture != CaptureMode::Scan {
-        let _host = host()?;
+        if let Err(refusal) = host() {
+            // An auto PID capture without root falls back to the scan lane
+            // (never-stop) instead of failing here: the native opening
+            // below records the named fallback gap. Other scopes and modes
+            // keep the fatal host refusal before any sink exists.
+            let pid_auto_fallback =
+                capture == CaptureMode::Auto && matches!(scope, InventoryRunScope::Pid(_));
+            if !pid_auto_fallback {
+                return Err(refusal.into());
+            }
+        }
     }
     // D3d: forced-kernel preflight before any sink exists. A refused
     // kernel is a named nonzero error, never a successful empty
@@ -9817,6 +9827,65 @@ mod tests {
                 "{error:#}"
             );
         }
+    }
+
+    /// Item 6: an auto PID run passes the host preflight on a host-wide
+    /// BPF refusal (no root) and falls back to the scan lane with a named
+    /// gap instead of failing. System scope stays fatal (see
+    /// `refused_multi_host_precedes_inventory_sinks_and_auto_fallback`).
+    #[test]
+    fn auto_pid_run_passes_preflight_to_scan_on_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let refusal =
+            MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            move |_, _, _| Err(refusal.into()),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(std::process::id()),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| {
+                        Err(MultiHostRefusal::for_test(
+                            MultiHostStage::ProgramLoad,
+                            Some(libc::EACCES),
+                        ))
+                    },
+                    None,
+                    None,
+                    false,
+                )
+            },
+        )
+        .expect("auto PID run falls back to scan on host refusal");
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_scan_fallback(&document);
     }
 
     /// Item 6: an auto PID capture whose native preparation hits a

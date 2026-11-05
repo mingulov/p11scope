@@ -425,8 +425,8 @@ from it.
 {"schema": "p11scope/inventory-events/v1", "seq": 0, "at_ns": 100, "kind": "started",
  "event": {"scope": "pid:4242", "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
            "started_ns": 100, "limits": {"callers": 4096, "modules": 4096, "edges": 32768,
-           "endpoints": 1048576, "inventory_endpoints": 4096,
-           "inventory_attach_modules": 4096, "semantic_state": 32768,
+           "endpoints": 1048576, "inventory_endpoints": 32768,
+           "inventory_attach_modules": 32768, "semantic_state": 32768,
            "retained_history": 1024}}}
 {"schema": "p11scope/inventory-events/v1", "seq": 1, "at_ns": 110, "kind": "caller_event",
  "event": {"event": "admitted", "caller": "c0"}}

@@ -1080,8 +1080,8 @@ conservatively instead of riding to the run end.
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},
     "edges": {"limit": 32768, "occupied": 1, "refused": 0},
     "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},
-    "inventory_endpoints": {"limit": 4096, "occupied": 68, "refused": 0},
-    "inventory_attach_modules": {"limit": 4096, "occupied": 1, "refused": 0},
+    "inventory_endpoints": {"limit": 32768, "occupied": 68, "refused": 0},
+    "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
     "counters": {"cap": 18446744073709551615, "observed_edges": 0, "saturated_edges": 0},
     "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
     "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0}

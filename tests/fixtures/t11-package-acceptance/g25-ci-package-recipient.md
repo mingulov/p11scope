@@ -66,7 +66,7 @@ gh run list --workflow ci.yml --branch "$p11scope_ci_ref" \
    has NO `## [Unreleased]` v0.4 section. T11 must update version,
    commands, limitations, manifests/README/changelog/runbook, support /
    permission / retention wording and schema/privacy status, then check
-   links and commands. (`git grep 'TODO(release)'` and
+   links and commands. (`git grep 'TODO[(]release)'` and
    `TBD-MEASURED|TBD-QUALIFIED` are already clean at base.)
 3. Installed recipient journeys G14/G20/G22 against packaged bytes are
    open live cells; a lane that builds its own binary remains source

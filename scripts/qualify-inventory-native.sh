@@ -3,8 +3,8 @@
 # qualify-inventory-native.sh — installed `p11scope inventory` acceptance (Task 6 C8).
 #
 #   qualify-inventory-native.sh P11SCOPE [--lane scan|native] [--base DIR] [--no-dashboard] [--max-endpoints N]
-#   qualify-inventory-native.sh P11SCOPE --capacity boundary|growth|owners|real|refusal --max-endpoints N [--demand 4097|6531|8192]
-#   A refusal cell needs --demand exactly one above --max-endpoints (4096/4097, 6530/6531, 8191/8192).
+#   qualify-inventory-native.sh P11SCOPE --capacity boundary|growth|owners|real|refusal --max-endpoints N [--demand 4097|6531|8192|32769]
+#   A refusal cell needs --demand exactly one above --max-endpoints (4096/4097, 6530/6531, 8191/8192, 32768/32769).
 #   qualify-inventory-native.sh --self-test
 #
 # Host runs need a ROOT-OWNED --base (not group/other-writable); the default
@@ -780,10 +780,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 case $LANE in scan|native) ;; *) echo "--lane must be scan or native" >&2; exit 64 ;; esac
-case $ENDPOINT_LIMIT in ''|*[!0-9]*|??????????*) echo "--max-endpoints must be in1..8192" >&2; exit 64 ;; esac
-[ "$ENDPOINT_LIMIT" -ge 1 ] && [ "$ENDPOINT_LIMIT" -le 8192 ] || { echo "--max-endpoints must be in1..8192" >&2; exit 64; }
+case $ENDPOINT_LIMIT in ''|*[!0-9]*|??????????*) echo "--max-endpoints must be in1..131072" >&2; exit 64 ;; esac
+[ "$ENDPOINT_LIMIT" -ge 1 ] && [ "$ENDPOINT_LIMIT" -le 131072 ] || { echo "--max-endpoints must be in1..131072" >&2; exit 64; }
 case $CAPACITY in ''|boundary|growth|owners|real|refusal) ;; *) echo "unknown capacity population $CAPACITY" >&2; exit 64 ;; esac
-case $CAPACITY_DEMAND in 4097|6531|8192) ;; *) echo "--demand must be4097,6531,8192" >&2; exit 64 ;; esac
+case $CAPACITY_DEMAND in 4097|6531|8192|32769) ;; *) echo "--demand must be4097,6531,8192,32769" >&2; exit 64 ;; esac
 if [ -n "$CAPACITY" ] && [ "$ENDPOINT_SELECTED" = 0 ]; then
     echo "--capacity requires --max-endpoints" >&2; exit 64
 fi

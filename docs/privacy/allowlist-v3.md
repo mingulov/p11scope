@@ -1258,6 +1258,24 @@ section version is 3, which is exactly when at least one count is
 nonzero; fully attributed publications stay byte-stable at versions 1
 and 2. Profile, trace and metrics never carry these counters.
 
+## Unknown-metadata key rows (owner ruling DEMO-4, 2026-11-05)
+
+**Status: APPROVED by owner ruling DEMO-4 (2026-11-05).** This section
+scopes section version 4 of
+[docs/schema/inventory-v1-object-observations-v4.schema.json](../schema/inventory-v1-object-observations-v4.schema.json):
+one additional finite `metadata_at_use` label, `unknown`, on a per-key
+row whose object the model first observed in the observed window
+(the key's creation or lookup predates attach) and whose type/size
+were never established by an already-observed attribute call. The
+label states an absence of already-held facts only: it grants no
+read, derives from the object's existing first-observed origin and
+its empty established metadata, and never guesses a type or size.
+If a later already-observed `C_GetAttributeValue` establishes the
+type, later uses row under their exact label; earlier uses are never
+backfilled. No `CKA_ID`, object handle, label, PIN or payload is read
+or published for these rows. Version 4 is present exactly when such
+a row exists; versions 1, 2 and 3 stay frozen and byte-stable.
+
 ## DR04 caller metadata (2026-10-18)
 
 **Status: opt-in implementation contract; installed qualification remains

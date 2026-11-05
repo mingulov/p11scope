@@ -4456,7 +4456,11 @@ fn key_operation_first_observed_key_rows_with_unknown_metadata() {
         .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("first-observed key keeps a per-key row with unknown metadata");
     assert_eq!(
-        (unknown_row.started, unknown_row.completed, unknown_row.active),
+        (
+            unknown_row.started,
+            unknown_row.completed,
+            unknown_row.active
+        ),
         (1, 1, 0)
     );
     let object = committed
@@ -5479,10 +5483,10 @@ fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
             .get("version")
             .map_or(1, |v| v.as_u64().unwrap_or(u64::MAX));
         assert!(
-            version == 1 || version == 2,
+            (1..=4).contains(&version),
             "H9 row version {version} refused"
         );
-        let (roles, creations): (&[&str], &[&str]) = if version == 2 {
+        let (roles, creations): (&[&str], &[&str]) = if version >= 2 {
             (&ROLE_LABELS_V2[..], &CREATION_LABELS_V2[..])
         } else {
             (&ROLE_LABELS[..], &CREATION_LABELS[..])
@@ -7942,7 +7946,7 @@ fn key_operation_g29_creator_close_vs_accessor_view() {
     let creator = committed
         .key_operations
         .iter()
-        .find(|row| row.category == "sign")
+        .find(|row| row.category == "sign" && row.metadata_at_use != "unknown")
         .expect("the creator use stands");
     assert_eq!(
         (creator.active, creator.key_join_lost),
@@ -7956,11 +7960,20 @@ fn key_operation_g29_creator_close_vs_accessor_view() {
         .expect("the cancelled terminal routes once");
     assert_eq!(routed.cancelled, 1);
     let accessor = committed
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("the accessor use stands");
-    assert_eq!(accessor.active, 1, "accessor session stays live");
+    // DEMO-4: the accessor's first-observed view rows per-key, so
+    // its retirement closes the join exactly like a labelled key
+    // (key_join_lost); its S1 machine stays live (asserted above).
+    // Previously the use sat in the metadata_unknown summary, whose
+    // associations keep their S1 active until the terminal.
+    assert_eq!(
+        (accessor.active, accessor.key_join_lost),
+        (0, 1),
+        "accessor view retirement closes its join"
+    );
 }
 
 /// G29 (N1b): delivery/equivalence matrix through the registry.
@@ -8864,6 +8877,7 @@ fn key_operation_schema_contract() {
             },
             label,
             attribution_valid,
+            first_observed: false,
             lost: false,
         };
         let mut start_sink = Vec::new();
@@ -11450,12 +11464,22 @@ fn key_operation_kem_retired_input_stays_unavailable() {
     let receipts = direct_receipts(&sink);
     assert_eq!(receipts.len(), 1);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    // DEMO-4: the fresh first-observed input rows per-key under the
+    // `unknown` metadata label (never the retired object); nothing
+    // lands in the capture-wide metadata_unknown bucket.
     let unknown: Vec<_> = committed
         .unknown_key_operations
         .iter()
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
-    assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
+    assert_eq!(unknown, Vec::<(&str, &str, u64)>::new());
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "encapsulate" && row.metadata_at_use == "unknown")
+        .expect("the first-observed input rows per-key");
+    assert_eq!(row.completed, 1);
+    assert_ne!(row.object, retired_id.as_u64());
 }
 
 /// Item 18: later qualification is forward-only. A KEM output's
@@ -12571,13 +12595,15 @@ fn key_operation_kem_jsonl_version_dispatch() {
     assert_reconstructed_eq_json(&reconstruct(&spun), &section, false);
 }
 
-/// The unknown-version refusal names its version.
+/// The unknown-version refusal names its version. (Versions 3 and
+/// 4 are real section versions since JK-22/DEMO-4; the sentinel is
+/// a version no producer emits.)
 #[test]
-#[should_panic(expected = "H9 row version 3 refused")]
+#[should_panic(expected = "H9 row version 99 refused")]
 fn key_operation_kem_jsonl_unknown_version_refused() {
     let lines = [serde_json::json!({
         "kind": "object_observed",
-        "event": {"revision": 1, "version": 3, "row": {}},
+        "event": {"revision": 1, "version": 99, "row": {}},
     })];
     let _ = reconstruct(&lines);
 }
@@ -16597,14 +16623,14 @@ fn key_operation_c5_loss_tees_terminals_and_spares_siblings() {
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
     // A's live machine ended Unknown; its open closed (teed); B live.
-    // (A's Joint uses carry receipts without established metadata, so
-    // they aggregate metadata_unknown; B's receipt-less direct use is
-    // unbound.)
+    // (A's Joint uses carry receipts without established metadata on
+    // a first-observed key, so they row per-key under the `unknown`
+    // metadata label; B's receipt-less direct use is unbound.)
     let observations = guarded.registry.joint_observations(13);
     let proved = observations
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("Joint evidence retained");
     assert_eq!(
         (proved.completed, proved.unknown, proved.active),
@@ -16753,9 +16779,9 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     );
     let observations = guarded.registry.joint_observations(15);
     let row = observations
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("Joint evidence retained");
     assert_eq!(
         (row.unknown, row.active),
@@ -18716,6 +18742,7 @@ fn key_operation_joint_async_pending_mints_deferred_origin() {
                 metadata: _,
                 label,
                 attribution_valid,
+                first_observed: _,
             } => Some((*call, *key_use, *input, *label, *attribution_valid)),
             _ => None,
         })
@@ -20933,10 +20960,13 @@ fn key_operation_late_attach_counts_and_joint_sibling_attributes() {
         }],
         "the pre-attach instance's two calls count once each"
     );
+    // The clean Joint sign attributes to its first-observed key:
+    // a per-key row under the `unknown` metadata label (DEMO-4),
+    // not the capture-wide metadata_unknown bucket.
     let joint_completed: u64 = observations
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .filter(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .map(|row| row.completed)
         .sum();
     assert_eq!(joint_completed, 1, "the clean Joint sign attributes");
@@ -21087,9 +21117,9 @@ fn key_operation_lost_record_counts_and_siblings_continue() {
         observations.unattributed
     );
     let joint_completed: u64 = observations
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .filter(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .map(|row| row.completed)
         .sum();
     assert_eq!(joint_completed, 2, "both Joint signs attribute");
@@ -21149,4 +21179,56 @@ fn key_operation_schema_v3_pins_unattributed_contract() {
                 .collect()
         )
     );
+}
+
+/// The v4 schema file mirrors the frozen contract tables: same
+/// section keys as v3 (unattributed required, possibly empty), the
+/// version constant 4, and the metadata enum extended by exactly
+/// the `unknown` first-observed label.
+#[test]
+fn key_operation_schema_v4_pins_unknown_metadata_contract() {
+    use crate::key_operation_projection::contract::{
+        METADATA_LABELS, METADATA_LABELS_V4, SECTION_KEYS_V3,
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v4.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 4);
+    assert_eq!(
+        required("/required"),
+        sorted(SECTION_KEYS_V3.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        required("/$defs/metadata_label/enum"),
+        sorted(
+            METADATA_LABELS_V4
+                .iter()
+                .map(|label| label.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(METADATA_LABELS_V4.len(), METADATA_LABELS.len() + 1);
+    assert_eq!(METADATA_LABELS_V4[12], "unknown");
 }

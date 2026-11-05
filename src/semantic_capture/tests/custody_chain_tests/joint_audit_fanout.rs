@@ -21477,8 +21477,9 @@ fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMome
             .registry()
             .keyuse_for_test()
             .aggregates()
-            .is_empty(),
-        "neither colliding provider receives object proof after disclosed loss"
+            .values()
+            .all(|counters| counters.completed == 0 && counters.active == 0),
+        "neither colliding provider receives completed object proof after disclosed loss"
     );
     let roles = fixture
         .scene

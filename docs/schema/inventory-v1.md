@@ -864,19 +864,26 @@ contracts are
 [inventory-v1-object-observations-v2.schema.json](inventory-v1-object-observations-v2.schema.json)
 (section version 2) and
 [inventory-v1-object-observations-v3.schema.json](inventory-v1-object-observations-v3.schema.json)
-(section version 3); consumers must reject unknown section versions,
+(section version 3) and
+[inventory-v1-object-observations-v4.schema.json](inventory-v1-object-observations-v4.schema.json)
+(section version 4); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 3 iff an `unattributed` counter is
-  present, else 2 iff a KEM creation
-  (`encapsulate`, `decapsulate`) or role (`encapsulation_key`,
-  `decapsulation_key`) label is present, otherwise byte-stable 1.
-  Versions 1 and 2 are frozen; version 1 never carries KEM labels and
-  neither carries `unattributed`. A feed that fell back or lost
+- `version` follows the content: 4 iff a key row carries the
+  `unknown` metadata label (a first-observed key — first seen before
+  attach — whose type/size were never established in the observed
+  window; its identity and counts are proved, no label is guessed),
+  else 3 iff an `unattributed` counter is present, else 2 iff a KEM
+  creation (`encapsulate`, `decapsulate`) or role
+  (`encapsulation_key`, `decapsulation_key`) label is present,
+  otherwise byte-stable 1. Versions 1, 2 and 3 are frozen; version 1
+  never carries KEM labels and neither 1 nor 2 carries
+  `unattributed`; version 4 always carries `unattributed` (possibly
+  empty). A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
   (`{reason, count}`, finite reasons, frozen order); the section is

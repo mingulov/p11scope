@@ -35,6 +35,16 @@ pub(crate) const OBSERVATIONS_VERSION_V2: u8 = 2;
 /// counters. The renderer emits v3 only when at least one count is
 /// nonzero; fully attributed output stays byte-stable v1/v2.
 pub(crate) const OBSERVATIONS_VERSION_V3: u8 = 3;
+/// Section version 4: v3 vocabulary plus the `unknown` metadata
+/// label on per-key rows (DEMO-4 late attach: a first-observed key
+/// whose type/size were never established in the observed window).
+/// The renderer emits v4 only when such a row is present; the
+/// `unattributed` key is then always present (possibly empty).
+pub(crate) const OBSERVATIONS_VERSION_V4: u8 = 4;
+/// The metadata label of a first-observed key at use: its identity
+/// and counts are proved, its type/size are not (first seen before
+/// attach). Frozen v4 vocabulary; never a guessed label.
+pub(crate) const METADATA_UNKNOWN: &str = "unknown";
 
 /// Finite not-attributed reasons, in publication order. Each counts
 /// calls that carry no per-key row, with the reason no key could be
@@ -175,6 +185,25 @@ pub(crate) mod contract {
         "ec_p256",
         "ec_p384",
         "ec_p521",
+    ];
+
+    /// H9 section v4 metadata vocabulary: the 12 established labels
+    /// plus `unknown` (a first-observed key whose type/size were
+    /// never established in the observed window).
+    pub(crate) const METADATA_LABELS_V4: [&str; 13] = [
+        "rsa_1024",
+        "rsa_2048",
+        "rsa_3072",
+        "rsa_4096",
+        "rsa_other",
+        "aes_128",
+        "aes_192",
+        "aes_256",
+        "aes_other",
+        "ec_p256",
+        "ec_p384",
+        "ec_p521",
+        "unknown",
     ];
 
     /// Frozen operation categories: 11 machine operations, 9 direct
@@ -774,12 +803,20 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
     })
 }
 
-/// The H9 section version for these observations: v3 iff a
+/// The H9 section version for these observations: v4 iff a key row
+/// carries the `unknown` metadata label, else v3 iff a
 /// not-attributed count is present, else v2 iff a KEM creation or
 /// role label is present, otherwise v1. The single version
 /// authority behind the JSON section, the JSONL row payloads and
 /// the pass marker.
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if observations
+        .key_operations
+        .iter()
+        .any(|row| row.metadata_at_use == METADATA_UNKNOWN)
+    {
+        return OBSERVATIONS_VERSION_V4;
+    }
     if !observations.unattributed.is_empty() {
         return OBSERVATIONS_VERSION_V3;
     }
@@ -828,7 +865,7 @@ pub(crate) fn object_observations_json(observations: &ObjectObservations) -> ser
         },
         "budgets": budgets_json(&observations.budgets),
     });
-    if version == OBSERVATIONS_VERSION_V3
+    if version >= OBSERVATIONS_VERSION_V3
         && let Some(map) = section.as_object_mut()
     {
         map.insert(

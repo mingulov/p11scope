@@ -601,6 +601,7 @@ enum DeferredInput {
         metadata: super::KeyMetadataFlags,
         label: Option<super::KeyLabel>,
         attribution_valid: bool,
+        first_observed: bool,
         lost: bool,
     },
 }
@@ -2546,6 +2547,10 @@ impl ModelState {
                                     label: self.resolved_label(id),
                                     attribution_valid: view.attribution
                                         == super::Attribution::Valid,
+                                    first_observed: matches!(
+                                        view.origin,
+                                        ViewOrigin::FirstObserved
+                                    ),
                                     lost: false,
                                 },
                                 // The binding names a view the model no
@@ -2905,6 +2910,7 @@ impl ModelState {
         let metadata = Self::metadata_flags_of(view);
         let label = self.resolved_label(id);
         let attribution_valid = view.attribution == super::Attribution::Valid;
+        let first_observed = matches!(view.origin, ViewOrigin::FirstObserved);
         if let Some(view) = self.objects.get_mut(&id) {
             view.references = view.references.saturating_add(1);
             if key_use {
@@ -2919,6 +2925,7 @@ impl ModelState {
                 metadata,
                 label,
                 attribution_valid,
+                first_observed,
             });
         }
     }
@@ -4401,6 +4408,7 @@ impl ModelState {
                 metadata,
                 label,
                 attribution_valid,
+                first_observed,
                 lost: false,
             } = input
             else {
@@ -4421,6 +4429,7 @@ impl ModelState {
                 metadata: *metadata,
                 label: *label,
                 attribution_valid: *attribution_valid,
+                first_observed: *first_observed,
             });
         }
         effects
@@ -5041,8 +5050,13 @@ mod tests {
                 metadata,
                 label,
                 attribution_valid,
+                first_observed,
                 lost,
             } => {
+                assert_eq!(
+                    first_observed,
+                    matches!(view.origin, ViewOrigin::FirstObserved)
+                );
                 assert_eq!(object, fx.object);
                 assert!(key_use, "access input is a key use");
                 assert_eq!(metadata, ModelState::metadata_flags_of(&view));
@@ -6216,6 +6230,7 @@ mod tests {
                     metadata,
                     label,
                     attribution_valid,
+                    first_observed: _,
                 } => Some((
                     *call,
                     *object,

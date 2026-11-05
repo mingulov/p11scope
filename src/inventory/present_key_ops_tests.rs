@@ -262,6 +262,28 @@ fn key_ops_line_counts_not_attributed_beside_exact_rows() {
     );
 }
 
+/// DEMO-4: a first-observed key row under the `unknown` metadata
+/// label reads in text as type unknown / first seen before attach,
+/// beside the exact tallies.
+#[test]
+fn key_ops_line_names_unknown_type_first_seen_before_attach() {
+    let mut observations = populated(9);
+    let mut row = key_row("sign", "key", 2, 0, 0, "operations");
+    row.metadata_at_use = "unknown";
+    observations.key_operations.push(row);
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let line = key_ops_line(&snapshot);
+    assert!(
+        line.contains("sign 2 completed, 0 failed, 0 active operations"),
+        "the tallies stay exact: {line}"
+    );
+    assert!(
+        line.ends_with("; type unknown: first seen before attach (1 key row)"),
+        "the unknown type is named, never guessed: {line}"
+    );
+}
+
 #[test]
 fn key_ops_line_journal_unavailable_names_tracking_off() {
     let presentation =

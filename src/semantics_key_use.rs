@@ -1566,6 +1566,28 @@ fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
     Some(metadata_label(label))
 }
 
+/// The metadata label a receipt rows under: its usable established
+/// label, or — for a first-observed object (DEMO-4 late attach: the
+/// key's creation/lookup predates the observed window) with valid
+/// attribution and no established label and no metadata conflict —
+/// the honest `unknown` label. The per-key row is kept with the
+/// object id and its exact counts; no type or size is guessed.
+/// Later learned metadata never rewrites this snapshot: a later use
+/// after an established attribute read buckets under its own label.
+fn row_label(receipt: &KeyReceipt) -> Option<&'static str> {
+    if let Some(label) = usable_label(receipt) {
+        return Some(label);
+    }
+    if receipt.first_observed
+        && receipt.attribution_valid
+        && receipt.label.is_none()
+        && receipt.metadata.conflicted == 0
+    {
+        return Some(crate::key_operation_projection::METADATA_UNKNOWN);
+    }
+    None
+}
+
 /// The unknown reason for an unusable label: any conflict at use
 /// reports conflicting, otherwise unknown.
 fn metadata_reason(receipt: &KeyReceipt) -> &'static str {
@@ -2331,7 +2353,7 @@ impl KeyUseReducer {
         let mut slots = [ResolvedAssoc::NONE; 2];
         let mut len = 0usize;
         for (index, receipt) in receipts.iter().enumerate().take(slots.len()) {
-            let bucket = match usable_label(receipt) {
+            let bucket = match row_label(receipt) {
                 Some(label) => AssocBucket::Proved(AggKey {
                     instance,
                     object: receipt.key.as_u64(),
@@ -2475,6 +2497,7 @@ impl KeyUseReducer {
                 metadata,
                 label,
                 attribution_valid,
+                first_observed,
                 ..
             } = effect
             else {
@@ -2496,6 +2519,7 @@ impl KeyUseReducer {
                 metadata: *metadata,
                 label: *label,
                 attribution_valid: *attribution_valid,
+                first_observed: *first_observed,
                 lost: false,
             });
         }

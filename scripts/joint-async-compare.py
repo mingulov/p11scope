@@ -51,6 +51,9 @@ CATEGORY = "operation"
 ROLE = "key"
 LABELS = {"rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
           "aes_192", "aes_256", "aes_other", "ec_p256", "ec_p384", "ec_p521"}
+# H9 section v4 (DEMO-4 late attach): a first-observed key whose
+# type/size were never established rows under "unknown".
+LABELS_V4 = LABELS | {"unknown"}
 CATEGORIES = {"digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt",
               "message_sign", "message_verify", "generate_key",
@@ -68,7 +71,7 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2, 3)
+SNAPSHOT_VERSIONS = (1, 2, 3, 4)
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -491,7 +494,7 @@ def _check_counters(row, names, where):
         _require(_integer(row[name]), f"{where}: {name} out of range")
 
 
-def _check_key_row(row, where, roles=ROLES):
+def _check_key_row(row, where, roles=ROLES, labels=LABELS):
     _require(type(row) is dict, f"{where}: key row must be an object")
     _keys(row, {"instance", "object", "category", "role", "metadata_at_use",
                 "unit"} | set(KEY_COUNTERS))
@@ -501,7 +504,7 @@ def _check_key_row(row, where, roles=ROLES):
     _require(_integer(row["object"]), f"{where}: key row object out of range")
     _require(row["category"] in CATEGORIES, f"{where}: key row category invalid")
     _require(row["role"] in roles, f"{where}: key row role invalid")
-    _require(row["metadata_at_use"] in LABELS,
+    _require(row["metadata_at_use"] in labels,
              f"{where}: key row metadata_at_use invalid")
     _require(row["unit"] in UNITS, f"{where}: key row unit invalid")
     want_unit = ("message_contexts" if row["category"].startswith("message_")
@@ -558,6 +561,14 @@ def _snapshot_roles(document, tag):
     return ROLES_V2 if version >= 2 else ROLES
 
 
+def _snapshot_labels(document, tag):
+    """Metadata vocabulary governed by the snapshot's section version."""
+    version = document["version"]
+    _require(type(version) is int and version in SNAPSHOT_VERSIONS,
+             f"{tag}: snapshot version mismatch")
+    return LABELS_V4 if version >= 4 else LABELS
+
+
 def _snapshot_creations(document, tag):
     """Creation vocabulary governed by the snapshot's section version."""
     version = document["version"]
@@ -593,14 +604,21 @@ UNATTRIBUTED_REASONS = ("started_before_attach", "record_lost",
 
 
 def _check_unattributed(document, tag):
-    """Validate v3 not-attributed counters: present iff version 3."""
-    if document["version"] != 3:
+    """Validate not-attributed counters: present iff version >= 3.
+
+    Version 3 requires a nonempty list (it is emitted iff a count
+    exists); version 4 always carries the key and it may be empty.
+    """
+    version = document["version"]
+    if version not in (3, 4):
         _require("unattributed" not in document,
                  f"{tag}: unattributed counters before section version 3")
         return
     rows = document["unattributed"]
-    _require(type(rows) is list and 1 <= len(rows) <= len(UNATTRIBUTED_REASONS),
-             f"{tag}: snapshot unattributed must be a nonempty bounded list")
+    _require(type(rows) is list
+             and (0 if version >= 4 else 1) <= len(rows)
+             <= len(UNATTRIBUTED_REASONS),
+             f"{tag}: snapshot unattributed must be a bounded list")
     order = []
     for position, row in enumerate(rows):
         where = f"{tag}: snapshot unattributed {position}"
@@ -620,11 +638,12 @@ def validate_snapshot(document, tag):
     keys = {"version", "revision", "status", "reason", "sessions",
             "objects", "key_operations", "unknown_key_operations",
             "gaps", "budgets"}
-    if type(document) is dict and document.get("version") == 3:
+    if type(document) is dict and document.get("version") in (3, 4):
         keys |= {"unattributed"}
     _keys(document, keys)
     _check_unattributed(document, tag)
     roles = _snapshot_roles(document, tag)
+    labels = _snapshot_labels(document, tag)
     creations = _snapshot_creations(document, tag)
     _require(_integer(document["revision"]), f"{tag}: snapshot revision out of range")
     _require(document["status"] in STATUSES, f"{tag}: snapshot status invalid")
@@ -658,7 +677,7 @@ def validate_snapshot(document, tag):
     _require(type(document["key_operations"]) is list,
              f"{tag}: snapshot key_operations must be a list")
     known_keys = [_check_key_row(row, f"{tag} snapshot key row {position}",
-                                      roles)
+                                      roles, labels)
                   for position, row in enumerate(document["key_operations"])]
     _check_sorted_unique(known_keys, f"{tag} snapshot key rows")
     _require(type(document["unknown_key_operations"]) is list,
@@ -848,6 +867,7 @@ def compare_joint(collision, snapshot):
     """
     owner, challenger = collision["owner"], collision["challenger"]
     roles = _snapshot_roles(snapshot, "joint")
+    labels = _snapshot_labels(snapshot, "joint")
     _require(snapshot["gaps"]["suppressed"] == 0,
              f"joint snapshot gaps suppressed"
              f" {_shown(snapshot['gaps']['suppressed'])} hides dispositions")
@@ -864,7 +884,8 @@ def compare_joint(collision, snapshot):
     chal_tally = _challenger_tally(challenger, collision)
     known = {}
     for row in snapshot["key_operations"]:
-        known[_check_key_row(row, "joint snapshot key row", roles)] = row
+        known[_check_key_row(row, "joint snapshot key row", roles,
+                              labels)] = row
     unknown = {}
     for row in snapshot["unknown_key_operations"]:
         unknown[_check_unknown_row(row, "joint snapshot unknown row")] = row
@@ -1104,11 +1125,13 @@ def compare_stream(events, collision, snapshot, view):
             version = _row_event_version(event, where,
                                          {"revision", "bucket", "row"})
             roles, _ = _row_vocabularies(version)
+            labels = LABELS_V4 if version >= 4 else LABELS
             _require(_integer(event["revision"]), f"{where}: revision out of range")
             _require(event["bucket"] in ("known", "unknown"),
                      f"{where}: bucket invalid")
             if event["bucket"] == "known":
-                key = ("known", _check_key_row(event["row"], where, roles))
+                key = ("known", _check_key_row(event["row"], where, roles,
+                                                labels))
             else:
                 key = ("unknown", _check_unknown_row(event["row"], where))
             series.setdefault(key, []).append(

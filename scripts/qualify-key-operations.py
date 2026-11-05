@@ -66,6 +66,7 @@ INVENTORY_SCHEMA = "p11scope/inventory/v1"
 OBSERVATIONS_VERSION = 1
 OBSERVATIONS_VERSION_V2 = 2
 OBSERVATIONS_VERSION_V3 = 3
+OBSERVATIONS_VERSION_V4 = 4
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -99,6 +100,12 @@ QUERY_STATUSES = ("not_queried", "established", "unavailable", "size_only", "uns
                   "malformed", "excluded")
 METADATA_LABELS = ("rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
                    "aes_192", "aes_256", "aes_other", "ec_p256", "ec_p384", "ec_p521")
+# H9 section v4 (DEMO-4 late attach): a first-observed key whose
+# type/size were never established rows under "unknown". The
+# qualification cells still demand the exact CELL_METADATA below;
+# v4 is accepted structurally so such a section fails by name,
+# never as an unsupported version.
+METADATA_LABELS_V4 = METADATA_LABELS + ("unknown",)
 CATEGORIES = ("digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt", "message_sign",
               "message_verify", "generate_key", "generate_key_pair", "wrap", "unwrap",
@@ -361,7 +368,7 @@ def _check_objects(rows, sessions, creations):
     return ids
 
 
-def _check_key_row(row, objects, roles):
+def _check_key_row(row, objects, roles, labels=METADATA_LABELS):
     _keys(row, KEY_ROW_KEYS)
     _require(type(row["instance"]) is str and INSTANCE_RE.fullmatch(row["instance"]) is not None,
              "unexpected instance label")
@@ -369,7 +376,7 @@ def _check_key_row(row, objects, roles):
     _require(row["object"] in objects, f"key row references unknown object {row['object']}")
     category = _label(row["category"], CATEGORIES, "operation category")
     role = _label(row["role"], roles, "operation role")
-    metadata = _label(row["metadata_at_use"], METADATA_LABELS, "operation metadata")
+    metadata = _label(row["metadata_at_use"], labels, "operation metadata")
     unit = _label(row["unit"], UNITS, "operation unit")
     counters = {name: row[name] for name in
                 ("started", "completed", "failed", "cancelled", "unknown", "active",
@@ -441,9 +448,11 @@ def _check_budgets(budgets, key_len, object_len, unknown_len):
     _require(budgets["refusal_reason"] == "none", "unexpected budget refusal reason")
 
 
-def _check_unattributed(rows):
-    """Validate v3 not-attributed counters: frozen order, counts only."""
-    _require(type(rows) is list and 1 <= len(rows) <= len(UNATTRIBUTED_REASONS),
+def _check_unattributed(rows, allow_empty=False):
+    """Validate not-attributed counters: frozen order, counts only."""
+    _require(type(rows) is list
+             and (0 if allow_empty else 1) <= len(rows)
+             <= len(UNATTRIBUTED_REASONS),
              "invalid unattributed rows")
     checked = []
     order = []
@@ -462,16 +471,21 @@ def _check_unattributed(rows):
 def check_section(section):
     """Validate the section shape and return the checked facts."""
     version = section.get("version") if type(section) is dict else None
-    _keys(section, SECTION_KEYS_V3 if version == OBSERVATIONS_VERSION_V3
+    _keys(section, SECTION_KEYS_V3
+          if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
-                             OBSERVATIONS_VERSION_V3),
+                             OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
-    unattributed = (_check_unattributed(section["unattributed"])
-                    if version == OBSERVATIONS_VERSION_V3 else [])
+    labels = (METADATA_LABELS_V4 if version >= OBSERVATIONS_VERSION_V4
+              else METADATA_LABELS)
+    unattributed = (_check_unattributed(
+                        section["unattributed"],
+                        allow_empty=version >= OBSERVATIONS_VERSION_V4)
+                    if version >= OBSERVATIONS_VERSION_V3 else [])
     _require(_u64(section["revision"]), "invalid observations revision")
     status = _label(section["status"], STATUSES, "status")
     reason = _label(section["reason"], REASONS, "reason")
@@ -482,7 +496,7 @@ def check_section(section):
     order = []
     _require(type(section["key_operations"]) is list, "unexpected fields")
     for row in section["key_operations"]:
-        category, counters = _check_key_row(row, objects, roles)
+        category, counters = _check_key_row(row, objects, roles, labels)
         key = (row["instance"], row["object"], category, row["role"], row["metadata_at_use"])
         _require(key not in tallies, "duplicate key row")
         tallies[key] = (category, counters)

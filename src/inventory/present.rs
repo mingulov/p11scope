@@ -1472,6 +1472,27 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                     .collect();
                 format!("; not attributed: {}", parts.join(", "))
             };
+            // First-observed keys with unestablished type keep their
+            // rows under the `unknown` metadata label (DEMO-4): say
+            // so beside the tallies, counts only, never a guessed
+            // label.
+            let unknown_type_suffix = {
+                let rows = observations
+                    .key_operations
+                    .iter()
+                    .filter(|row| {
+                        row.metadata_at_use == crate::key_operation_projection::METADATA_UNKNOWN
+                    })
+                    .count();
+                if rows == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        "; type unknown: first seen before attach ({rows} key row{})",
+                        if rows == 1 { "" } else { "s" }
+                    )
+                }
+            };
             let tallies = key_operation_tallies(observations);
             if tallies.is_empty() {
                 line.push_str("no key operations observed");
@@ -1488,6 +1509,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                     .collect();
                 line.push_str(&parts.join("; "));
                 line.push_str(&unattributed_suffix);
+                line.push_str(&unknown_type_suffix);
             }
             let _ = writeln!(out, "{line}");
         }

@@ -15271,6 +15271,59 @@ fn key_operation_joint_seal_delivery_replays_and_populates_capture() {
 /// N1: failure delivery disposes retained staging, degrades the feed
 /// to S1Only, releases the guard — and still retains the H8
 /// projection for capture.
+/// No-projection loss arm, the loss-before-first-delivery twin of
+/// `key_operation_joint_failure_delivery_retains_projection`: semantic
+/// loss lands on a Joint feed holding one staged call before any
+/// delivery, so no projection exists. The section names the loss as
+/// partial with the disposed call counted once, never bootstrap
+/// silence and never a guessed row.
+#[test]
+fn key_operation_loss_before_first_delivery_names_authority_lost() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.scene.adapter.ledger().staged(), 1);
+    assert_eq!(g.registry.feed_mode_for_test(id), Some(FeedMode::Joint));
+    assert_eq!(
+        g.registry.joint_observations(1).status,
+        ObsStatus::Unavailable,
+        "nothing delivered or lost yet"
+    );
+    let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
+    g.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(key.clone()),
+        position(g.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    let after = g.registry.joint_observations(2);
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "{:?}",
+        after.unattributed
+    );
+    assert_eq!(
+        after
+            .unattributed
+            .iter()
+            .map(|row| (row.reason, row.count))
+            .collect::<Vec<_>>(),
+        vec![("record_lost", 1)],
+        "the staged call counts once"
+    );
+    assert!(after.key_operations.is_empty(), "no row is guessed");
+}
+
 #[test]
 fn key_operation_joint_failure_delivery_retains_projection() {
     let mut guarded = GuardedScene::new();

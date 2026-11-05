@@ -419,6 +419,13 @@ SELECTED_DETAIL_ROW_BASE_KEYS = {
     "rv_counts",
 }
 SELECTED_DETAIL_LATENCY_BUCKETS = 32
+# --exclude-module reporting (additive, present only when the flag is
+# passed; omitted when empty): excluded_modules lists one row per
+# distinct excluded file, unmatched_excludes lists inputs that matched
+# nothing. Producer: src/render.rs DiscoveryEvidence (flattened into
+# evidence); schema: docs/schema/observed-profile-v3.schema.json. Never
+# feeds verdicts or completeness (a declared choice, not a loss).
+EXCLUDED_MODULE_KEYS = {"path", "dev", "ino", "processes"}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "kernel_control", "attach_backend", "object_capture",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
@@ -1005,6 +1012,12 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "selected_detail" in evidence:
         wanted.add("selected_detail")
         exact_selected_detail(evidence["selected_detail"])
+    if not historical and not terminal and "excluded_modules" in evidence:
+        wanted.add("excluded_modules")
+        exact_excluded_modules(evidence["excluded_modules"])
+    if not historical and not terminal and "unmatched_excludes" in evidence:
+        wanted.add("unmatched_excludes")
+        exact_unmatched_excludes(evidence["unmatched_excludes"])
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
@@ -1016,6 +1029,27 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
+
+
+def exact_excluded_modules(value):
+    """The additive --exclude-module hit list: one closed row per distinct
+    excluded file (fstat identity plus the in-scope process count)."""
+    require(isinstance(value, list), f"excluded_modules must be an array: {value!r}")
+    for row in value:
+        exact_keys(row, EXCLUDED_MODULE_KEYS, "excluded_modules row")
+        require(isinstance(row["path"], str) and row["path"],
+                f"invalid excluded_modules.path: {row!r}")
+        require(u64(row["dev"]), f"invalid excluded_modules.dev: {row!r}")
+        require(u64(row["ino"]), f"invalid excluded_modules.ino: {row!r}")
+        require(u64(row["processes"], positive=True),
+                f"invalid excluded_modules.processes: {row!r}")
+
+
+def exact_unmatched_excludes(value):
+    """The additive --exclude-module miss list: operator inputs that matched
+    no mapped file, in operator order."""
+    require(isinstance(value, list) and all(isinstance(item, str) for item in value),
+            f"unmatched_excludes must be a string array: {value!r}")
 
 
 def exact_counter_collection(collection):

@@ -3473,7 +3473,7 @@ fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
          (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a prefix \
          of its 64 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
          when mapped before the capture's first plan, or as published tables)";
-    let prefix = "2 of 64 template tables attached; calls through the others are not counted";
+    let prefix = "2 of 64 template tables attached; calls through the others are not counted (closure_prefix)";
     assert!(
         plan::is_closure_array_refusal(whole),
         "whole refusal recognized"

@@ -6583,7 +6583,7 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/p11-kit-client.so".into(),
-            reason: "4 of 64 template tables attached; calls through the others are not counted"
+            reason: "4 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
                 .into(),
         });
         ev.verdict();

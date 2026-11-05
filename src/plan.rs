@@ -323,9 +323,12 @@ pub(crate) fn is_closure_awaiting_publication(reason: &str) -> bool {
 
 /// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
 /// proxy closure array: some leading templates attached, the rest not
-/// counted. Partially covered, never a whole refusal.
+/// counted. Partially covered, never a whole refusal. The tag is
+/// required beside the counted phrase: whole refusals interpolate
+/// holder paths verbatim, and a path may name the phrase.
 pub(crate) fn is_closure_array_prefix(reason: &str) -> bool {
     reason.contains("template tables attached; calls through the others are not counted")
+        && reason.contains("(closure_prefix)")
 }
 
 /// Whether a `modules_skipped` reason records a JK-22a prefix-admitted

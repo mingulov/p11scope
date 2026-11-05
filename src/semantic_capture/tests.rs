@@ -2352,6 +2352,54 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
     harness.ingest(quiet, &admitted);
 }
 
+/// DEMO-4 late attach at the H0 seam: the same already-present
+/// provider whose exec-marker birth refuses above (unpublished
+/// marker, no committed absence) births as attach-observed from
+/// its first New candidate — the witness proves custody, image
+/// and cut under the live closure, and claims nothing before the
+/// cut. ExecMarker observation itself still refuses closed (the
+/// twins around this test pin that).
+#[test]
+fn joint_attach_birth_for_already_present_provider() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (mut report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+    let mut rows = NativeBirthRows { row, control };
+    let candidate = report
+        .take_current()
+        .pop()
+        .unwrap()
+        .into_birth_candidate()
+        .unwrap_or_else(|_| panic!("actual first H0 New candidate"));
+    harness
+        .capture
+        .validate_birth_candidate(&mut harness.io, &candidate, false)
+        .unwrap();
+    let witness = harness
+        .capture
+        .finish_birth(
+            candidate,
+            None,
+            &admitted,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &proof,
+            &harness.adapter,
+            &mut rows,
+        )
+        .expect("an already-present provider births as attach-observed");
+    assert_eq!(
+        witness.receipt().birth(),
+        crate::semantics_objects::journal::BirthKind::AttachObserved
+    );
+}
+
 #[test]
 fn joint_exec_marker_birth_without_publication_refuses_closed() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};

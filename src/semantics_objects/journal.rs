@@ -11502,6 +11502,61 @@ pub(crate) mod tests {
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
     }
 
+    /// DEMO-4 late attach: an image already affecting provider
+    /// state before the cut (the already-running browser) can never
+    /// birth as exec or absence, but births as attach-observed at
+    /// the cut and seals calls that start after it. The birth
+    /// claims nothing about pre-cut history. A tainted or
+    /// never-sighted image still refuses, and an audit failure
+    /// after the cut breaks the attach chain.
+    #[test]
+    fn object_journal_attach_birth_for_preexisting_image() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let sign = function_id("C_Sign");
+        let begin = begin_bytes(1, 1, create, 0);
+        let mut affecting = ordinary_for(&begin, 0);
+        affecting.slot = 99;
+        affecting.target_function = sign;
+        scene.ingest_ordinary(affecting);
+        scene.ingest(&begin);
+        // Exec and absence keep refusing this history (pinned above);
+        // attach-observed attests at the same cut.
+        let birth = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::AttachObserved,
+                1,
+                scene.closure_generation(),
+            ),
+        )
+        .expect("pre-existing image births as attach-observed");
+        assert_eq!(birth.birth(), BirthKind::AttachObserved);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let success = scene.seal(&birth).expect("attach birth seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+
+        // Zero observed history still proves nothing.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        assert_eq!(
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::AttachObserved,
+                    0,
+                    scene.closure_generation()
+                )
+            ),
+            Err(BirthRefusal::ImageUnknown)
+        );
+    }
+
     #[test]
     fn object_journal_absence_birth_requires_clean_chain() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;

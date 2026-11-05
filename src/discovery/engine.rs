@@ -7449,6 +7449,31 @@ fn place_count_only_seed(candidate: &mut LiveCandidate, seed: &CountOnlySeedWork
     }
 }
 
+impl Engine {
+    /// Places one loader batch's count-only seeds, folding the cycle's
+    /// required-complete: terminal and placed seeds keep it, a partial
+    /// seed clears it and marks its named gap. The pause-completeness
+    /// twin pins both arms: an unpublished closure alone never poisons
+    /// the cycle, and a solver-selected loss always does.
+    fn place_count_only_seeds(
+        &mut self,
+        candidate: &mut LiveCandidate,
+        seeds: &[CountOnlySeedWork],
+        mut required_complete: bool,
+    ) -> bool {
+        for seed in seeds {
+            match place_count_only_seed(candidate, seed) {
+                SeedPlacement::Terminal | SeedPlacement::Placed => {}
+                SeedPlacement::Partial(why) => {
+                    required_complete = false;
+                    self.mark_partial("live export hook", why);
+                }
+            }
+        }
+        required_complete
+    }
+}
+
 /// The `discovery[]` record: what was found, where it was found, and how well
 /// the two sources agreed. Identity is `{dev, ino, sha256}` — a path here is
 /// only the label the source that saw it used, and for anything the scan found
@@ -17005,16 +17030,11 @@ impl Engine {
             terminal_owner.is_some(),
             terminal_exports,
         );
-        let mut required_seed_complete = collected.required_seed_complete;
-        for seed in &collected.count_only_seeds {
-            match place_count_only_seed(&mut candidate, seed) {
-                SeedPlacement::Terminal | SeedPlacement::Placed => {}
-                SeedPlacement::Partial(why) => {
-                    required_seed_complete = false;
-                    self.mark_partial("live export hook", why);
-                }
-            }
-        }
+        let required_seed_complete = self.place_count_only_seeds(
+            &mut candidate,
+            &collected.count_only_seeds,
+            collected.required_seed_complete,
+        );
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);

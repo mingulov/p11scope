@@ -3982,16 +3982,13 @@ fn start_gate_falls_back_to_gap_text_for_hand_built_plans() {
     assert!(error.contains("nothing to attach"), "{error}");
 }
 
-/// A loader cycle whose only incompleteness is an unpublished closure
-/// completes: the awaiting seed places terminal, never partial.
-#[test]
-fn loader_seed_for_an_unpublished_closure_places_terminal() {
+fn unpublished_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
     let published_source = p11kit_like_64_table_module();
     let mut closure = published_source.clone();
     closure.interfaces.clear();
     let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
     let mut engine = Engine::empty();
-    let mut candidate = engine
+    let candidate = engine
         .live_candidate(pins, vec![closure.clone()], Vec::new())
         .expect("the unpublished rebuild");
     let object = candidate
@@ -4008,6 +4005,14 @@ fn loader_seed_for_an_unpublished_closure_places_terminal() {
         object_path: closure.path.clone(),
         file_offset: 0x10000,
     };
+    (engine, candidate, seed)
+}
+
+/// A loader cycle whose only incompleteness is an unpublished closure
+/// completes: the awaiting seed places terminal, never partial.
+#[test]
+fn loader_seed_for_an_unpublished_closure_places_terminal() {
+    let (_, mut candidate, seed) = unpublished_closure_seed();
     assert_eq!(
         place_count_only_seed(&mut candidate, &seed),
         SeedPlacement::Terminal,
@@ -4015,10 +4020,7 @@ fn loader_seed_for_an_unpublished_closure_places_terminal() {
     );
 }
 
-/// ...but a seed the solver selected aside stays partial: the exemption
-/// never masks a solver-selected loss.
-#[test]
-fn loader_seed_for_a_refused_closure_stays_partial() {
+fn refused_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
     let published_source = p11kit_like_64_table_module();
     let closure = published_source.clone();
     let crowded = p11scope_ebpf_common::MAX_SLOTS - 312;
@@ -4034,7 +4036,7 @@ fn loader_seed_for_a_refused_closure_stays_partial() {
     let mut engine = Engine::empty();
     let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
     let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
-    let mut candidate = engine
+    let candidate = engine
         .live_candidate(candidate_pins, vec![published, provider], skipped)
         .expect("the crowded rebuild");
     let object = candidate
@@ -4059,12 +4061,54 @@ fn loader_seed_for_a_refused_closure_stays_partial() {
         object_path: closure.path.clone(),
         file_offset: 0x10000,
     };
+    (engine, candidate, seed)
+}
+
+/// ...but a seed the solver selected aside stays partial: the exemption
+/// never masks a solver-selected loss.
+#[test]
+fn loader_seed_for_a_refused_closure_stays_partial() {
+    let (_, mut candidate, seed) = refused_closure_seed();
     assert!(
         matches!(
             place_count_only_seed(&mut candidate, &seed),
             SeedPlacement::Partial(_)
         ),
         "the refused closure's seed stays partial"
+    );
+}
+
+/// The pause-completeness twin: terminal seeds never poison the cycle's
+/// required-complete, so a cycle whose only incompleteness is an
+/// unpublished closure completes; a partial seed clears it and marks the
+/// named gap.
+#[test]
+fn loader_terminal_seeds_keep_required_complete() {
+    let (mut engine, mut candidate, seed) = unpublished_closure_seed();
+    let kept = engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(
+        kept,
+        "terminal seeds must not poison the cycle's required-complete"
+    );
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a terminal seed marks no partial gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn loader_partial_seed_clears_required_complete() {
+    let (mut engine, mut candidate, seed) = refused_closure_seed();
+    let kept = engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(
+        !kept,
+        "a partial seed must clear the cycle's required-complete"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "the partial seed marks its named gap"
     );
 }
 

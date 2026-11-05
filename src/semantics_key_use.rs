@@ -170,6 +170,29 @@ pub(crate) enum SealFailureDisposition {
     Retry,
 }
 
+/// Whether a feed whose segment ended with this gap may resume
+/// Joint at its next clean point. Record-level and proof-only
+/// endings are segment-local: fresh seals can prove a later
+/// segment. Endings that name the authority itself — a tainted or
+/// ended domain/image, a mismatched or invalidated birth, a
+/// stopped adapter, or a faulted journal — have no clean point on
+/// this feed; only a new birth (a new feed) can attribute again.
+pub(crate) fn segment_resumable_after(gap: JournalGap) -> bool {
+    use JournalGap::*;
+    !matches!(
+        gap,
+        DomainTainted
+            | ImageTainted
+            | DomainEnded
+            | AdapterInvalidated
+            | Stopped
+            | BootstrapMismatch
+            | FaultChanged
+            | FaultUnreadable
+            | FaultSaturated
+    )
+}
+
 /// Map one seal gap to its H9 disposition.
 pub(crate) fn disposition_of(gap: JournalGap) -> SealFailureDisposition {
     use JournalGap::*;
@@ -262,6 +285,10 @@ pub(crate) struct JointStaging {
     /// ordinary S1 and degraded to S1Only: the projection reports
     /// `proof_refused_fallback`.
     fell_back: bool,
+    /// Whether the segment that just ended permits a clean-point
+    /// resume (see [`segment_resumable_after`]); ordered fallbacks
+    /// always permit it. Cleared on resume.
+    segment_resumable: bool,
     /// Ledger releases pended by a ledger-less ordered fallback
     /// (C4): flushed on the next ledger contact. One fallback drains
     /// staging, and re-staging after a clean-point resume flushes
@@ -304,6 +331,7 @@ impl JointStaging {
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
+            segment_resumable: false,
             pending_releases: Vec::new(),
         }
     }
@@ -351,10 +379,11 @@ impl JointStaging {
     pub(crate) fn resume_joint(&mut self) -> bool {
         if self.mode == FeedMode::S1Only
             && self.selected_receipt.is_some()
-            && (self.fell_back || self.degraded_loss)
+            && self.segment_resumable
             && self.staged.is_empty()
         {
             self.mode = FeedMode::Joint;
+            self.segment_resumable = false;
             true
         } else {
             false
@@ -876,6 +905,7 @@ impl JointStaging {
             return (FailureBatchProgress::Held, 0);
         }
         let disposition = audited.disposition();
+        let gap = audited.failure().gap;
         let covered = matches!(audited.h3(), H3DispositionEvidence::Clean {
             staged_max, pending_floor: None,
         } if self.covered_by(*staged_max));
@@ -939,6 +969,7 @@ impl JointStaging {
         }
         if self.staged.is_empty() {
             self.mode = FeedMode::S1Only;
+            self.segment_resumable = segment_resumable_after(gap);
             if loss {
                 self.degraded_loss = true;
             } else {
@@ -1001,6 +1032,7 @@ impl JointStaging {
         }
         if self.staged.is_empty() {
             self.mode = FeedMode::S1Only;
+            self.segment_resumable = segment_resumable_after(gap);
             if loss {
                 self.degraded_loss = true;
             } else {
@@ -1117,6 +1149,7 @@ impl JointStaging {
                 );
                 let disposed = self.drain_staged(Some(ledger));
                 self.mode = FeedMode::S1Only;
+                self.segment_resumable = segment_resumable_after(failure.gap);
                 self.degraded_loss = true;
                 (FailureApplyOutcome::Degraded { disposed }, 0)
             }
@@ -1140,6 +1173,7 @@ impl JointStaging {
                             assoc_fallback.as_deref_mut(),
                         );
                         self.mode = FeedMode::S1Only;
+                        self.segment_resumable = segment_resumable_after(failure.gap);
                         self.fell_back = true;
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }
@@ -1157,6 +1191,7 @@ impl JointStaging {
                         );
                         let disposed = self.drain_staged(Some(ledger));
                         self.mode = FeedMode::S1Only;
+                        self.segment_resumable = segment_resumable_after(failure.gap);
                         self.degraded_loss = true;
                         (FailureApplyOutcome::Degraded { disposed }, 0)
                     }
@@ -1265,6 +1300,9 @@ impl JointStaging {
         let (replayed, refused) =
             self.replay_staged(reducer, keyuse, instance, sink, ledger, assoc_fallback);
         self.mode = FeedMode::S1Only;
+        // Ordered fallbacks are local capacity/shape endings: the
+        // next clean point may resume Joint for a fresh segment.
+        self.segment_resumable = true;
         self.fell_back = true;
         (replayed, refused)
     }

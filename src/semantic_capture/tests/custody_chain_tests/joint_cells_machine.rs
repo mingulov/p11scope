@@ -1862,7 +1862,9 @@ fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
         "same_incarnation native_read_refusal observation={:?}/{}",
         observations.status, observations.reason
     );
-    assert_eq!(observations.status, ObsStatus::Unavailable);
+    // The refused segment's retained history publishes as partial,
+    // never a whole-section ending.
+    assert_eq!(observations.status, ObsStatus::Partial);
 
     for (sequences, count) in [([5, 6], 6), ([7, 8], 8)] {
         for sequence in sequences {
@@ -1916,7 +1918,7 @@ fn joint_machine_same_incarnation_native_refusal_retains_s1_history() {
             "same_incarnation s1only_subject audit={audit:?} observation={:?}/{}",
             observations.status, observations.reason
         );
-        assert_eq!(observations.status, ObsStatus::Unavailable);
+        assert_eq!(observations.status, ObsStatus::Partial);
         scene.scene.assert_claims(&[]);
     }
 }

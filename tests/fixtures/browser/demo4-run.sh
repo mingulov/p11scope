@@ -184,8 +184,9 @@ start_observer() {
     observer_pid=$!
 }
 wait_seal() {
+    local limit=${1:-900}
     local waited=0
-    while [ $waited -lt 900 ]; do
+    while [ $waited -lt "$limit" ]; do
         grep -q 'p11scope: semantic lane ready' "$work/inventory.err" 2>/dev/null && return 0
         kill -0 "$observer_pid" 2>/dev/null || return 1
         sleep 1; waited=$((waited+1))
@@ -205,14 +206,22 @@ wait_pidfile() {
 t0=$(date +%s)
 if [ "$MODE" = first ]; then
     start_observer
+    # p11scope starts first, but without a manifest the scan seal
+    # can only mint once a complete provider exists to discover:
+    # give the observer a head start, then launch the browser and
+    # let the seal complete over its softokn, all before the
+    # post-attach signs are signalled.
+    wait_seal 20 || true
+    kill -0 "$observer_pid" 2>/dev/null \
+        || { echo "FAIL observer-exited-before-launch"; tail -15 "$work/inventory.err"; trap - RETURN; exit 1; }
+    : >"$work/launch"
+    wait_pidfile || { trap - RETURN; exit 1; }
     if ! wait_seal; then
         echo "FAIL observer-never-sealed mode=first"
         kill "$observer_pid" "$driver_pid" 2>/dev/null; tail -15 "$work/inventory.err"
         trap - RETURN; exit 1
     fi
     seal_wall=$(( $(date +%s)-t0 ))
-    : >"$work/launch"
-    wait_pidfile || { trap - RETURN; exit 1; }
 else
     # Late attach: the browser runs (and signs) first.
     wait_pidfile || { trap - RETURN; exit 1; }

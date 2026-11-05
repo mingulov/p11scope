@@ -996,6 +996,7 @@ pub(super) mod tests {
         Contended,
         KernelLoss,
         BankGaps,
+        BankQuarantined,
     }
 
     /// The run-loop tests replace I/O only: every successful acquisition still
@@ -1109,6 +1110,15 @@ pub(super) mod tests {
                         });
                         Ok(read)
                     }
+                    Some(ConsumerFault::BankQuarantined) => CounterRead::new(
+                        std::num::NonZeroU64::new(generation).unwrap(),
+                        mode,
+                        ReadWindow::new(Some(30), Some(40)),
+                        Err(CounterIssue::BankQuarantined),
+                        CounterHealth::default(),
+                        KernelEvidence::default(),
+                        ReadReservation::reserve(0, 0, reserve).unwrap(),
+                    ),
                     Some(
                         ConsumerFault::RowTopology
                         | ConsumerFault::RowTopologySaturated
@@ -1414,6 +1424,36 @@ pub(super) mod tests {
         assert_eq!(gaps["bank_gaps"]["failed_slots"], 1);
         assert_eq!(gaps["bank_gaps"]["health_failed"], false);
         assert_eq!(gaps["bank_gaps"]["kernel_failed"], false);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &stale);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn quarantined_bank_publishes_last_good_stale_with_named_failure() {
+        // A quarantined or misrouted bank voids every bank: quarantine is
+        // a directory-global integrity refusal with no per-bank surface,
+        // so the capture publishes last-good stale with the named
+        // failure instead of blanking. Per-bank quarantine partition
+        // needs the bank-authority surface and stays deferred.
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let stale = fixture
+            .fresh(
+                CounterMode::Counts,
+                1,
+                9,
+                Some(ConsumerFault::BankQuarantined),
+            )
+            .expect("a quarantined bank must publish stale, never blank");
+        assert_eq!(stale.reports()[0].calls, 5);
+        assert!(stale.has_counter_gap());
+        let collection = stale.counter_collection().unwrap();
+        assert_eq!(collection["status"], "stale");
+        assert_eq!(collection["failure"], "bank_quarantined");
+        assert!(collection.get("bank_gaps").is_none());
         let mut evidence = crate::render::tests::evidence();
         evidence.verdict();
         crate::render::apply_counter_snapshot(&mut evidence, &stale);

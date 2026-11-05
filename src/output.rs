@@ -1895,7 +1895,47 @@ mod tests {
             .unwrap();
         std::io::Write::write_all(&mut stream, b"line\n").unwrap();
         drop(stream);
+        assert_eq!(std::fs::read(&stream_path).unwrap(), b"line\n");
         assert_handed(&stream_path);
+
+        // Second run: the handed-over stream file is the invoker's own,
+        // so re-creating the stream over it truncates and reuses it
+        // (still handed over, still private) instead of refusing.
+        let mut second = create_private_stream(&stream_path)
+            .unwrap()
+            .begin()
+            .unwrap();
+        std::io::Write::write_all(&mut second, b"second\n").unwrap();
+        drop(second);
+        assert_eq!(
+            std::fs::read(&stream_path).unwrap(),
+            b"second\n",
+            "a second run replaces the handed-over stream content"
+        );
+        assert_handed(&stream_path);
+
+        // Negative twin: a third party's file in the same trusted
+        // directory is still refused, byte for byte.
+        assert_ne!(uid, 65534, "the test needs an invoker distinct from nobody");
+        let foreign_path = user_dir.join("foreign.log");
+        std::fs::write(&foreign_path, b"do not touch\n").unwrap();
+        let foreign = CString::new(foreign_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(foreign.as_ptr(), 65534, 65534) }, 0);
+        let refusal = create_private_stream(&foreign_path).unwrap_err();
+        assert!(
+            refusal.contains("refusing to overwrite"),
+            "a foreign-owned stream file must be refused, got: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read(&foreign_path).unwrap(),
+            b"do not touch\n",
+            "a refused foreign file keeps its bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&foreign_path).unwrap().uid(),
+            65534,
+            "a refused foreign file keeps its owner"
+        );
 
         // Event-log sibling: create, rotate past max_files, evict. Every
         // file is handed over, and eviction of handed-over rotations is

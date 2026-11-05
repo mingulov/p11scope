@@ -3120,7 +3120,11 @@ fn render_object(
                 crate::render::escape_controls(reason),
             );
         }
-        AdmissionRecord::Refused { class, reason, kind } => {
+        AdmissionRecord::Refused {
+            class,
+            reason,
+            kind,
+        } => {
             if *kind == crate::plan::RefusalKind::AwaitingPublication {
                 // By-design refusal: the proxy alone admits nothing until
                 // its providers publish. One plain line; JSON keeps the
@@ -7875,7 +7879,7 @@ mod tests {
                 AdmissionRecord::Refused {
                     class: "closure_array",
                     reason: "module needs 388 more; only 512 attach slots are available".into(),
-               kind: crate::plan::RefusalKind::CapacityWhole,
+                    kind: crate::plan::RefusalKind::CapacityWhole,
                 },
             ),
             object(
@@ -7939,7 +7943,7 @@ mod tests {
                 AdmissionRecord::Refused {
                     class: "closure_array",
                     reason: "module needs 388 more".into(),
-               kind: crate::plan::RefusalKind::CapacityWhole,
+                    kind: crate::plan::RefusalKind::CapacityWhole,
                 },
             ),
             object(
@@ -7996,7 +8000,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
-           kind: crate::plan::RefusalKind::CapacityWhole,
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let text = render_text(&catalog);
@@ -8195,7 +8199,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 6734 more".into(),
-           kind: crate::plan::RefusalKind::CapacityWhole,
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         );
         let mut prefix = table((3, 2), 68);

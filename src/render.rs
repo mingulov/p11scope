@@ -6663,10 +6663,7 @@ pub(crate) mod tests {
         });
         ev.verdict();
         let text = scope_summary("pid", &[self_row, backend_row], &ev);
-        assert!(
-            text.contains("/opt/p11-kit-trust.so: 744 calls"),
-            "{text}"
-        );
+        assert!(text.contains("/opt/p11-kit-trust.so: 744 calls"), "{text}");
         assert!(
             !text.contains("/opt/libp11-kit.so: 500 calls"),
             "the layer must not list itself as a provider below it: {text}"

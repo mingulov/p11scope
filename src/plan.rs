@@ -3872,7 +3872,11 @@ fn merge(
                         counter_hint,
                     }),
                 };
-                refused_module_objects.push((object, omission.clone(), RefusalKind::GrowthOmission));
+                refused_module_objects.push((
+                    object,
+                    omission.clone(),
+                    RefusalKind::GrowthOmission,
+                ));
                 modules_skipped.push(omission);
             }
         }
@@ -6336,8 +6340,7 @@ impl ConservativePlanCursor {
                 Ok(false)
             }
             3 => {
-                let Some((object, skip, kind)) =
-                    old.refused_module_objects.get(self.copy_index)
+                let Some((object, skip, kind)) = old.refused_module_objects.get(self.copy_index)
                 else {
                     self.copy_stage = 4;
                     self.copy_index = 0;
@@ -13989,7 +13992,8 @@ mod tests {
             gap.reason
         );
         assert!(
-            gap.reason.contains("as a prefix when named by the operator"),
+            gap.reason
+                .contains("as a prefix when named by the operator"),
             "the note states the named exception without the retired first-plan rule: {}",
             gap.reason
         );
@@ -14005,12 +14009,17 @@ mod tests {
     #[test]
     fn whole_policy_closure_note_states_whole_admission() {
         let closure = provider_with_tables(92, "/opt/heuristic.so", 64, 103, false);
-        let inventory =
-            build_from_test_sources_with_policy(std::slice::from_ref(&closure), &[], inventory_policy(100));
+        let inventory = build_from_test_sources_with_policy(
+            std::slice::from_ref(&closure),
+            &[],
+            inventory_policy(100),
+        );
         assert_eq!(inventory.modules_skipped.len(), 1);
         let refusal = &inventory.modules_skipped[0];
         assert!(
-            refusal.reason.contains("admitted whole under this capture policy"),
+            refusal
+                .reason
+                .contains("admitted whole under this capture policy"),
             "the whole-policy note states whole admission: {}",
             refusal.reason
         );

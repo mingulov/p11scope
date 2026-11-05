@@ -3840,6 +3840,137 @@ fn awaiting_seed_decision_survives_a_gap_rewording() {
     );
 }
 
+/// The loader route with an owned seed completes: the real
+/// armed-seed batch path, not the predicate alone.
+#[test]
+fn loader_route_with_an_owned_seed_completes() {
+    let (_fixture, mut engine, _context, record, mut session) = armed_seed_route(1);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert!(
+        outcome.required_complete,
+        "an owned seed via the loader route completes"
+    );
+}
+
+/// An awaiting layer's real collected seed stays terminal: the export
+/// file provides C_GetFunctionList (so collection succeeds) while the
+/// closure description is unpublished (so the plan refuses awaiting).
+#[test]
+fn awaiting_layer_seed_from_real_export_collects_and_stays_terminal() {
+    let (_fixture, _view, provider_module, provider_pins) = loaded_seed_provider();
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    closure.key = provider_module.key;
+    closure.path = provider_module.path.clone();
+    closure.exports = provider_module.exports.clone();
+    closure.view = provider_module.view;
+    closure.mount_namespace = provider_module.mount_namespace;
+    closure.mapped_identity = provider_module.mapped_identity.clone();
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate(provider_pins, vec![closure.clone()], Vec::new())
+        .expect("the unpublished rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        candidate.plan.object_awaits_publication(object),
+        "the closure refuses awaiting: {:?}",
+        candidate.plan.modules_skipped
+    );
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&closure),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+    assert!(collected.required_seed_complete);
+    assert_eq!(collected.count_only_seeds.len(), 1);
+    assert_eq!(collected.count_only_seeds[0].object, object);
+    assert!(
+        seed_without_owner_is_terminal(&candidate, &collected.count_only_seeds[0]),
+        "the awaiting layer's real seed is terminal"
+    );
+}
+
+/// Negative twin: a capacity-refused provider's ownerless seed stays
+/// incomplete (required_complete == false via the seed loop).
+#[test]
+fn capacity_refused_provider_seed_without_owner_stays_incomplete() {
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(
+        &provider,
+        first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
+    );
+    let pins = overlay_pins(&[(provider.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate(pins, vec![provider.clone()], Vec::new())
+        .expect("the over-budget rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        !candidate.plan.object_awaits_publication(object),
+        "a crowded provider is capacity, never awaiting: {:?}",
+        candidate.plan.modules_skipped
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: provider.path.clone(),
+        file_offset: 0x10000,
+    };
+    assert!(
+        !seed_without_owner_is_terminal(&candidate, &seed),
+        "a capacity-refused seed stays incomplete: {:?}",
+        candidate.plan.modules_skipped
+    );
+}
+
+/// The start gate keeps reading gap text for hand-built plans (which
+/// carry gaps without refused records): awaiting text starts PARTIAL,
+/// a reworded gap is fatal. Pins the disclosed fallback.
+#[test]
+fn start_gate_falls_back_to_gap_text_for_hand_built_plans() {
+    let mut plan = plan_with(0, 1);
+    assert_eq!(plan.refused_modules_typed().count(), 0);
+    plan.modules_skipped[0].reason =
+        format!("none is published yet {}", plan::CLOSURE_ARRAY_NOTE_DETAILED);
+    assert!(
+        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "awaiting text: {}",
+        plan.modules_skipped[0].reason
+    );
+    assert_eq!(
+        refusal_error(&plan),
+        None,
+        "awaiting text starts PARTIAL via the fallback"
+    );
+    plan.modules_skipped[0].reason = "a reworded gap that names no rule".to_string();
+    assert!(
+        !plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "reworded text names no rule"
+    );
+    let error = refusal_error(&plan).expect("a reworded hand-built gap is fatal via the fallback");
+    assert!(error.contains("nothing to attach"), "{error}");
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);

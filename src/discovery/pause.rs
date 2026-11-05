@@ -7164,6 +7164,125 @@ mod tests {
         assert_eq!(coordinator.status(), PauseStatus::Partial);
     }
 
+    /// Consecutive engine-incomplete cycles must retire with a counted
+    /// named gap, never spin unbounded (one per loader hit). Four straight
+    /// incompletes retire the chain; the four partials stay counted.
+    #[test]
+    fn consecutive_engine_incomplete_cycles_retire_with_a_counted_gap() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.required_complete = false;
+        io.apply_outcome_diagnostic = Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters().partial, 1);
+        assert!(
+            coordinator.rearming_enabled(),
+            "the first incomplete re-arms"
+        );
+
+        for (cycle, ts, fallback) in [(2u64, 18u64, 15u64), (3, 26, 23), (4, 34, 31)] {
+            io.fallback_now = fallback;
+            assert_eq!(
+                coordinator.arm(&mut io).unwrap(),
+                ArmResult::Armed,
+                "cycle {cycle} arms"
+            );
+            io.authorization = Some(PAUSE_REQUESTED);
+            io.queue
+                .push_back(Ok(Some(DiscoveryItem::Record(record(ts, 0, false)))));
+            io.queue.push_back(Ok(None));
+            io.queue.push_back(Ok(None));
+            coordinator.service(&mut io).unwrap();
+            assert_eq!(
+                coordinator.counters().partial,
+                cycle,
+                "cycle {cycle} stays a counted partial"
+            );
+        }
+
+        assert!(
+            !coordinator.rearming_enabled(),
+            "the fourth consecutive incomplete retires the chain"
+        );
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 4,
+                confirmed: 0,
+                partial: 4,
+                unavailable: 0,
+            }
+        );
+    }
+
+    /// A sticky unowned EngineIncomplete must not re-arm a later
+    /// non-lifecycle failure with a different cause.
+    #[test]
+    fn an_unowned_engine_incomplete_must_not_rearm_a_later_non_lifecycle_failure() {
+        let mut io = FakeIo::default();
+        io.apply_outcome_diagnostic = Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.pending_records.push(record(1, 0, false));
+        coordinator.apply_unowned(&mut io, Some(100)).unwrap();
+        assert_eq!(
+            coordinator.pending_diagnostic,
+            Some(PauseDiagnostic::EngineIncompleteWithinDeadline),
+            "the unowned apply sets the sticky diagnostic"
+        );
+
+        coordinator
+            .fail_cycle(&mut io, "pause request had no discovery record", false)
+            .unwrap();
+
+        assert!(
+            !coordinator.rearming_enabled(),
+            "a different non-lifecycle cause must not re-arm"
+        );
+        assert_eq!(coordinator.counters().partial, 1);
+    }
+
+    /// `--pause always` never re-arms, even with an EngineIncomplete
+    /// diagnostic sticky.
+    #[test]
+    fn engine_incomplete_under_always_does_not_rearm() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.set_diagnostic(PauseDiagnostic::EngineIncompleteWithinDeadline);
+
+        let error = coordinator
+            .fail_cycle(&mut io, "one or more frozen required attachments failed", false)
+            .unwrap_err();
+
+        assert!(error.required());
+        assert!(
+            !coordinator.rearming_enabled(),
+            "Always must not re-arm"
+        );
+    }
+
+    /// Lifecycle failures never re-arm, even with an EngineIncomplete
+    /// diagnostic sticky.
+    #[test]
+    fn engine_incomplete_with_a_lifecycle_failure_does_not_rearm() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.set_diagnostic(PauseDiagnostic::EngineIncompleteWithinDeadline);
+
+        let _ = coordinator
+            .fail_cycle(&mut io, "pause coordination cancelled", true)
+            .unwrap_err();
+
+        assert!(
+            !coordinator.rearming_enabled(),
+            "a lifecycle failure must not re-arm"
+        );
+    }
+
     #[test]
     fn post_release_revalidation_remains_owned_by_the_pause_ledger() {
         let mut io = FakeIo {

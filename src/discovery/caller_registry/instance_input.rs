@@ -2886,6 +2886,11 @@ impl CallerRegistry {
             }
         }
         let mut fallback_refused = 0u64;
+        // True when staging already counted this call (the
+        // unsealable shape that triggered an ordered fallback
+        // counts once as `unmodelled_call_shape` at stage time):
+        // the direct reduction below must not count it again.
+        let mut direct_counted_in_stage = false;
         if joint {
             if let Some(ledger) = ledger.as_deref_mut() {
                 let origin = EffectOrigin::from(&input.facts);
@@ -2952,6 +2957,7 @@ impl CallerRegistry {
                     StageAction::Staged => return Ok(0),
                     StageAction::CarveOut => {}
                     StageAction::FallbackUncounted => {
+                        direct_counted_in_stage = true;
                         fallback_refused = self.fallback_joint_for_order(
                             id,
                             input.caller,
@@ -3002,9 +3008,14 @@ impl CallerRegistry {
             .semantics
             .get_mut(&id)
             .expect("retained edge");
-        // A direct reduction on a feed with no witnessed birth is a
-        // started-before-attach call: counted, never attributed.
-        state.feed.note_direct_reduction();
+        // Count the direct reduction once, under the one reason
+        // that kept it from attribution (no witnessed birth, or
+        // the ended segment's reason in the degraded window);
+        // proved-irrelevant calls never count, and a call staging
+        // already counted is never counted twice.
+        if !direct_counted_in_stage {
+            state.feed.note_direct_reduction(&input.facts.function);
+        }
         let reducer = state.semantics.as_mut().expect("materialized above");
         let mut outer = NoSink;
         let mut tee = KeyUseTee::new(

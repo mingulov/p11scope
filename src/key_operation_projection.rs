@@ -1111,14 +1111,25 @@ pub(crate) mod producer {
                 "started_before_attach",
                 sum(&|staging| staging.pre_attach_direct()),
             ),
-            ("record_lost", sum(&|staging| staging.history_disposed())),
+            (
+                "record_lost",
+                sum(&|staging| {
+                    staging
+                        .history_disposed()
+                        .saturating_add(staging.degraded_loss_direct())
+                }),
+            ),
             (
                 "unmodelled_call_shape",
                 sum(&|staging| staging.unsealable_direct()),
             ),
             (
                 "proof_refused_fallback",
-                sum(&|staging| staging.fallback_replayed()),
+                sum(&|staging| {
+                    staging
+                        .fallback_replayed()
+                        .saturating_add(staging.degraded_fallback_direct())
+                }),
             ),
         ];
         counts

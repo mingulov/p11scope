@@ -14967,11 +14967,7 @@ impl GuardedScene {
     /// manual facts on a fixture-minted ordinal (info calls are
     /// not attested shapes), then publish without a ledger.
     fn drive_info_direct(&mut self, key: &InstanceKey, name: &str) {
-        let position = self
-            .scene
-            .fixture
-            .admit_function("C_SignInit")
-            .h0_ordinal();
+        let position = self.scene.fixture.admit_function("C_SignInit").h0_ordinal();
         let facts = SemanticCall {
             function: name.into(),
             session: SESSION,

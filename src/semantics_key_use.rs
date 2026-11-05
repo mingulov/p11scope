@@ -60,6 +60,25 @@ pub(crate) enum FeedMode {
     Joint,
 }
 
+/// Which ending opened a feed's current degraded window: the
+/// reason direct reductions count under until the next clean
+/// point resumes Joint (see [`JointStaging::note_direct_reduction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedWindow {
+    /// A proof-only or ordered fallback ended the segment.
+    Fallback,
+    /// Real loss ended the segment.
+    Loss,
+}
+
+/// Whether the frozen endpoint table proves `function` irrelevant
+/// to key proof: info and session-state reads that are not key
+/// operations and never count as not attributed.
+fn proved_irrelevant(function: &str) -> bool {
+    crate::kinds::function_id(function).and_then(crate::semantics_objects::journal::endpoint_class)
+        == Some(crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant)
+}
+
 /// Whether `function` starts a clean segment boundary at which a
 /// degraded feed may resume attribution: an operation init (the
 /// frozen descriptor's INITIALIZE transition), a login, or a
@@ -276,6 +295,18 @@ pub(crate) struct JointStaging {
     /// not attributed (`started_before_attach`). The registry
     /// notes each one; the feed itself never sees the call.
     pre_attach_direct: u64,
+    /// Direct reductions in the degraded window after a fallback
+    /// ended a segment, before its next clean point: counted as
+    /// not attributed under that segment's reason
+    /// (`proof_refused_fallback`).
+    degraded_fallback_direct: u64,
+    /// Direct reductions in the degraded window after real loss
+    /// ended a segment, before its next clean point: counted as
+    /// not attributed under that segment's reason (`record_lost`).
+    degraded_loss_direct: u64,
+    /// The ending that opened the current degraded window, if a
+    /// segment has ended and not yet resumed. Cleared on resume.
+    degraded_window: Option<DegradedWindow>,
     correlation_refusals: u64,
     /// True once real loss (not proof-only refusal) ended this
     /// feed's object authority: the projection reports
@@ -328,6 +359,9 @@ impl JointStaging {
             fallback_replayed: 0,
             unsealable_direct: 0,
             pre_attach_direct: 0,
+            degraded_fallback_direct: 0,
+            degraded_loss_direct: 0,
+            degraded_window: None,
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
@@ -384,6 +418,7 @@ impl JointStaging {
         {
             self.mode = FeedMode::Joint;
             self.segment_resumable = false;
+            self.degraded_window = None;
             true
         } else {
             false
@@ -417,11 +452,53 @@ impl JointStaging {
         self.pre_attach_direct
     }
 
-    /// Count one S1-direct reduction on this feed: without a
-    /// selected birth receipt it is a started-before-attach call.
-    pub(crate) fn note_direct_reduction(&mut self) {
+    /// Direct reductions in the degraded window after a fallback.
+    pub(crate) fn degraded_fallback_direct(&self) -> u64 {
+        self.degraded_fallback_direct
+    }
+
+    /// Direct reductions in the degraded window after real loss.
+    pub(crate) fn degraded_loss_direct(&self) -> u64 {
+        self.degraded_loss_direct
+    }
+
+    /// End the current Joint segment: degrade to S1Only and open
+    /// the degraded window in which direct reductions count under
+    /// this ending's reason until the next clean point resumes.
+    fn close_segment(&mut self, loss: bool, resumable: bool) {
+        self.mode = FeedMode::S1Only;
+        self.segment_resumable = resumable;
+        if loss {
+            self.degraded_loss = true;
+            self.degraded_window = Some(DegradedWindow::Loss);
+        } else {
+            self.fell_back = true;
+            self.degraded_window = Some(DegradedWindow::Fallback);
+        }
+    }
+
+    /// Count one S1-direct reduction on this feed, under the one
+    /// reason that kept it from attribution. Proved-irrelevant
+    /// calls are not key operations and never count. Without a
+    /// selected birth receipt the call started before attach; on
+    /// a receipt-holding feed whose last segment ended and has
+    /// not yet resumed, it counts under that segment's reason.
+    pub(crate) fn note_direct_reduction(&mut self, function: &str) {
+        if proved_irrelevant(function) {
+            return;
+        }
         if self.selected_receipt.is_none() {
             self.pre_attach_direct = self.pre_attach_direct.saturating_add(1);
+            return;
+        }
+        match self.degraded_window {
+            Some(DegradedWindow::Fallback) => {
+                self.degraded_fallback_direct = self.degraded_fallback_direct.saturating_add(1);
+            }
+            Some(DegradedWindow::Loss) => {
+                self.degraded_loss_direct = self.degraded_loss_direct.saturating_add(1);
+            }
+            None => {}
         }
     }
 
@@ -958,7 +1035,10 @@ impl JointStaging {
             // still binds later original negatives to this exact history.
             // S1Only never owns a staged suffix; refuse before completing if
             // that invariant is broken rather than discarding any head.
-            self.degraded_loss |= loss;
+            if loss {
+                self.degraded_loss = true;
+                self.degraded_window = Some(DegradedWindow::Loss);
+            }
             return (
                 batch.negative_delivered().map_or(
                     FailureBatchProgress::Held,
@@ -968,13 +1048,7 @@ impl JointStaging {
             );
         }
         if self.staged.is_empty() {
-            self.mode = FeedMode::S1Only;
-            self.segment_resumable = segment_resumable_after(gap);
-            if loss {
-                self.degraded_loss = true;
-            } else {
-                self.fell_back = true;
-            }
+            self.close_segment(loss, segment_resumable_after(gap));
             return (
                 FailureBatchProgress::Complete(if loss {
                     FailureApplyOutcome::Degraded { disposed: 0 }
@@ -1031,13 +1105,7 @@ impl JointStaging {
             }
         }
         if self.staged.is_empty() {
-            self.mode = FeedMode::S1Only;
-            self.segment_resumable = segment_resumable_after(gap);
-            if loss {
-                self.degraded_loss = true;
-            } else {
-                self.fell_back = true;
-            }
+            self.close_segment(loss, segment_resumable_after(gap));
             (
                 FailureBatchProgress::Complete(if loss {
                     FailureApplyOutcome::Degraded { disposed: 1 }
@@ -1148,9 +1216,7 @@ impl JointStaging {
                     assoc_fallback.as_deref_mut(),
                 );
                 let disposed = self.drain_staged(Some(ledger));
-                self.mode = FeedMode::S1Only;
-                self.segment_resumable = segment_resumable_after(failure.gap);
-                self.degraded_loss = true;
+                self.close_segment(true, segment_resumable_after(failure.gap));
                 (FailureApplyOutcome::Degraded { disposed }, 0)
             }
             SealFailureDisposition::Fallback => {
@@ -1172,9 +1238,7 @@ impl JointStaging {
                             Some(&mut *ledger),
                             assoc_fallback.as_deref_mut(),
                         );
-                        self.mode = FeedMode::S1Only;
-                        self.segment_resumable = segment_resumable_after(failure.gap);
-                        self.fell_back = true;
+                        self.close_segment(false, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }
                     H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
@@ -1190,9 +1254,7 @@ impl JointStaging {
                             assoc_fallback,
                         );
                         let disposed = self.drain_staged(Some(ledger));
-                        self.mode = FeedMode::S1Only;
-                        self.segment_resumable = segment_resumable_after(failure.gap);
-                        self.degraded_loss = true;
+                        self.close_segment(true, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::Degraded { disposed }, 0)
                     }
                     _ => {
@@ -1299,11 +1361,9 @@ impl JointStaging {
         // needed, unlike proof-only fallback across a seal gap.
         let (replayed, refused) =
             self.replay_staged(reducer, keyuse, instance, sink, ledger, assoc_fallback);
-        self.mode = FeedMode::S1Only;
         // Ordered fallbacks are local capacity/shape endings: the
         // next clean point may resume Joint for a fresh segment.
-        self.segment_resumable = true;
-        self.fell_back = true;
+        self.close_segment(false, true);
         (replayed, refused)
     }
 

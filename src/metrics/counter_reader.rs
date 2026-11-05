@@ -2,8 +2,8 @@
 //! Private native counter acquisition; no public selector or reader activation.
 
 use super::counter_collector::{
-    CounterCell, CounterField, CounterHealth, CounterIssue, CounterLimits, CounterRead, CounterRow,
-    ReadReservation, ReadStage, ReadWindow,
+    CounterCell, CounterField, CounterGaps, CounterHealth, CounterIssue, CounterLimits,
+    CounterRead, CounterRow, ReadReservation, ReadStage, ReadWindow,
 };
 use super::{KernelControl, KernelEvidence, saturating_total};
 use crate::attach::Session;
@@ -327,6 +327,7 @@ fn acquire(
     }
 
     let mut rvs = Vec::with_capacity(limits.rv_keys);
+    let mut gaps = CounterGaps::default();
     let mut issue = source.routing()?;
     // Do not use Aya's combined MapIter: it can internally skip missing keys
     // without exposing an iteration bound. Each key and lookup is explicit.
@@ -365,6 +366,8 @@ fn acquire(
         let mut start = 0;
         // One dense original-index scan plus one advancing RV cursor. Holes
         // cannot create rows or accept RVs, and published inactivity is kept.
+        // One bank's unreadable cell gaps only its slots; the readable banks
+        // stay exact with a named gap count instead of voiding every bank.
         for slot in plan
             .slots
             .iter()
@@ -374,24 +377,50 @@ fn acquire(
             while end < rvs.len() && rvs[end].0.slot == slot.index {
                 end += 1;
             }
-            match source.fold_row(slot, &rvs[start..end], limits)? {
-                Ok(row) => rows.push(row),
-                Err(failure) => {
-                    issue = Some(failure);
-                    break;
+            match source.fold_row(slot, &rvs[start..end], limits) {
+                Ok(Ok(row)) => rows.push(row),
+                Ok(Err(_)) | Err(_) => {
+                    gaps.failed_slots = gaps.failed_slots.saturating_add(1);
                 }
             }
             start = end;
         }
-        issue.map_or(Ok(rows), Err)
+        Ok(rows)
     };
-    // Required health is additional to START/RV/owner evidence. Even a known
-    // fold/topology failure never fabricates successful missing-map reads.
-    let health = source.health()?;
-    let kernel = source.kernel()?;
+    // Required health is additional to START/RV/owner evidence. A health or
+    // kernel read failure degrades the evidence with a named gap instead of
+    // voiding the rows already folded.
+    let health = match source.health() {
+        Ok(health) => health,
+        Err(_) => {
+            gaps.health_failed = true;
+            CounterHealth::default()
+        }
+    };
+    let kernel = match source.kernel() {
+        Ok(kernel) => kernel,
+        Err(_) => {
+            gaps.kernel_failed = true;
+            KernelEvidence {
+                unknown_cells: super::LEGACY_UNKNOWN_RING_LOSS
+                    | super::LEGACY_UNKNOWN_START_INSERT
+                    | super::LEGACY_UNKNOWN_UNMATCHED_RETURNS
+                    | super::LEGACY_UNKNOWN_RV_UPDATES
+                    | super::LEGACY_UNKNOWN_CGROUP_SCOPE
+                    | super::LEGACY_UNKNOWN_SEMANTIC_CAPTURE
+                    | super::LEGACY_UNKNOWN_TEMPLATE_TAIL
+                    | super::LEGACY_UNKNOWN_UNREGISTERED_MECHANISMS
+                    | super::LEGACY_UNKNOWN_ABI_REFUSALS
+                    | super::LEGACY_UNKNOWN_OWNER
+                    | super::LEGACY_UNKNOWN_COOKIE
+                    | super::LEGACY_UNKNOWN_ROOT,
+                ..KernelEvidence::default()
+            }
+        }
+    };
     let rows = source.routing()?.map_or(rows, Err);
     let window = ReadWindow::new(started, source.now());
-    CounterRead::new(
+    let mut read = CounterRead::new(
         generation,
         source.mode(),
         window,
@@ -399,7 +428,9 @@ fn acquire(
         health,
         kernel,
         storage,
-    )
+    )?;
+    read.set_gaps(gaps);
+    Ok(read)
 }
 
 enum NativeStats<'a> {
@@ -1160,6 +1191,118 @@ mod tests {
     }
 
     #[test]
+    fn banked_fold_failure_partitions_rows_with_named_gap() {
+        // One slot's STATS cell is unreadable (its bank fails to fold);
+        // the readable slot's rows stay exact with a named gap count,
+        // instead of voiding every bank.
+        let (_dir, history, snapshot, pool) =
+            crate::attach::counter_banks::tests::growth_snapshot_fixture(false);
+        let mut source = Scripted::sample(CounterMode::Counts, false);
+        let last_stats = source.stats.remove(&1).unwrap();
+        source.stats.insert(2, last_stats);
+        source.rvs.push((key(2, 0x1_0000_0204), [1, 0]));
+        source.published = Some(snapshot);
+        // Drop one slot's STATS: only its bank fails to fold.
+        source.stats.remove(&2);
+        let limits = CounterLimits {
+            rows: 3,
+            rv_keys: 12,
+        };
+        let read = acquire(
+            &source,
+            NonZeroU64::new(19).unwrap(),
+            &history,
+            limits,
+            &pool.reserver(),
+        )
+        .expect("one bad bank cell must not void the readable bank");
+        let view = read.view();
+        let rows = view.rows.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].view().slot, 0);
+        assert_eq!(rows[0].view().returned, 5);
+        assert_eq!(view.gaps.failed_slots, 1);
+        assert!(!view.gaps.health_failed);
+        assert!(!view.gaps.kernel_failed);
+    }
+
+    #[test]
+    fn banked_health_failure_degrades_evidence_keeps_folded_rows() {
+        // Health read fails after rows folded; rows stay exact with a
+        // degraded-evidence gap, instead of voiding the read.
+        let pool = test_pool();
+        let history = plan();
+        let mut source = Scripted::sample(CounterMode::Counts, false);
+        source.fail = Some(ReadStage::Health);
+        let read = acquire(
+            &source,
+            NonZeroU64::new(19).unwrap(),
+            &history,
+            CounterLimits {
+                rows: 3,
+                rv_keys: 12,
+            },
+            &pool.reserver(),
+        )
+        .expect("health failure must degrade evidence, not void folded rows");
+        let view = read.view();
+        assert_eq!(view.rows.unwrap().len(), 2);
+        assert!(view.gaps.health_failed);
+        assert!(!view.gaps.kernel_failed);
+        assert_eq!(view.gaps.failed_slots, 0);
+    }
+
+    #[test]
+    fn banked_kernel_failure_degrades_evidence_keeps_folded_rows() {
+        // Kernel evidence read fails after rows folded; rows stay exact
+        // with a degraded-evidence gap, instead of voiding the read.
+        let pool = test_pool();
+        let history = plan();
+        let mut source = Scripted::sample(CounterMode::Counts, false);
+        source.fail = Some(ReadStage::KernelEvidence);
+        let read = acquire(
+            &source,
+            NonZeroU64::new(19).unwrap(),
+            &history,
+            CounterLimits {
+                rows: 3,
+                rv_keys: 12,
+            },
+            &pool.reserver(),
+        )
+        .expect("kernel failure must degrade evidence, not void folded rows");
+        let view = read.view();
+        assert_eq!(view.rows.unwrap().len(), 2);
+        assert!(view.gaps.kernel_failed);
+        assert!(!view.gaps.health_failed);
+        assert_eq!(view.gaps.failed_slots, 0);
+    }
+
+    #[test]
+    fn banked_exact_acquisition_has_no_gaps() {
+        let pool = test_pool();
+        let history = plan();
+        let source = Scripted::sample(CounterMode::Counts, false);
+        let read = acquire(
+            &source,
+            NonZeroU64::new(19).unwrap(),
+            &history,
+            CounterLimits {
+                rows: 3,
+                rv_keys: 12,
+            },
+            &pool.reserver(),
+        )
+        .expect("exact bank reads stay exact with no gaps");
+        let view = read.view();
+        assert_eq!(view.rows.unwrap().len(), 2);
+        assert!(view.gaps.is_clean());
+        assert_eq!(view.gaps.failed_slots, 0);
+        assert!(!view.gaps.health_failed);
+        assert!(!view.gaps.kernel_failed);
+    }
+
+    #[test]
     fn banked_acquisition_rejects_hole_rvs_and_missing_published_rows() {
         for hole_rv in [true, false] {
             let (_dir, history, snapshot, pool) =
@@ -1196,20 +1339,15 @@ mod tests {
             } else {
                 source.stats.remove(&2);
             }
-            let observed = collector.observe(acquire(
-                &source,
-                generation,
-                &history,
-                limits,
-                &pool.reserver(),
-            ));
+            let read = acquire(&source, generation, &history, limits, &pool.reserver())
+                .expect("per-bank gaps must not void the acquisition");
+            if !hole_rv {
+                assert_eq!(read.view().gaps.failed_slots, 1);
+            }
+            let observed = collector.observe(Ok(read));
             assert_eq!(
                 observed,
-                if hole_rv {
-                    CounterObservation::Unavailable(CounterIssue::Topology)
-                } else {
-                    CounterObservation::ReadFailed(ReadStage::Stats)
-                }
+                CounterObservation::Unavailable(CounterIssue::Topology)
             );
             let baseline = collector.current().unwrap().view();
             let rows = baseline.rows.unwrap();
@@ -1586,16 +1724,20 @@ mod tests {
                 &history,
                 LIMITS,
                 &pool.reserver(),
-            );
-            assert_eq!(failed.as_ref().err(), Some(&stage));
+            )
+            .expect("routing with degraded evidence must not void the read");
+            let view = failed.view();
+            assert_eq!(view.rows.err(), Some(CounterIssue::BankRouting));
+            match stage {
+                ReadStage::Health => assert!(view.gaps.health_failed),
+                ReadStage::KernelEvidence => assert!(view.gaps.kernel_failed),
+                _ => unreachable!(),
+            }
             assert_eq!(source.rv_reads.get(), 0);
+            assert_eq!(source.accesses.get(), 2);
             assert_eq!(
-                source.accesses.get(),
-                if stage == ReadStage::Health { 1 } else { 2 }
-            );
-            assert_eq!(
-                collector.observe(failed),
-                CounterObservation::ReadFailed(stage)
+                collector.observe(Ok(failed)),
+                CounterObservation::Unavailable(CounterIssue::BankRouting)
             );
             assert_eq!(
                 collector
@@ -1610,18 +1752,18 @@ mod tests {
                 [(0, 5), (2, 1)]
             );
             source = banked_scripted_sample(source.published.take().unwrap(), true);
-            match collector.observe(acquire(
-                &source,
-                NonZeroU64::new(7).unwrap(),
-                &history,
-                LIMITS,
-                &pool.reserver(),
-            )) {
-                CounterObservation::Advanced { deltas, .. } => {
-                    assert_eq!((deltas[0].entered, deltas[0].returned), (5, 4))
-                }
-                other => panic!("banked failed mandatory read changed the baseline: {other:?}"),
-            }
+            // Routing refusals stay sticky: a later exact read cannot erase
+            // the bank loss, while the complete baseline is preserved above.
+            assert_eq!(
+                collector.observe(acquire(
+                    &source,
+                    NonZeroU64::new(7).unwrap(),
+                    &history,
+                    LIMITS,
+                    &pool.reserver(),
+                )),
+                CounterObservation::Unavailable(CounterIssue::BankRouting)
+            );
         }
         for saturated in [true, false] {
             let (_dir, history, snapshot, pool) =
@@ -1676,8 +1818,10 @@ mod tests {
 
     #[test]
     fn counter_reader_failures_preserve_complete_baselines() {
-        // Advancing on partial RV/STATS/health/evidence acquisition, or hiding
-        // native read failures, breaks the hand-computed 5/4/1 continuation.
+        // Advancing on partial RV acquisition, or hiding native read
+        // failures, breaks the hand-computed 5/4/1 continuation. Per-bank
+        // STATS/health/evidence failures partition with named gaps instead
+        // of voiding, preserving the complete baseline as stale.
         for stage in [
             ReadStage::Rvs,
             ReadStage::Stats,
@@ -1705,7 +1849,26 @@ mod tests {
                 LIMITS,
                 &pool.reserver(),
             );
-            assert_eq!(refusal.err(), Some(stage));
+            if stage == ReadStage::Rvs {
+                assert_eq!(refusal.err(), Some(stage));
+            } else {
+                let read = refusal.expect("per-bank gaps must not void the read");
+                let view = read.view();
+                match stage {
+                    ReadStage::Stats => assert_eq!(view.gaps.failed_slots, 2),
+                    ReadStage::Health => assert!(view.gaps.health_failed),
+                    ReadStage::KernelEvidence => assert!(view.gaps.kernel_failed),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    collector.observe(Ok(read)),
+                    CounterObservation::Unavailable(if stage == ReadStage::Stats {
+                        CounterIssue::Topology
+                    } else {
+                        CounterIssue::KernelEvidence
+                    }),
+                );
+            }
             assert_eq!(
                 pool.snapshot().charged_bytes,
                 before,

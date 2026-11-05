@@ -43,7 +43,11 @@ or combine aggregate and semantic-detail totals.
 When a capture uses the prepared cumulative-counter reader, its evidence also
 contains optional `counter_collection` metadata. Legacy captures omit this
 object. Its exact keys are `mode`, `generation`, `read_window`, `status`,
-`health`, `discontinuity`, and `failure`. Mode and positive generation identify
+`health`, `discontinuity`, and `failure`, plus an optional additive
+`bank_gaps` object (`failed_slots` count with `health_failed`/`kernel_failed`
+flags) that appears only when one bank's cells or evidence reads failed.
+Exact counter reads omit `bank_gaps`. This is a v3-additive disclosure
+that introduces no new schema revision. Mode and positive generation identify
 the accepted native read. `read_window` is either the measured monotonic
 `{started_ns, finished_ns}` interval or null when that interval is unavailable;
 it does not assert an atomic snapshot. Cached display ticks keep the original

@@ -130,7 +130,10 @@ banks grow with
 the host possible-CPU count and refuse with `counter-memory-limit`
 past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
-saturation is reported in the collection health. A legacy aggregate read
+saturation is reported in the collection health. One bank's unreadable cell
+gaps only its slots with a `bank_gaps` count, and a health or kernel read
+failure degrades the evidence without voiding the folded rows; the readable
+banks stay exact and the report reads PARTIAL. A legacy aggregate read
 that cannot read one slot's counters reports zero for that slot as unknown
 with a `legacy_collection` gap, and one unread kernel-evidence cell reads 0
 as unknown with its name; the rest stays exact and the report reads PARTIAL.

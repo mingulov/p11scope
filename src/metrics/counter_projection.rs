@@ -2,7 +2,7 @@
 //! Charged cumulative presentation from the existing complete counter collector.
 
 use super::counter_collector::{
-    CounterCellDelta, CounterCollector, CounterHealth, CounterIssue, CounterLimits,
+    CounterCellDelta, CounterCollector, CounterGaps, CounterHealth, CounterIssue, CounterLimits,
     CounterObservation, CounterRead, ReadReservation, ReadStage, ReadWindow, tree_bytes,
 };
 use super::{KernelEvidence, LegacyReadGaps, SlotReport};
@@ -39,6 +39,7 @@ pub(super) struct CounterSnapshot {
     failure: Option<CounterFailure>,
     attempted_kernel: Option<KernelEvidence>,
     discontinuity: bool,
+    bank_gaps: CounterGaps,
 }
 
 impl CounterSnapshot {
@@ -84,8 +85,14 @@ impl CounterSnapshot {
     }
 
     pub(super) fn health(&self) -> Option<CounterHealth> {
-        self.is_fresh()
-            .then(|| self.data.as_ref().unwrap().source.view().health)
+        if !self.is_fresh() || self.bank_gaps.health_failed {
+            return None;
+        }
+        Some(self.data.as_ref().unwrap().source.view().health)
+    }
+
+    pub(super) fn bank_gaps(&self) -> CounterGaps {
+        self.bank_gaps
     }
 
     pub(super) fn deltas(&self) -> Option<&[CounterCellDelta]> {
@@ -232,8 +239,9 @@ impl CaptureSnapshot {
     }
 
     pub(crate) fn has_counter_gap(&self) -> bool {
-        self.counter()
-            .is_some_and(|snapshot| !snapshot.is_fresh() || snapshot.discontinuity())
+        self.counter().is_some_and(|snapshot| {
+            !snapshot.is_fresh() || snapshot.discontinuity() || !snapshot.bank_gaps().is_clean()
+        })
     }
 
     fn legacy_gaps(&self) -> Option<&LegacyReadGaps> {
@@ -263,11 +271,13 @@ impl CaptureSnapshot {
 
     /// Metadata can only be obtained from this accepted protected snapshot.
     /// A failed new attempt never substitutes its mode/generation/window.
+    /// Per-bank gaps appear only when the acquisition was partial; exact
+    /// reads omit `bank_gaps` so the full-coverage shape is unchanged.
     pub(crate) fn counter_collection(&self) -> Option<serde_json::Value> {
         let snapshot = self.counter()?;
         let mode = snapshot.mode()?;
         let generation = snapshot.generation()?;
-        Some(serde_json::json!({
+        let mut value = serde_json::json!({
             "mode": mode.name(),
             "generation": generation,
             "read_window": snapshot.window().map(|window| serde_json::json!({
@@ -279,7 +289,22 @@ impl CaptureSnapshot {
             })),
             "discontinuity": snapshot.discontinuity(),
             "failure": snapshot.failure().map(CounterFailure::name),
-        }))
+        });
+        let bank_gaps = snapshot.bank_gaps();
+        if !bank_gaps.is_clean() {
+            value
+                .as_object_mut()
+                .expect("counter collection is an object")
+                .insert(
+                    "bank_gaps".into(),
+                    serde_json::json!({
+                        "failed_slots": bank_gaps.failed_slots,
+                        "health_failed": bank_gaps.health_failed,
+                        "kernel_failed": bank_gaps.kernel_failed,
+                    }),
+                );
+        }
+        Some(value)
     }
 
     pub(crate) fn counter_summary(&self) -> Option<String> {
@@ -489,6 +514,7 @@ impl CaptureCollection {
                         failure: None,
                         attempted_kernel: Some(kernel),
                         discontinuity,
+                        bank_gaps: CounterGaps::default(),
                     };
                     return CaptureSnapshot::from_counter(snapshot);
                 }
@@ -560,12 +586,18 @@ impl CounterCapture {
         }
     }
 
-    fn failed(&self, failure: CounterFailure, kernel: Option<KernelEvidence>) -> CounterSnapshot {
+    fn failed(
+        &self,
+        failure: CounterFailure,
+        kernel: Option<KernelEvidence>,
+        gaps: CounterGaps,
+    ) -> CounterSnapshot {
         CounterSnapshot {
             data: self.last.clone(),
             failure: Some(failure),
             attempted_kernel: kernel,
             discontinuity: self.discontinuity,
+            bank_gaps: gaps,
         }
     }
 
@@ -586,11 +618,12 @@ impl CounterCapture {
             Ok(read) => read,
             Err(stage) => {
                 let _ = self.collector.observe(Err(stage));
-                return self.failed(CounterFailure::Read(stage), None);
+                return self.failed(CounterFailure::Read(stage), None, CounterGaps::default());
             }
         };
         let kernel = read.view().kernel;
         let health = read.view().health;
+        let gaps = read.view().gaps;
         // Reserve and copy before observe can advance the baseline. Both the
         // acquisition's owned rows and the old displayed view remain charged.
         let (reports, storage) =
@@ -605,10 +638,10 @@ impl CounterCapture {
                         CounterObservation::ReadFailed(stage) => CounterFailure::Read(stage),
                         _ => unreachable!("invalid folded rows cannot establish a baseline"),
                     };
-                    return self.failed(failure.with_observed_health(health), Some(kernel));
+                    return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
                 }
                 Err(failure) => {
-                    return self.failed(failure.with_observed_health(health), Some(kernel));
+                    return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
                 }
             };
         let observation = self.collector.observe(Ok(read));
@@ -618,7 +651,7 @@ impl CounterCapture {
             _ => None,
         };
         if let Some(failure) = failure {
-            return self.failed(failure.with_observed_health(health), Some(kernel));
+            return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
         }
         self.discontinuity |= matches!(observation, CounterObservation::GenerationChanged { .. });
         let source = self
@@ -638,6 +671,7 @@ impl CounterCapture {
             failure: None,
             attempted_kernel: Some(kernel),
             discontinuity: self.discontinuity,
+            bank_gaps: gaps,
         }
     }
 }
@@ -761,8 +795,8 @@ pub(super) mod tests {
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
     use crate::metrics::counter_collector::{
-        CounterCell, CounterHealth, CounterIssue, CounterLimits, CounterRead, CounterRow,
-        ReadReservation, ReadStage, ReadWindow,
+        CounterCell, CounterGaps, CounterHealth, CounterIssue, CounterLimits, CounterRead,
+        CounterRow, ReadReservation, ReadStage, ReadWindow,
     };
     use crate::metrics::{KernelEvidence, LegacyReadGaps};
     use crate::plan::{AdmissionPolicy, AttachPlan};
@@ -961,6 +995,7 @@ pub(super) mod tests {
         Saturated,
         Contended,
         KernelLoss,
+        BankGaps,
     }
 
     /// The run-loop tests replace I/O only: every successful acquisition still
@@ -1057,6 +1092,23 @@ pub(super) mod tests {
                 native_reads.set(native_reads.get() + 1);
                 match fault {
                     Some(ConsumerFault::ReadRvs) => Err(ReadStage::Rvs),
+                    Some(ConsumerFault::BankGaps) => {
+                        let mut read = read_with_health(
+                            plan,
+                            mode,
+                            generation,
+                            returned,
+                            CounterHealth::default(),
+                            KernelEvidence::default(),
+                            reserve,
+                        );
+                        read.set_gaps(CounterGaps {
+                            failed_slots: 1,
+                            health_failed: false,
+                            kernel_failed: false,
+                        });
+                        Ok(read)
+                    }
                     Some(
                         ConsumerFault::RowTopology
                         | ConsumerFault::RowTopologySaturated
@@ -1344,6 +1396,45 @@ pub(super) mod tests {
         let document =
             crate::render::with_legacy_snapshot(serde_json::json!({"evidence": {}}), &snapshot);
         assert!(document["evidence"].get("legacy_collection").is_none());
+    }
+
+    #[test]
+    fn counter_bank_gaps_publish_partial_with_named_counts() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let stale = fixture
+            .fresh(CounterMode::Counts, 1, 9, Some(ConsumerFault::BankGaps))
+            .expect("bank gaps must publish stale with named counts");
+        assert_eq!(stale.reports()[0].calls, 5);
+        assert!(stale.has_counter_gap());
+        let gaps = stale.counter_collection().unwrap();
+        assert_eq!(gaps["status"], "stale");
+        assert_eq!(gaps["failure"], "topology");
+        assert_eq!(gaps["bank_gaps"]["failed_slots"], 1);
+        assert_eq!(gaps["bank_gaps"]["health_failed"], false);
+        assert_eq!(gaps["bank_gaps"]["kernel_failed"], false);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &stale);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn counter_exact_omits_bank_gaps_and_stays_complete() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        let fresh = fixture
+            .fresh(CounterMode::Counts, 1, 5, None)
+            .expect("exact reads stay exact");
+        assert!(!fresh.has_counter_gap());
+        let gaps = fresh.counter_collection().unwrap();
+        assert_eq!(gaps["status"], "fresh");
+        assert!(gaps.get("bank_gaps").is_none());
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &fresh);
+        assert_eq!(evidence.completeness, "COMPLETE");
     }
 
     #[test]

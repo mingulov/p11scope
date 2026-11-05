@@ -44,7 +44,9 @@ which names refused slots with their recorded detach reason and no new capture,
 and [unpublished mechanism approval count](#unpublished-mechanism-approval-count-ruling-jk-22a-2026-11-05),
 which gaps shed approval ids by count only,
 and [legacy collection gaps](#legacy-collection-gaps-v060),
-which names the `legacy_collection` counts-and-reasons projection.**
+which names the `legacy_collection` counts-and-reasons projection,
+and [counter bank gaps](#counter-bank-gaps-v060),
+which names the `bank_gaps` counts-and-flags projection.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1579,3 +1581,16 @@ facts the observer already holds. Allowlist-v1 bytes are unchanged.**
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Legacy gap object (`evidence.legacy_collection`) | A pure projection of the legacy read's per-slot and per-cell failure flags: the STATS slots whose map read failed, whether any RV-table entry read failed, and the EVIDENCE/control cells whose map read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted aggregate reads; a missing STATS/RV/EVIDENCE map remains fatal (the data source itself is gone), and missing control maps (Inventory flavors) contribute nothing without a gap bit. The key stays absent (never null) when the legacy read was exact. | Public profile/metrics JSON only: `unread_stats` (saturating u64 count of slots that read zero as unknown), `rv_failed` (whether the RV table read failed), and `unknown_evidence` (finite names of the unread cells, in bit order: the nine EVIDENCE names plus `owner`, `cookie`, `root`). Counts and reason names only; no per-slot index, offset, timing, RV value or control word reaches output. Zeros in the rows are unknown, not exact, whenever this object is present, and the report reads PARTIAL with cause `legacy_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and an empty name list is never emitted. Required evidence: per-slot zero-with-gap and per-cell unknown twins at the legacy collection seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |
+
+## Counter bank gaps (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0 under the owner never-stop rule
+(2026-11-05): one bank's unreadable cell gaps only its slots with a named
+count, and a health or kernel read failure degrades the evidence without
+voiding the folded rows. No new capture exists; the gaps project
+read-failure facts the observer already holds. Allowlist-v1 bytes are
+unchanged.**
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Bank gap object (`evidence.counter_collection.bank_gaps`) | A pure projection of the counter acquisition's per-bank failure flags: how many slots failed to fold, and whether the health or kernel evidence read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted bank reads; a missing bank map or a global quarantine/routing refusal still voids via the existing failure cause. The key stays absent (never null) when the acquisition was exact. | Public profile/metrics JSON only, inside `counter_collection`: `failed_slots` (saturating u64 count of slots that failed to fold), `health_failed` (whether the health read failed), and `kernel_failed` (whether the kernel evidence read failed). Counts and finite flags only; no per-slot index, offset, timing, RV value, health word or control word reaches output. The readable banks stay exact whenever this object is present, and the report reads PARTIAL with cause `counter_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, health word, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and false flags is never emitted. Required evidence: per-bank partition and evidence-degradation twins at the counter acquisition seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |

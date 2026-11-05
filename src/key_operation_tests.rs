@@ -14963,6 +14963,30 @@ impl GuardedScene {
         )
     }
 
+    /// Drive one proved-irrelevant info call direct for `key`:
+    /// manual facts on a fixture-minted ordinal (info calls are
+    /// not attested shapes), then publish without a ledger.
+    fn drive_info_direct(&mut self, key: &InstanceKey, name: &str) {
+        let position = self
+            .scene
+            .fixture
+            .admit_function("C_SignInit")
+            .h0_ordinal();
+        let facts = SemanticCall {
+            function: name.into(),
+            session: SESSION,
+            capture: op_capture(),
+            ts_ns: 999,
+            rv: CkRv::OK.0,
+            authorized: true,
+            unambiguous: true,
+            attributable: true,
+            ..SemanticCall::default()
+        };
+        self.observe(key, position, facts);
+        self.registry.publish();
+    }
+
     /// Drive one S1Only-direct call for `key`: admit, observe,
     /// publish (no ledger). Effects tee while Joint evidence exists.
     fn drive_s1only(&mut self, key: &InstanceKey, shape: &ShapedS1) {
@@ -20918,6 +20942,390 @@ fn key_operation_joint_resumes_at_next_clean_point() {
         "the fallback segment stays counted: {:?}",
         observations.unattributed
     );
+}
+
+/// F1 (round 3): calls reduced direct in the degraded window —
+/// after a fallback ended the segment, before the next clean point —
+/// are counted under that segment's reason, never nowhere. Proved-
+/// irrelevant info calls in the same window count nothing (F4).
+/// The clean point then resumes exact attribution.
+#[test]
+fn key_operation_degraded_window_calls_count_under_fallback_reason() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // One exact Joint sign.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // An affecting unsealable completion behind a queued call
+    // forces the ordered fallback: this segment ends.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    complete.authorized = true;
+    complete.unambiguous = true;
+    complete.attributable = true;
+    let complete_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    guarded.observe(&joint_key, complete_pos, complete);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the fallback ends only the current segment"
+    );
+
+    // Degraded window: two modeled calls reduce direct. They are
+    // not attributed, so they must count under the ended segment's
+    // reason. Four proved-irrelevant calls in the same window are
+    // not key operations and must count nowhere.
+    guarded.drive_s1only(&joint_key, &sign);
+    guarded.drive_s1only(&joint_key, &sign);
+    for name in [
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_GetMechanismInfo",
+        "C_GetSessionInfo",
+    ] {
+        guarded.drive_info_direct(&joint_key, name);
+    }
+
+    // The next init is a clean point: attribution resumes exactly.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(61);
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "proof_refused_fallback");
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 1,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 3,
+            },
+        ],
+        "one replayed + two degraded-window calls under the segment reason; \
+         the info calls count nowhere: {:?}",
+        observations.unattributed
+    );
+    let proved: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved, 2, "both clean-segment signs attribute exactly");
+}
+
+/// F1 (round 3), loss arm: direct calls in the degraded window
+/// after real loss count as `record_lost` beside the disposed
+/// staged call; info calls count nothing; the clean point resumes.
+#[test]
+fn key_operation_degraded_window_calls_count_under_loss_reason() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // Stage one more init, then real loss ends the segment.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        ),
+        "the staged call disposes as history: {outcome:?}"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only)
+    );
+
+    // Degraded window: two modeled directs count as record_lost;
+    // proved-irrelevant calls count nothing.
+    guarded.drive_s1only(&joint_key, &sign);
+    guarded.drive_s1only(&joint_key, &sign);
+    for name in ["C_GetSlotInfo", "C_GetTokenInfo"] {
+        guarded.drive_info_direct(&joint_key, name);
+    }
+
+    // Clean point: exact attribution resumes.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(62);
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "authority_lost");
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 3,
+        }],
+        "one disposed + two degraded-window calls; info calls nowhere: {:?}",
+        observations.unattributed
+    );
+    let proved: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved, 2, "both clean-segment signs attribute exactly");
+}
+
+/// F4 (round 3): `started_before_attach` counts key operations
+/// only. Proved-irrelevant info/session-state calls on a feed
+/// registered without a witnessed birth are not key operations
+/// and never inflate the count. Pins all three brief-named info
+/// calls plus one non-info table entry, so the carve-out is the
+/// frozen table, not a name list.
+#[test]
+fn key_operation_started_before_attach_excludes_proved_irrelevant_calls() {
+    let mut guarded = GuardedScene::new();
+    let (late_key, _) = guarded.register(1);
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(2);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    for name in [
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_GetMechanismInfo",
+        "C_GetSessionInfo",
+    ] {
+        guarded.drive_info_direct(&late_key, name);
+    }
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(63);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: 2,
+        }],
+        "only the two key operations count; the four proved-irrelevant \
+         calls count nowhere: {:?}",
+        observations.unattributed
+    );
+}
+
+/// Conservation (round 3): in one capture, every observed key
+/// call is either attributed through a seal or counted in exactly
+/// one named unattributed reason. The totals are constructed by
+/// hand from the driven calls; proved-irrelevant calls are not
+/// key operations and enter neither side.
+#[test]
+fn key_operation_conservation_attributed_plus_unattributed_equals_observed() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (late_key, _) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // Joint, segment 1: init + sign sealed (2 attributed calls).
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Fallback: one staged init replays (proof_refused_fallback),
+    // its unsealable trigger counts unmodelled_call_shape.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    complete.authorized = true;
+    complete.unambiguous = true;
+    complete.attributable = true;
+    let complete_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    guarded.observe(&joint_key, complete_pos, complete);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    // Degraded window: two modeled directs (proof_refused_fallback).
+    guarded.drive_s1only(&joint_key, &sign);
+    guarded.drive_s1only(&joint_key, &sign);
+    // Joint, segment 2: init + sign sealed (2 more attributed).
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Late instance: init + sign (started_before_attach); three
+    // proved-irrelevant calls enter neither side of the equation.
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    for name in ["C_GetSlotInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
+        guarded.drive_info_direct(&late_key, name);
+    }
+    // One foreign call, refused before application.
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded
+        .registry
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            joint_key.clone(),
+            CallerId(99),
+            position,
+            facts,
+        ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+
+    let observations = guarded.registry.joint_observations(64);
+    let unattributed_total: u64 = observations.unattributed.iter().map(|row| row.count).sum();
+    // Hand-constructed: attributed sealed calls = 4 (two inits +
+    // two signs across the two clean segments).
+    let attributed_calls = 4u64;
+    // Hand-constructed observed key calls: 4 attributed + 1
+    // replayed + 1 unmodelled trigger + 2 degraded + 2 pre-attach
+    // + 1 foreign = 11.
+    let observed_key_calls = 11u64;
+    assert_eq!(
+        unattributed_total, 7,
+        "every unattributed call in exactly one reason: {:?}",
+        observations.unattributed
+    );
+    assert_eq!(
+        attributed_calls + unattributed_total,
+        observed_key_calls,
+        "conservation: attributed + unattributed = observed"
+    );
+    let proved_signs: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved_signs, 2, "the two clean signs attribute once each");
 }
 
 /// Late attach: an instance registered without a witnessed birth

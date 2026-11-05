@@ -852,12 +852,10 @@ fn native_semantic_scan_subset_skips_cross_object_provider() {
     let mut bad = cross.source(["C_SignInit", "C_Sign"]);
     // Point the cross provider's entries into the complete
     // provider's object (distinct offsets, so no key is shared).
-    let target_key = complete.pins.raw_keys_for(complete.pins.pinned().next().unwrap().id)[0];
-    for (entry, delta) in bad.scanned.tables[0]
-        .entries
-        .iter_mut()
-        .zip([2u64, 3])
-    {
+    let target_key = complete
+        .pins
+        .raw_keys_for(complete.pins.pinned().next().unwrap().id)[0];
+    for (entry, delta) in bad.scanned.tables[0].entries.iter_mut().zip([2u64, 3]) {
         entry.object = target_key;
         entry.object_path = complete.manifest.module_path.clone();
         entry.file_offset = complete.offsets[0] + delta;

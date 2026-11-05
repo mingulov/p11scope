@@ -603,6 +603,17 @@ fn build_subset_from_accepted(
             .zip(plan.modules.iter().find(|module| module.object == provider))
             .is_some_and(|(required, module)| {
                 !claims.incomplete.contains(&provider)
+                    // Scan mint only: a provider whose required
+                    // keys live in another object (the p11-kit
+                    // trust shim, whose table entries are
+                    // implemented inside libp11-kit) can never
+                    // pass the attested seal's per-provider
+                    // instance check, and seeded here it would
+                    // refuse the whole subset. Count it
+                    // incomplete; manifest mints keep their
+                    // operator-chosen semantics.
+                    && (!scan_authorized
+                        || required.iter().all(|key| key.object == provider))
                     && !required.is_empty()
                     && required.iter().all(|key| {
                         plan.slots.iter().any(|slot| {

@@ -576,9 +576,18 @@ fn build_subset_from_accepted(
         // no plan module, exactly as when the budget refused it.
         let claims =
             plan::semantic_source_claims_scan_authorized(source_modules, &manifests, &pins);
+        // A cross-object provider (required keys in another
+        // object, the p11-kit trust shape) can never mint either
+        // (refused below): keep it out of the plan too, so a huge
+        // one cannot starve a complete provider of slots.
         let mintable: Vec<ReconciledModule> = source_modules
             .iter()
-            .filter(|module| !claims.incomplete.contains(&module.object))
+            .filter(|module| {
+                !claims.incomplete.contains(&module.object)
+                    && claims.providers.get(&module.object).is_none_or(|required| {
+                        required.iter().all(|key| key.object == module.object)
+                    })
+            })
             .cloned()
             .collect();
         let plan = plan::build_from_sources_scan_authorized(&mintable, &manifests, &pins);

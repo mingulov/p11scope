@@ -723,6 +723,44 @@ fn native_semantic_scan_subset_mints_without_manifest() {
     );
 }
 
+/// DEMO-4 regression (fedora ff-late-2, 2026-11-05): a `--system`
+/// scan also discovers providers that can never mint (the system
+/// p11-kit proxy walks `known_prefix`). Their incompleteness is a
+/// counted gap for that provider only; the complete provider
+/// beside it (the browser's own softokn) must still mint.
+#[test]
+fn native_semantic_scan_subset_mints_beside_incomplete_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let complete = ProviderFixture::new();
+    let partial = ProviderFixture::new();
+    let good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = partial.source(["C_SignInit", "C_Sign"]);
+    bad.scanned.tables[0].walk = "known_prefix";
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![good.scanned, bad.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the partial provider is a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("a complete provider mints beside an incomplete one");
+    assert_eq!(subset.required().len(), 1, "only the complete provider");
+    assert_eq!(subset.plan().slots.len(), 2);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "the complete provider's slots carry semantics"
+    );
+}
+
 /// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live
 /// `--system` capture the creation-time `engine.modules` snapshot
 /// stays empty; current scanned tables live in the per-view scan

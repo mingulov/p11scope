@@ -328,6 +328,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     engine_collected_finish_calls: u64,
     /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
+    /// Whether a no-manifest scan seal will be attempted for this
+    /// run (the driver's deferred-seal condition). The mint stash
+    /// below retains a whole pass's aggregate pins, so it is only
+    /// kept when an attempt will actually consume it: an ordinary
+    /// inventory run must not retain pins for providers its broad
+    /// admission never took (e.g. an uninitialized table's object).
+    scan_mint_requested: bool,
     /// DEMO-4: the latest catalog lowering's reconciled scan
     /// modules and aggregate pins, stashed at absorb time for
     /// no-manifest scan-seal attempts (cloned by
@@ -804,6 +811,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             #[cfg(test)]
             engine_collected_finish_calls: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
+            scan_mint_requested: false,
             scan_mint_sources: None,
             count_manifests: Vec::new(),
             prearm: None,
@@ -1522,6 +1530,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
         self.semantic_inputs.prepare(&self.engine)
+    }
+
+    /// Mark that this run will attempt the no-manifest scan seal,
+    /// so absorb keeps the per-pass mint sources (and their pins)
+    /// the attempt consumes. Called by the driver when it arms
+    /// its deferred scan seal, before the first pass.
+    pub(crate) fn note_scan_mint_requested(&mut self) {
+        self.scan_mint_requested = true;
     }
 
     /// The no-manifest scan mint (DEMO-4), over the same retained
@@ -5251,9 +5267,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // DEMO-4: retain this pass's reconciled scan modules and
         // their aggregate pins for one no-manifest scan-seal
         // attempt after the pass (consumed there; never more than
-        // one pass's lowering is held).
+        // one pass's lowering is held). Only when the run will
+        // actually attempt that seal: the stash's pins would
+        // otherwise outlive broad admission for providers it
+        // never took.
         let crate::inspect_system::CatalogLowering { pins, modules, .. } = lowering;
-        if !modules.is_empty() {
+        if self.scan_mint_requested && !modules.is_empty() {
             self.scan_mint_sources = Some((modules, pins));
         }
         self.record_absorbed(absorbed)

@@ -1562,6 +1562,11 @@ fn run_with_terminal_budget(
     let deadline = cgroup
         .as_ref()
         .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
+    // The deferred scan seal consumes per-pass mint sources the
+    // coordinator only retains when told an attempt will come.
+    if manifests.is_empty() && key_operations && native_available {
+        coordinator.note_scan_mint_requested();
+    }
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
         inventory_scope,

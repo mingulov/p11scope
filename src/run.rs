@@ -15692,9 +15692,7 @@ mod tests {
             // missing privilege instead of a hazard; either is the
             // environment's own category, never a pause failure.
             let environment = |text: &str| {
-                text.contains("refusing to attach")
-                    || text.contains("cannot load p11scope's BPF programs")
-                    || text.contains("uprobe-multi-required:")
+                text.contains("refusing to attach") || text.contains("live capture ")
             };
             assert!(environment(&never), "{never}");
             assert!(
@@ -15711,8 +15709,7 @@ mod tests {
             );
             assert!(
                 behind_override.contains("attach session")
-                    || behind_override.contains("cannot load p11scope's BPF programs")
-                    || behind_override.contains("uprobe-multi-required:"),
+                    || behind_override.contains("live capture "),
                 "{behind_override}"
             );
             assert!(

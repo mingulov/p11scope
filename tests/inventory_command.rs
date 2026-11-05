@@ -1359,7 +1359,7 @@ fn capture_native_without_privilege_is_an_error_naming_why() {
 }
 
 #[test]
-fn capture_auto_without_privilege_requires_multi_before_scan_fallback() {
+fn capture_auto_without_privilege_falls_back_to_scan_for_pid() {
     if running_as_root() {
         eprintln!("skipped: root runs the native lane under auto");
         return;
@@ -1367,22 +1367,11 @@ fn capture_auto_without_privilege_requires_multi_before_scan_fallback() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-auto-fallback");
     let driver = LiveDriver::spawn(&dir, "af", &["af-p1.so"]);
-    let host_refusal = multi_host::refusal();
+    // PID scope always falls back to the scan lane with a named gap,
+    // whether the host preflight or the native opening refuses.
     for args in [vec!["--json"], vec!["--capture", "auto", "--json"]] {
         let output = observe(driver.pid, &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if let Some(reason) = &host_refusal {
-            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
-            assert_eq!(
-                stderr,
-                format!("p11scope: inventory --pid {}: {reason}\n", driver.pid)
-            );
-            assert!(
-                output.stdout.is_empty(),
-                "no scan fallback on an ineligible host"
-            );
-            continue;
-        }
         assert!(output.status.success(), "{args:?}: {stderr}");
         assert!(
             stderr.contains("native usage feed unavailable, continuing with the scan lane"),

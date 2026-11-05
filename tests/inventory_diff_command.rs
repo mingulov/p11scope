@@ -44,7 +44,7 @@ fn different_content_is_informational_and_names_the_application_and_module() {
     let mut changed = document();
     changed["modules"][0]["identity"]["sha256"] = json!("b".repeat(64));
     std::fs::write(&after, serde_json::to_vec(&changed).unwrap()).unwrap();
-    let output = command(&before, &after).output().unwrap();
+    let output = command(&before, &after).arg("-v").output().unwrap();
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
     for expected in [
@@ -121,7 +121,7 @@ fn review_r1_caller_fanout_keeps_the_complete_text_document_bounded() {
     let bytes = serde_json::to_vec(&value).unwrap();
     std::fs::write(&before, &bytes).unwrap();
     std::fs::write(&after, &bytes).unwrap();
-    let output = command(&before, &after).output().unwrap();
+    let output = command(&before, &after).arg("-v").output().unwrap();
     success(&output);
     assert!(
         output.stdout.len() < 180_000,
@@ -167,7 +167,7 @@ fn review_r1_caller_fanout_keeps_the_complete_text_document_bounded() {
 }
 
 #[test]
-fn review_r2_module_only_admission_change_is_visible_in_the_default_report() {
+fn review_r2_module_only_admission_change_is_visible_in_text_reports() {
     let (_dir, before, after) = inputs();
     let mut value = document();
     value["edges"] = json!([]);
@@ -176,6 +176,13 @@ fn review_r2_module_only_admission_change_is_visible_in_the_default_report() {
     value["modules"][0]["admission"]["endpoints"] = json!(5);
     std::fs::write(&after, serde_json::to_vec(&value).unwrap()).unwrap();
     let output = command(&before, &after).output().unwrap();
+    success(&output);
+    let summary = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !summary.contains("No differences in the compared inventory observations"),
+        "the summary must not hide the admission-only change: {summary}"
+    );
+    let output = command(&before, &after).arg("-v").output().unwrap();
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
     for expected in [
@@ -186,7 +193,6 @@ fn review_r2_module_only_admission_change_is_visible_in_the_default_report() {
     ] {
         assert!(text.contains(expected), "missing {expected:?}: {text}");
     }
-    assert!(!text.contains("No differences in the compared inventory observations"));
     let output = command(&before, &after).arg("--json").output().unwrap();
     success(&output);
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -226,7 +232,7 @@ fn history_inputs(unit: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
 #[test]
 fn review_r3_unknown_clock_history_keeps_raw_values_and_unit_uncertainty() {
     let (_dir, before, after) = history_inputs("future_ticks");
-    let output = command(&before, &after).output().unwrap();
+    let output = command(&before, &after).arg("-v").output().unwrap();
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
     for expected in [
@@ -264,7 +270,7 @@ fn review_r3_unknown_clock_history_keeps_raw_values_and_unit_uncertainty() {
 #[test]
 fn review_r3_known_nanosecond_history_preserves_the_published_unit() {
     let (_dir, before, after) = history_inputs("ns");
-    let output = command(&before, &after).output().unwrap();
+    let output = command(&before, &after).arg("-v").output().unwrap();
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("unresolved -> admitted at 110 ns"));
@@ -377,7 +383,7 @@ fn text_escapes_labels_but_json_preserves_decoded_data() {
     value["modules"][0]["paths"] = json!(["/lib/module\t\r.so"]);
     value["modules"][0]["admission"]["note"] = json!("why\n\x1b");
     std::fs::write(&after, serde_json::to_vec(&value).unwrap()).unwrap();
-    let output = command(&before, &after).output().unwrap();
+    let output = command(&before, &after).arg("-v").output().unwrap();
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("/bin/app\\n\\u{1b}[31m"), "{text}");

@@ -140,7 +140,6 @@ fn usage_error_is_scoped() {
             &format!("Try 'p11scope {topic} --help'."),
         );
     }
-    refusal(invoke(&[]), "missing subcommand", "Try 'p11scope --help'.");
     refusal(
         invoke(&["unknown"]),
         "unknown subcommand",
@@ -152,6 +151,16 @@ fn usage_error_is_scoped() {
         .output()
         .unwrap();
     refusal(output, "not valid UTF-8", "Try 'p11scope trace --help'.");
+}
+
+#[test]
+fn bare_argv_prints_global_help() {
+    let output = invoke(&[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Choose a task"), "{text}");
+    assert!(text.contains("p11scope inventory diff"), "{text}");
 }
 
 #[test]
@@ -207,12 +216,18 @@ fn advertised_examples_parse_and_run_command_boundary_is_verbatim() {
             "inventory",
             "p11scope inventory --pid 4242 --capture scan --json -o inventory.json",
         ),
-        ("run", "p11scope run --trace -- /absolute/path/to/program"),
+        (
+            "run",
+            "sudo p11scope run -- pkcs11-tool --module \
+             /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+        ),
     ] {
         let text = String::from_utf8(invoke(&[topic, "--help"]).stdout).unwrap();
         assert!(text.contains(example), "{topic}: {text}");
         assert!(text.contains("example"), "values must be examples: {text}");
-        cli::parse(example.split_whitespace().skip(1)).unwrap();
+        let words: Vec<&str> = example.split_whitespace().collect();
+        let words = words.strip_prefix(&["sudo"]).unwrap_or(&words);
+        cli::parse(words.iter().skip(1).copied()).unwrap();
     }
     let child_word = OsString::from_vec(b"child-\xff".to_vec());
     let words = vec![

@@ -234,8 +234,9 @@ class JournalGateTests(unittest.TestCase):
             "timeout": {"rc": 124, "text": ""},
             "crash": {"rc": 1, "text": LINKED_TEXT + "thread 'main' panicked at src/x.rs:1\n"},
             "refusal-515": {"rc": 1, "text":
-                "p11scope: uprobe-multi-required: Multi capability unavailable "
-                "at scratch program load\n"},
+                "p11scope: live capture unavailable: loading p11scope's BPF "
+                "programs is not supported on this host; run 'p11scope doctor' "
+                "for host readiness\n"},
         }))
         tool = self.bin / "tool"
         tool.write_text("#!" + sys.executable + "\n" + TOOL_SOURCE)
@@ -547,7 +548,7 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["cell"], f"journal-load-{CONTROL_KERNEL}")
         self.assertTrue(row["pass"])
         self.assertEqual(row["qualification"], "qualified")
-        self.assertIn("uprobe-multi-required", row["detail"])
+        self.assertIn("live-capture", row["detail"])
 
     def test_refusal_control_passes_on_61(self):
         # 6.1 is pre-Multi too: the same finite refusal passes the
@@ -558,7 +559,7 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["cell"], f"journal-load-{CONTROL_KERNEL_61}")
         self.assertTrue(row["pass"])
         self.assertEqual(row["qualification"], "qualified")
-        self.assertIn("uprobe-multi-required", row["detail"])
+        self.assertIn("live-capture", row["detail"])
 
     def test_control_load_fails(self):
         # The control twin: a 5.15 guest that loads the pair instead of
@@ -568,7 +569,7 @@ class JournalGateTests(unittest.TestCase):
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")
-        self.assertIn("uprobe-multi-required", row["detail"])
+        self.assertIn("live-capture", row["detail"])
         self.assertIn("journal pair loaded", row["detail"])
 
     def test_observer_timeout_fails(self):
@@ -791,7 +792,7 @@ class ScriptContractTests(unittest.TestCase):
 
     def test_names_the_finite_refusal_reasons(self):
         self.assertIn("journal-pair-unavailable-in-build", self.text)
-        self.assertIn("uprobe-multi-required", self.text)
+        self.assertIn("live capture \\(needs root\\|unavailable\\|did not start\\):", self.text)
 
     def test_runs_one_bounded_guest_per_kernel(self):
         self.assertIn("vng --run", self.text)

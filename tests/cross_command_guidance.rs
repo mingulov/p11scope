@@ -49,11 +49,21 @@ fn doctor_summary_matches_requested_lane_verdict() {
         Some("Doctor: extra-strict qualification passed.")
     );
 
+    // Controller ruling: an unclassified EPERM denial tells an unprivileged
+    // operator to rerun doctor as root, while an already-root denial keeps
+    // the unclassified guidance and never suggests sudo. Each leg pins the
+    // twin for the euid it runs as.
+    let privileged = unsafe { libc::geteuid() } == 0;
+    let eperm_action = if privileged {
+        "denial cause is unclassified"
+    } else {
+        "run as root: sudo p11scope doctor"
+    };
     for (name, detail, action, forbidden) in [
         (
             "BPF map create",
             "Operation not permitted (os error 1)",
-            "denial cause is unclassified",
+            eperm_action,
             "Next: grant",
         ),
         (
@@ -119,10 +129,15 @@ fn doctor_summary_matches_requested_lane_verdict() {
             .unwrap();
         assert!(next.contains(action), "{text}");
         assert!(!next.contains(forbidden), "{text}");
-        assert!(
-            !next.contains("sudo") && !next.contains("disable"),
-            "{text}"
-        );
+        let eperm_unprivileged = !privileged
+            && name == "BPF map create"
+            && detail == "Operation not permitted (os error 1)";
+        if eperm_unprivileged {
+            assert!(next.contains("sudo"), "{text}");
+        } else {
+            assert!(!next.contains("sudo"), "{text}");
+        }
+        assert!(!next.contains("disable"), "{text}");
         assert!(
             text.contains(detail),
             "the original diagnostic survives: {text}"

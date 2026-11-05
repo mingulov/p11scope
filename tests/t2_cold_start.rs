@@ -80,7 +80,7 @@ fn require_capture_positive(test: &str) {
 
 #[test]
 fn cold_start_doctor_with_scrubbed_env_completes_honestly() {
-    let outcome = cold_run(&["doctor"]);
+    let outcome = cold_run(&["doctor", "-v"]);
     assert!(
         matches!(outcome.code, Some(0) | Some(1)),
         "cold doctor must exit 0/1, never crash: {:?}\n{}",
@@ -141,13 +141,14 @@ fn cold_start_extra_strict_refusal_is_explicit() {
 fn cold_start_doctor_ignores_spoofed_sudo_uid() {
     let output = Command::new(bin())
         .arg("doctor")
+        .arg("-v")
         .env_clear()
         .env("SUDO_UID", "0")
         .env("SUDO_GID", "0")
         .output()
         .expect("run doctor with spoofed SUDO_UID");
     let spoofed = String::from_utf8(output.stdout).expect("stdout is UTF-8");
-    let clean = cold_run(&["doctor"]);
+    let clean = cold_run(&["doctor", "-v"]);
     // Only the categorical lines are compared: per-row BPF diagnostics may
     // name whichever map the loader attempted first (T2-C2), but the
     // verdict and tier must not move under a spoofed credential.

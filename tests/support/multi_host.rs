@@ -17,7 +17,11 @@ fn refusal_from_checks(checks: &[Check]) -> Option<String> {
     assert!(required.next().is_none(), "duplicate required Multi probe");
     match &check.status {
         Status::Ok(_) => None,
-        Status::Fail(reason) if reason.starts_with("uprobe-multi-required: ") => {
+        Status::Fail(reason)
+            if reason.starts_with("live capture needs root: ")
+                || reason.starts_with("live capture unavailable: ")
+                || reason.starts_with("live capture did not start: ") =>
+        {
             Some(reason.clone())
         }
         status => panic!("unexpected required Multi probe status: {status:?}"),
@@ -49,11 +53,16 @@ mod tests {
 
     #[test]
     fn ineligible_multi_probe_retains_the_exact_named_reason() {
-        let reason = "uprobe-multi-required: Multi capability unavailable at scratch self-link";
-        assert_eq!(
-            refusal_from_checks(&[required(Status::Fail(reason.into()))]),
-            Some(reason.into())
-        );
+        for reason in [
+            "live capture needs root: the kernel refused to load p11scope's BPF programs (Operation not permitted). Run with sudo, or use 'p11scope inspect --pid N' for a scan without capture.",
+            "live capture unavailable: loading p11scope's BPF programs is not supported on this host; run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.",
+            "live capture did not start: loading p11scope's BPF programs failed; run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.",
+        ] {
+            assert_eq!(
+                refusal_from_checks(&[required(Status::Fail(reason.into()))]),
+                Some(reason.into())
+            );
+        }
     }
 
     #[test]

@@ -43,13 +43,13 @@
 # rows, a refused journal start, an idle lane, a timeout, a crash or a
 # missing count is FAIL. The finite refusal reasons
 # (`journal-pair-unavailable-in-build` on a build that omits the
-# object, `uprobe-multi-required` on pre-Multi kernels) are named in
+# object, the `live capture ...` refusal on pre-Multi kernels) are named in
 # the row detail, never mistaken for a pass. The key-operations display
 # latch does not complete in production runs at this base, so the
 # display state is recorded in the row, never gated.
 #
 # Pre-Multi kernels (v5.15.*, v6.1.*) are a refusal control, not a
-# load: the finite `uprobe-multi-required` refusal with no loaded
+# load: the finite live-capture refusal with no loaded
 # journal row is a pass for that cell; a load or a crash is FAIL.
 #
 # Writes OUTDIR/results.jsonl, one row per kernel:
@@ -494,8 +494,8 @@ PY
         # Refusal control: the finite pre-Multi refusal, no loaded
         # journal row, no crash. A load or a crash is FAIL.
         REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -q 'uprobe-multi-required' "$J_TXT"; then
-            add_reason "finite uprobe-multi-required refusal missing"
+        if [ ! -f "$J_TXT" ] || ! grep -q 'live capture \(needs root\|unavailable\|did not start\):' "$J_TXT"; then
+            add_reason "finite live-capture refusal missing"
         fi
         if [ "$J_RC" = 0 ]; then
             add_reason "observer exited 0 on a pre-Multi kernel"
@@ -507,9 +507,9 @@ PY
             add_reason "observer crashed or left no log"
         fi
         if [ -z "$REASONS" ]; then
-            echo "# control $KERNEL: PASS (refused uprobe-multi-required)"
+            echo "# control $KERNEL: PASS (refused live-capture)"
             emit_row "journal-load-$KERNEL" 1 qualified \
-                "refused uprobe-multi-required; no journal loads; rc=$J_RC"
+                "refused live-capture; no journal loads; rc=$J_RC"
         else
             echo "# control $KERNEL: FAIL ($REASONS)"
             emit_row "journal-load-$KERNEL" 0 failed "$REASONS"

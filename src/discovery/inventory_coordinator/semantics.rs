@@ -5584,6 +5584,13 @@ mod finalizer_history_tests {
             // shed and disclosed.
             assert_eq!(lane.shed_calls_disclosed(), 2, "cookie {cookie}");
             assert_eq!(unrouted_gap_calls(&coordinator), 2, "cookie {cookie}");
+            // Only a provably other caller's sheds count as foreign
+            // for the key-operation unattributed counters.
+            assert_eq!(
+                coordinator.registry().foreign_unrouted_calls(),
+                if other { 2 } else { 0 },
+                "cookie {cookie}"
+            );
         }
     }
 

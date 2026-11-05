@@ -12603,6 +12603,35 @@ mod tests {
         }
     }
 
+    /// Route A (publication-driven admission): a Detailed forwarding
+    /// layer attaches only the tables a live return actually published,
+    /// in every scope and arrival order. Unpublished templates take no
+    /// slots and never crowd out the backend beside them; the layer
+    /// reads as awaiting publication, never as a prefix or whole.
+    #[test]
+    fn detailed_closure_array_attaches_only_published_tables() {
+        let backend = provider_with_tables(32, TRUST, 1, 68, false);
+        for scope in [AdmissionScope::Named, AdmissionScope::Shared] {
+            let unpublished = provider_with_tables(31, P11_KIT, 64, 103, false);
+            let plan = scoped_plan(&[unpublished, backend.clone()], scope);
+            assert_eq!(slots_of(&plan, 32), 68, "backend whole: {scope:?}");
+            assert_eq!(slots_of(&plan, 31), 0, "no heuristic slots: {scope:?}");
+            let refusal = refusal_of(&plan, P11_KIT).expect("named gap: {scope:?}");
+            assert!(
+                is_closure_awaiting_publication(&refusal.reason),
+                "awaiting publication, not a prefix: {}",
+                refusal.reason
+            );
+        }
+        // One published table attaches exactly its own endpoints; the
+        // other 63 templates stay unattached.
+        let mut published = provider_with_tables(31, P11_KIT, 64, 3, false);
+        published.scanned.tables[0].live_return = true;
+        let plan = scoped_plan(&[published, backend], AdmissionScope::Named);
+        assert_eq!(slots_of(&plan, 32), 68, "backend whole beside published");
+        assert_eq!(slots_of(&plan, 31), 3, "only the published table attaches");
+    }
+
     /// A small closure family is still a closure array — five lookalike
     /// tables never take a strongest-four prefix — but whole admission
     /// needs a provider beside it in the first plan (PA-9/C1): alone it is

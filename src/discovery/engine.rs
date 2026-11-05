@@ -7391,6 +7391,64 @@ fn seed_without_owner_is_terminal(candidate: &LiveCandidate, seed: &CountOnlySee
     candidate.plan.object_awaits_publication(seed.object)
 }
 
+/// Placement of one count-only seed against the candidate plan: the
+/// loader hook's per-seed verdict, shared by the seed loop so the
+/// terminal-or-partial mapping stays pinned in one place.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedPlacement {
+    /// The seed needs no plan work: an unpublished closure's seed is
+    /// terminal for the cycle.
+    Terminal,
+    /// The seed placed a provisional slot (or needed none).
+    Placed,
+    /// The seed is a counted incompleteness with this cause.
+    Partial(&'static str),
+}
+
+fn place_count_only_seed(candidate: &mut LiveCandidate, seed: &CountOnlySeedWork) -> SeedPlacement {
+    let (first, second) = {
+        let mut owners = candidate
+            .plan
+            .modules
+            .iter()
+            .filter(|module| module.object == seed.object);
+        (
+            owners.next().map(|module| module.id),
+            owners.next().is_some(),
+        )
+    };
+    let Some(module) = first else {
+        if seed_without_owner_is_terminal(candidate, seed) {
+            return SeedPlacement::Terminal;
+        }
+        return SeedPlacement::Partial(
+            "a C_GetFunctionList seed had no unique candidate module owner",
+        );
+    };
+    if second {
+        return SeedPlacement::Partial(
+            "a C_GetFunctionList seed had no unique candidate module owner",
+        );
+    }
+    match candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset,
+        }) {
+        Ok(Some(slot)) => {
+            candidate.delta.new.push(slot);
+            SeedPlacement::Placed
+        }
+        Ok(None) => SeedPlacement::Placed,
+        Err(_) => SeedPlacement::Partial(
+            "a C_GetFunctionList seed could not be added to the candidate plan",
+        ),
+    }
+}
+
 /// The `discovery[]` record: what was found, where it was found, and how well
 /// the two sources agreed. Identity is `{dev, ino, sha256}` — a path here is
 /// only the label the source that saw it used, and for anything the scan found
@@ -16949,46 +17007,11 @@ impl Engine {
         );
         let mut required_seed_complete = collected.required_seed_complete;
         for seed in &collected.count_only_seeds {
-            let mut owners = candidate
-                .plan
-                .modules
-                .iter()
-                .filter(|module| module.object == seed.object);
-            let Some(module) = owners.next() else {
-                if seed_without_owner_is_terminal(&candidate, seed) {
-                    continue;
-                }
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            };
-            if owners.next().is_some() {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            }
-            match candidate.plan.add_provisional_get_function_list(
-                plan::ProvisionalGetFunctionList {
-                    module: module.id,
-                    object: seed.object,
-                    object_path: seed.object_path.clone(),
-                    file_offset: seed.file_offset,
-                },
-            ) {
-                Ok(Some(slot)) => candidate.delta.new.push(slot),
-                Ok(None) => {}
-                Err(_) => {
+            match place_count_only_seed(&mut candidate, seed) {
+                SeedPlacement::Terminal | SeedPlacement::Placed => {}
+                SeedPlacement::Partial(why) => {
                     required_seed_complete = false;
-                    self.mark_partial(
-                        "live export hook",
-                        "a C_GetFunctionList seed could not be added to the candidate plan",
-                    );
+                    self.mark_partial("live export hook", why);
                 }
             }
         }

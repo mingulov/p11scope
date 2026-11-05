@@ -4032,12 +4032,10 @@ fn loader_seed_for_a_refused_closure_stays_partial() {
         interface.table = Some(60 + index);
     }
     let mut engine = Engine::empty();
+    let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
     let mut candidate = engine
-        .live_candidate(
-            overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]),
-            vec![published, provider],
-            Vec::new(),
-        )
+        .live_candidate(candidate_pins, vec![published, provider], skipped)
         .expect("the crowded rebuild");
     let object = candidate
         .pinned

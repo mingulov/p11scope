@@ -24946,16 +24946,13 @@ mod seal_readiness_tests {
     #[test]
     fn scan_seal_attempt_is_not_engine_changed_gated() {
         let source = include_str!("mod.rs");
-        let attempt = source
-            .find("DEMO-4 deferred scan seal")
-            .expect("the deferred scan seal block exists");
-        let window = &source[attempt..attempt + 1200];
         assert!(
-            window.contains("self.scan_seal_pending {"),
+            source.contains("if self.semantic.is_none() && self.scan_seal_pending {"),
             "the attempt keys on the pending flag alone"
         );
+        let gated = ["self.scan_seal_pending && report.engine", "_changed"].concat();
         assert!(
-            !window.contains("report.engine_changed"),
+            !source.contains(&gated),
             "the attempt must not gate on engine_changed"
         );
     }

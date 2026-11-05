@@ -4336,6 +4336,163 @@ fn key_operation_unknown_key_and_requested_only() {
     assert_eq!((row.completed, row.active), (1, 0));
 }
 
+/// DEMO-4 late attach: a key first observed through FIND (its lookup
+/// and any session/login happened before attach) that signs after
+/// attach must keep a per-key row even though its type/size were
+/// never established: the row carries the object id with metadata
+/// `unknown` (type unknown: first seen before attach), never a
+/// guessed label and never a dropped row. A sibling key whose type
+/// is later established by an already-observed
+/// `C_GetAttributeValue` keeps its exact label in the same capture.
+#[test]
+fn key_operation_first_observed_key_rows_with_unknown_metadata() {
+    const FIND_A: u64 = 0xC1C1_C1C1_C1C1_C1C1;
+    const FIND_B: u64 = 0xC2C2_C2C2_C2C2_C2C2;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsInit", CkRv::OK.0, 0, 0),
+    );
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, 0);
+    find.find_handles = Some((vec![FIND_A, FIND_B], false));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsFinal", CkRv::OK.0, 0, 0),
+    );
+    // Sign with the never-queried found key (the late-attach key).
+    let mut sign_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    sign_init.input0 = Some((FIND_B, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    // The sibling's type is established by an observed attribute
+    // call, then it signs with its exact label.
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.input0 = Some((FIND_A, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let mut sign_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    sign_init.input0 = Some((FIND_A, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    assert_eq!((joint.started(), joint.completed()), (2, 2));
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let unknown_row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .expect("first-observed key keeps a per-key row with unknown metadata");
+    assert_eq!(
+        (unknown_row.started, unknown_row.completed, unknown_row.active),
+        (1, 1, 0)
+    );
+    let object = committed
+        .objects
+        .iter()
+        .find(|row| row.object == unknown_row.object)
+        .expect("the row's object stands");
+    assert_eq!(object.origin, "first_observed");
+    assert_eq!(object.label, None, "no type is guessed");
+    let labelled = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.metadata_at_use == "rsa_2048")
+        .expect("established sibling keeps its exact label");
+    assert_eq!((labelled.started, labelled.completed), (1, 1));
+    assert_ne!(labelled.object, unknown_row.object);
+    assert!(
+        committed
+            .unknown_key_operations
+            .iter()
+            .all(|row| !(row.category == "sign" && row.reason == "metadata_unknown")),
+        "the attributed sign is not double-counted in the unknown bucket"
+    );
+    // The JSON section carries the new label under its new version.
+    let json = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(json["version"], 4, "unknown metadata rows stamp v4");
+    assert!(
+        json["key_operations"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row["metadata_at_use"] == "unknown"),
+        "JSON row carries the unknown metadata label"
+    );
+}
+
 /// N2: metadata freezes in the positional model receipt at the
 /// join: a receipt assembled after routing delay (the model learned
 /// an RSA label after the Init settled) carries no label — delay

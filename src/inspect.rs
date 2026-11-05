@@ -13,7 +13,8 @@ use crate::discovery::scan::{
 };
 use crate::inspect_identity::{
     InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
-    application_detail, application_json, application_label, begin_application, finish_application,
+    application_detail, application_executable, application_json, application_label,
+    begin_application, finish_application,
 };
 use crate::process::{ProcessView, ProcessViewId};
 use anyhow::Result;
@@ -100,8 +101,16 @@ fn render_text_with_application(
     };
     let mut out = String::new();
     let _ = writeln!(out, "{}", application_label(application, pid));
-    if let Some(detail) = application_detail(application) {
-        out.push_str(&detail);
+    // Verbose keeps the full image identity; concise names the executable
+    // only; quiet keeps the header label alone.
+    if verbose {
+        if let Some(detail) = application_detail(application) {
+            out.push_str(&detail);
+        }
+    } else if !quiet {
+        if let Some(exe) = application_executable(application) {
+            out.push_str(&exe);
+        }
     }
     let _ = write!(out, "pid {pid} — {} {word} mapped", modules.len());
     match outcome {
@@ -114,7 +123,9 @@ fn render_text_with_application(
         }
         ScanOutcome::Unavailable { reason, .. } => {
             out.push('\n');
-            if !quiet {
+            // Concise states the cause once, in the coverage line below;
+            // the full paragraph stays verbose-only.
+            if verbose {
                 if *reason == "ptrace" {
                     let _ = writeln!(
                         out,
@@ -166,7 +177,21 @@ fn render_text_with_application(
             );
         }
     } else if !quiet {
-        render_folded_skips(&mut out, outcome.skipped());
+        // When the scan itself was refused, its mem skip duplicates the
+        // coverage line; concise states the cause once.
+        let skips: Vec<Skipped> = match outcome {
+            ScanOutcome::Unavailable { .. } => {
+                let mem = format!("/proc/{pid}/mem");
+                outcome
+                    .skipped()
+                    .iter()
+                    .filter(|skip| skip.subject != mem)
+                    .cloned()
+                    .collect()
+            }
+            _ => outcome.skipped().to_vec(),
+        };
+        render_folded_skips(&mut out, &skips);
     }
     if !excluded.is_empty() {
         let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
@@ -212,6 +237,17 @@ fn render_text_with_application(
 fn render_module_summary(out: &mut String, module: &ScannedModule) {
     let functions: usize = module.tables.iter().map(|table| table.entries.len()).sum();
     let tables = module.tables.len();
+    // No walked tables means the module was listed from maps only, never
+    // deep-scanned: say so instead of "0 functions", which reads as
+    // "has no functions".
+    if tables == 0 {
+        let _ = writeln!(
+            out,
+            "module  {} — contents unknown (not deep-scanned)",
+            crate::render::escape_controls(&module.path),
+        );
+        return;
+    }
     let _ = writeln!(
         out,
         "module  {} — {functions} function{} ({} table{})",
@@ -259,11 +295,22 @@ fn render_folded_skips(out: &mut String, skipped: &[Skipped]) {
 fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
     match outcome {
         ScanOutcome::Unavailable { reason, .. } => {
-            let _ = writeln!(
-                out,
-                "coverage: partial — target memory unreadable ({})",
-                crate::render::escape_controls(reason)
-            );
+            // Concise states the refused-scan cause once, here: the
+            // paragraph and mem skip above stay verbose-only.
+            if *reason == "ptrace" {
+                let _ = writeln!(
+                    out,
+                    "coverage: partial — cannot read process memory without root (sudo); \
+                     providers listed from its memory map only"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "coverage: partial — target memory unreadable ({}); providers listed \
+                     from its memory map only",
+                    crate::render::escape_controls(reason)
+                );
+            }
         }
         ScanOutcome::Scanned {
             modules, skipped, ..
@@ -1302,15 +1349,36 @@ mod tests {
             }],
             skipped: vec![],
         };
-        let out = render_text(4242, &outcome, &PinnedObjects::empty());
-        assert!(
-            out.contains("libsofthsm2.so"),
-            "modules are known without mem: {out}"
+        // Concise states the refused-scan cause once, in coverage; the
+        // full paragraph stays verbose-only.
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
         );
-        assert!(out.contains("ptrace"), "the reason must be named: {out}");
         assert!(
-            out.contains("CAP_SYS_PTRACE") || out.contains("ptrace_scope"),
-            "say what would fix it: {out}"
+            concise.contains("libsofthsm2.so"),
+            "modules are known without mem: {concise}"
+        );
+        assert!(
+            concise.contains("cannot read process memory without root (sudo)"),
+            "concise names the cause once: {concise}"
+        );
+        assert!(
+            !concise.contains("table scan unavailable"),
+            "concise keeps no paragraph: {concise}"
+        );
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(verbose.contains("ptrace"), "the reason must be named: {verbose}");
+        assert!(
+            verbose.contains("CAP_SYS_PTRACE") || verbose.contains("ptrace_scope"),
+            "say what would fix it: {verbose}"
         );
     }
 

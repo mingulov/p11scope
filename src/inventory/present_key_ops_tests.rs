@@ -263,10 +263,12 @@ fn key_ops_line_counts_not_attributed_beside_exact_rows() {
 }
 
 /// DEMO-4: a first-observed key row under the `unknown` metadata
-/// label reads in text as type unknown / first seen before attach,
-/// beside the exact tallies.
+/// label reads in text as a type not established in the observed
+/// window, beside the exact tallies. The text claims no timing it
+/// cannot prove (the key may predate attach or its attribute call may
+/// simply be unobserved).
 #[test]
-fn key_ops_line_names_unknown_type_first_seen_before_attach() {
+fn key_ops_line_names_unknown_type_not_established_in_window() {
     let mut observations = populated(9);
     let mut row = key_row("sign", "key", 2, 0, 0, "operations");
     row.metadata_at_use = "unknown";
@@ -279,7 +281,7 @@ fn key_ops_line_names_unknown_type_first_seen_before_attach() {
         "the tallies stay exact: {line}"
     );
     assert!(
-        line.ends_with("; type unknown: first seen before attach (1 key row)"),
+        line.ends_with("; type not established in the observed window (1 key row)"),
         "the unknown type is named, never guessed: {line}"
     );
 }

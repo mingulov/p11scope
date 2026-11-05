@@ -484,7 +484,7 @@ fn inventory_capacity_public_exact_discoverable_boundaries() {
 }
 
 #[test]
-fn inventory_capacity_default_refuses_and_override_admits() {
+fn inventory_capacity_default_admits_and_override_admits() {
     let _guard = serial_guard();
     let dir = tmp("inventory-selected-endpoint-capacity");
     let driver = gcc(
@@ -588,9 +588,9 @@ fn inventory_capacity_default_refuses_and_override_admits() {
         );
         let document: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         let budget = &document["budgets"]["inventory_endpoints"];
-        assert_eq!(budget["limit"], selected.unwrap_or(4096));
+        assert_eq!(budget["limit"], selected.unwrap_or(32768));
         assert_eq!(document["budgets"]["endpoints"]["limit"], 1_048_576);
-        if selected.is_some() {
+        {
             assert_eq!(budget["occupied"], physical_union.len());
             assert_eq!(budget["refused"], 0);
             assert_eq!(
@@ -631,17 +631,6 @@ fn inventory_capacity_default_refuses_and_override_admits() {
                     }
                 );
             }
-        } else {
-            assert!(budget["occupied"].as_u64().unwrap() <= 4096);
-            assert!(
-                document["modules"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|module| module["admission"]["state"] == "refused"
-                        && module["admission"]["reasons"].to_string().contains("4096")),
-                "the default lowering refuses owned demand and names its physical endpoint capacity"
-            );
         }
         drop(fixture);
     }

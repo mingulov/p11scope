@@ -3006,19 +3006,41 @@ fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerb
     } else {
         "provider files"
     };
-    // The scan split in words: the full three-way count only when the
-    // scan actually mixed methods.
-    let detail = if catalog.maps_matched == 0 && catalog.scanned == catalog.enumerated {
-        format!("all {} checked in detail", catalog.enumerated)
+    // The scan split in words, counted from the same process table the
+    // `processes:` line below summarizes — so "checked in detail" is one
+    // count in both places. Memory-unreadable members are named
+    // separately, never folded into the deep-scanned total.
+    let checked = catalog
+        .processes
+        .iter()
+        .filter(|process| matches!(process.status, MemberStatus::Scanned))
+        .count();
+    let matched = catalog
+        .processes
+        .iter()
+        .filter(|process| matches!(process.status, MemberStatus::MapsMatched))
+        .count();
+    let mem_unreadable = catalog
+        .processes
+        .iter()
+        .filter(|process| {
+            matches!(process.status, MemberStatus::MemoryUnavailable { .. })
+        })
+        .count();
+    let found = catalog.processes.len();
+    let detail = if matched == 0 && mem_unreadable == 0 && checked == found {
+        format!("all {found} checked in detail")
+    } else if mem_unreadable == 0 {
+        format!("{checked} checked in detail, {matched} matched from maps, of {found} found")
     } else {
         format!(
-            "{} checked in detail, {} matched from maps, of {} found",
-            catalog.scanned, catalog.maps_matched, catalog.enumerated
+            "{checked} checked in detail, {matched} matched from maps, {mem_unreadable} memory \
+             unreadable, of {found} found"
         )
     };
     let _ = writeln!(
         out,
-        "system — {} {files} mapped in {} processes ({detail}; cap {}; scan took {} ms; {})",
+        "system — {} {files} mapped in {} processes ({detail}; cap {}; deep scans {} ms; {})",
         catalog.objects.len(),
         catalog.processes.len(),
         catalog.cap,

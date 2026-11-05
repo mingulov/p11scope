@@ -513,6 +513,36 @@ struct WholeFixture {
     lookalikes: Option<u64>,
 }
 
+/// JK-22a relaxed corner: ambient occupancy can leave a closure array with
+/// room for a reserve-capped prefix but not for whole, so relaxed runs
+/// accept the named prefix gap beside the whole outcomes. Strict pins stay
+/// exact: N is always refused whole ahead of C in default (its published
+/// union exceeds the ceiling), which blocks C's prefix, and wide admits C
+/// whole.
+fn validate_closure_admission(
+    admission: WholeAdmission<'_>,
+    fixture: WholeFixture,
+    wide: bool,
+    strict: bool,
+) -> Result<(), String> {
+    match validate_whole_admission(admission, fixture, wide, strict) {
+        Ok(()) => Ok(()),
+        Err(error) if !strict => {
+            let reason = admission.reason.unwrap_or("");
+            if admission.state == "refused"
+                && admission.class == "closure_array"
+                && reason.contains("template tables attached")
+                && reason.contains("(closure_prefix)")
+            {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 const NSS: WholeFixture = WholeFixture {
     class: "corroborated",
     demand: 544,
@@ -524,6 +554,7 @@ const CLOSURE: WholeFixture = WholeFixture {
     lookalikes: Some(65),
 };
 
+#[derive(Clone, Copy)]
 struct WholeAdmission<'a> {
     state: &'a str,
     class: &'a str,
@@ -721,6 +752,28 @@ fn catalog_admission_oracle_rejects_admitted_prefixes() {
 }
 
 #[test]
+fn catalog_closure_admission_accepts_prefix_gap_only_when_relaxed() {
+    let reason = "33 of 65 template tables attached; calls through the others are not counted (closure_prefix)";
+    let json =
+        serde_json::json!({ "state": "refused", "class": "closure_array", "reason": reason });
+    let text = format!("  admission  refused (closure_array): {reason} [scan-only admission]");
+    for wide in [false, true] {
+        validate_closure_admission(json_whole_admission(&json).unwrap(), CLOSURE, wide, false)
+            .unwrap();
+        validate_closure_admission(text_whole_admission(&text).unwrap(), CLOSURE, wide, false)
+            .unwrap();
+        assert!(
+            validate_closure_admission(json_whole_admission(&json).unwrap(), CLOSURE, wide, true,)
+                .is_err()
+        );
+        assert!(
+            validate_closure_admission(text_whole_admission(&text).unwrap(), CLOSURE, wide, true,)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
     let _guard = serial_guard();
     let dir = tmp("catalog-reader-partial-exports");
@@ -746,11 +799,12 @@ fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
         Some("admitted") => assert_eq!(b["admission"]["endpoints"], 92),
         Some("refused") if !strict_admission() => {
             assert!(b["admission"]["endpoints"].is_null());
+            let reason = b["admission"]["reason"].as_str().unwrap();
             assert!(
-                b["admission"]["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains("attach slots")
+                reason.contains("attach slots")
+                    || (reason.contains("endpoints attached")
+                        && reason.contains("(provider_prefix)")),
+                "relaxed B refusal must be capacity-shaped or a named prefix gap: {reason}"
             );
         }
         state => panic!("unexpected partial-export admission: {state:?}"),
@@ -884,7 +938,7 @@ fn catalog_reader_finds_every_fixture_object() {
         0
     );
     assert_eq!(c["admission"]["class"], "closure_array");
-    validate_whole_admission(
+    validate_closure_admission(
         json_whole_admission(&c["admission"]).unwrap(),
         CLOSURE,
         wide,
@@ -1092,8 +1146,14 @@ fn catalog_reader_finds_every_fixture_object() {
                     .is_some_and(|header| header.ends_with(path.to_str().unwrap()))
             })
             .unwrap_or_else(|| panic!("text must contain the {name} object block: {text}"));
-        validate_whole_admission(text_whole_admission(block).unwrap(), fixture, wide, strict)
-            .unwrap_or_else(|error| panic!("{name} text admission: {error}: {block}"));
+        let admission = text_whole_admission(block).unwrap();
+        if name == "closure.so" {
+            validate_closure_admission(admission, fixture, wide, strict)
+                .unwrap_or_else(|error| panic!("{name} text admission: {error}: {block}"));
+        } else {
+            validate_whole_admission(admission, fixture, wide, strict)
+                .unwrap_or_else(|error| panic!("{name} text admission: {error}: {block}"));
+        }
     }
     for phase in ["enumerating", "deep-scanning", "rendering"] {
         assert!(

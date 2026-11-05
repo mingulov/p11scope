@@ -51,14 +51,21 @@ leading-templates prefix with a named partial gap only when the capture's
 first plan held the closure beside a non-closure provider, or when its
 opened file matches an operator-named `--module` path, and its published
 tables only when unnamed (mapped mid-capture, or alone in the first plan)
-— refused whole when none of those admit. Shared scope stays
-whole-or-nothing for closures (never a heuristic prefix). Its 6,530+
+— refused whole when none of those admit. Shared scope (`--system`,
+`--cgroup`) admits the same reserve-capped prefix with the same named
+`closure_prefix` partial gap. Its 6,530+
 endpoints exceed every current ceiling, so the proxy layer itself is only
 ever covered by that prefix (late-start beside a provider, or
 operator-named) or its published tables (mid-capture, or alone in the first
 plan) while the backends behind it attach (costs of covering
 it are
 measured in `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
+An ordinary provider that does not fit whole in a shared-scope Detailed
+capture is likewise admitted on the leading-tables prefix that fits,
+with a named `provider_prefix` partial gap stating attached versus
+needed endpoints; it is refused whole only when not even its strongest
+table fits. Inventory, counter and broad admission keep their
+complete-union whole rule.
 
 Endpoint selection (`--select-endpoint` with `--mode metrics` and
 `--counter-mode`) details one function from the broad counter's own

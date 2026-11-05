@@ -2088,6 +2088,7 @@ fn excluded_lines(ev: &Evidence) -> String {
 fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
     let status = if crate::plan::is_growth_omission(&skipped.reason)
         || crate::plan::is_closure_array_prefix(&skipped.reason)
+        || crate::plan::is_provider_prefix(&skipped.reason)
     {
         "partially covered"
     } else {
@@ -2499,6 +2500,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                     .filter(|module| {
                         crate::plan::is_growth_omission(&module.reason)
                             || crate::plan::is_closure_array_prefix(&module.reason)
+                            || crate::plan::is_provider_prefix(&module.reason)
                     })
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;

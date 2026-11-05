@@ -36,7 +36,9 @@ and [pre-arm mapping-instant witness](#pre-arm-mapping-instant-witness-v060),
 which loads the short-lived kernel witness behind `--prearm-module` and
 publishes no new field,
 and [reload-disclosure linkage publication](#reload-disclosure-linkage-publication-b17-leg-2-2026-11-04),
-which names the `instance_reload_not_excluded` labels-and-counts projection.**
+which names the `instance_reload_not_excluded` labels-and-counts projection,
+and [gap-admission prefix publication](#gap-admission-prefix-publication-jk-22a),
+which names the admitted-prefix counts in module gaps.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1492,3 +1494,21 @@ authority from the generic rows.
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Reload-disclosure linkage (`instance_reload_not_excluded`) | A pure projection of the staged reload-disclosure ledger in the semantic finalizer (the `reload_not_excluded` map plus the `continued_across_global`/`joined_across_global` counters). No target-memory, argument, pointer, map or file read happens for this field: each ledger identity's router IDs resolve through their registered instances and group by the one module conversion the ledger recorded — never a second lookup — so the named module is always the recorded one. Router IDs that never registered are omitted; identities with nothing nameable are dropped. The key stays absent (never null) when the capture produced no disclosure. | Public inventory JSON only: the two capture-monotonic saturating u64 router totals plus `identities`, one entry per affected registry module in numeric module order with its disclosed instance references in numeric instance order (`{"module": "mN", "instances": ["iN", ...]}`), same-module entries merged into one sorted union. Labels are the monotonic capture-local `mN`/`iN` allocation, never a raw handle, address or digest. An empty `identities` list with nonzero counts means continuations projected to no nameable identity (mint exhaustion, an all-unregistered identity, or ledger-cap shed); the counts stay exact in each case. | No router ID, file slot, native domain, task cookie, exec ID, address, session, slot, async handle, argv, environ, PIN, key or payload value reaches output. Registration refusals disclose under the existing `instance semantics refused` gap, conversion refusals under `semantic input refused`, and ledger-cap shed under `reload disclosure identities shed`. Required evidence: the 12-instance reverse-order merge/sort twins with the `m10`/`m11` lexicographic-separation guard, the mint-exhaustion empty-with-counts twin, the unregistered-omission and no-private-identity pins at the reload-disclosure seam, and the matching shape in `docs/schema/inventory-v1.md`. |
+
+## Gap-admission prefix publication (JK-22a)
+
+**Status: IMPLEMENTED in v0.6.0 by ruling JK-22a (owner rule 2026-11-05):
+when a module does not fit whole, admission attaches the leading prefix
+that fits and reports the remainder as a named partial gap instead of
+refusing the module whole. Counts and reason names only; no new capture,
+no new read, no new retained field.** The counts are admission
+accounting over already-decoded tables and endpoints (how many tables
+or endpoints the module needed, how many attached). The module path in
+the gap record is the same verbatim discovery label the whole-refusal
+record already carries. Allowlist-v1 bytes are unchanged apart from
+the gap-reason text itself.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Closure prefix gap (`closure_prefix`) | A pure projection of the planner's prefix decision: the count of leading template tables attached and the count of distinct tables decoded for that closure-array object. No target-memory, argument, pointer or file read happens for this field; the tables were decoded by the existing scan. The record exists only when at least one table attached and at least one did not. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` ends with the `(closure_prefix)` name beside the `N of M template tables attached` counts, in every scope. Terminal text carries the same reason through the `Module gaps` section. A zero-table outcome stays a whole refusal, never a `0 of M` partial. | No address, offset, entry name, table content, key or payload value reaches output. A refused whole closure keeps its existing refusal text. Required evidence: the shared-scope prefix test with its `(closure_prefix)` pin, the named-scope prefix tests, the whole-admission healthy twin, and the start-anchored `N of M` reader pins in `scripts/check-capture-evidence.py` and `scripts/verify-p11kit-remote.sh`. |
+| Provider prefix gap (`provider_prefix`) | A pure projection of the planner's prefix decision: the count of leading endpoints attached and the count of fresh endpoints the shared-scope Detailed provider needed. No target-memory, argument, pointer or file read happens for this field; the endpoints were decoded by the existing scan. The record exists only when at least one endpoint attached and at least one did not; a provider whose strongest table does not fit stays a whole refusal. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` carries the `A of N endpoints attached` counts with the `(provider_prefix)` name, plus the reserve clause when the module was held out of the shared-scope reserve. Terminal text carries the same reason through the `Module gaps` section with `partially covered` status. | No address, offset, entry name, table content, key or payload value reaches output. Operator (manifest), Inventory, counter and broad modules keep their whole-only rule and existing refusal text. Required evidence: the shared-scope provider-prefix test with its `(provider_prefix)` pin, the exact-fit healthy twin, the strongest-table whole-refusal pins, and the catalog prefix-gap test. |

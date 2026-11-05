@@ -6557,8 +6557,11 @@ mod tests {
             // same aim rule the capture engine keeps: an aimed capture
             // admits first-come with no reserve, so a 600-endpoint
             // heuristic provider admits its strongest 450-endpoint prefix
-            // and discloses the spilled table, where the unaimed capture
-            // refuses the module whole at the reserve.
+            // and discloses the spilled table. JK-22a: the unaimed capture
+            // admits the reserve-capped 300-endpoint prefix with a named
+            // provider-prefix gap instead of refusing the module whole; the
+            // catalog still files a gapped module under `refused`, carrying
+            // the prefix reason.
             let aimed = scoped_catalog(
                 heuristic_provider(4, 150),
                 AdmissionPolicy::detailed(),
@@ -6581,8 +6584,13 @@ mod tests {
                 AdmissionRecord::Refused { class, reason } => {
                     assert_eq!(*class, "heuristic");
                     assert!(reason.contains("reserved"), "{reason}");
+                    assert!(
+                        reason.contains("300 of 600 endpoints attached")
+                            && reason.contains("(provider_prefix)"),
+                        "the unaimed inspect carries the prefix gap: {reason}"
+                    );
                 }
-                other => panic!("the unaimed inspect must refuse whole, got {other:?}"),
+                other => panic!("the unaimed inspect must file the gapped prefix, got {other:?}"),
             }
         }
 

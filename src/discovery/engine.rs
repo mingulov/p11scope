@@ -2617,9 +2617,13 @@ impl CaptureFacts {
             );
             // PA-5 I1: a later prefix record replaces an earlier whole-refusal
             // record for the same closure module. Without this the report says
-            // "not attached" while the prefix is counting calls.
-            let prefix_replaces_whole = plan::is_closure_array_refusal(&known.reason)
-                && plan::is_closure_array_prefix(&refused.reason);
+            // "not attached" while the prefix is counting calls. JK-22a: the
+            // same holds for a later provider-prefix record replacing an
+            // earlier whole refusal for the same provider module.
+            let prefix_replaces_whole = (plan::is_closure_array_refusal(&known.reason)
+                && plan::is_closure_array_prefix(&refused.reason))
+                || (plan::whole_refusal_needed_count(&known.reason).is_some()
+                    && plan::is_provider_prefix(&refused.reason));
             // An awaiting-publication record ranks below any counted capacity
             // refusal for the same module: once its published set names a
             // demand, the earlier "nothing published yet" is stale. Never the

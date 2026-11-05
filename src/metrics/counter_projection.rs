@@ -753,6 +753,8 @@ fn stage_projection(
         charge(tree_bytes::<u64, u64>(row.rv_counts.len()).ok_or_else(budget)?)?;
     }
     let storage = reserve.reserve(bytes).map_err(|_| budget())?;
+    // Fold exec-generation duplicates like the legacy reader: two slots
+    // for one function (retired plus armed) report once, summed.
     let mut reports = Vec::with_capacity(rows.len());
     for raw in rows {
         let row = raw.view();
@@ -784,7 +786,7 @@ fn stage_projection(
             ordinals,
         });
     }
-    Ok((reports, storage))
+    Ok((crate::metrics::merge_slot_reports(reports), storage))
 }
 
 #[cfg(test)]

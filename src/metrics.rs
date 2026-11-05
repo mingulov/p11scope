@@ -366,9 +366,11 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
 /// exec between them) retire one generation's slots and arm the
 /// next, and the aggregate table must show the function once with
 /// summed counts, not once per generation. Rows for different files
-/// stay apart: sharing a name never merges two modules. First-seen
-/// order is kept; a merged row keeps the first row's identity fields
-/// and sums every counter, bucket and return tally.
+/// or different counter modes stay apart: sharing a name never
+/// merges two modules, and counts never merge with timing rows.
+/// First-seen order is kept; a merged row keeps the first row's
+/// mode, authorization and module attribution alongside its identity
+/// fields, and sums every counter, bucket and return tally.
 pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
     struct Key {
@@ -376,6 +378,7 @@ pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
         aliased: bool,
         target: Option<((u64, u64), u64, Option<String>)>,
         file_offset: u64,
+        mode: u8,
     }
     let mut index: BTreeMap<Key, usize> = BTreeMap::new();
     let mut merged: Vec<SlotReport> = Vec::with_capacity(reports.len());
@@ -388,6 +391,7 @@ pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
                 .as_ref()
                 .map(|target| (target.dev, target.ino, target.sha256.clone())),
             file_offset: report.file_offset,
+            mode: report.mode as u8,
         };
         let Some(position) = index.get(&key).copied() else {
             index.insert(key, merged.len());

@@ -15337,10 +15337,11 @@ fn key_operation_joint_failure_delivery_retains_projection() {
 }
 
 /// N1 guard: with no install anywhere the registry reduces S1Only
-/// and capture stays unavailable exactly as before — the N1 path
-/// cuts no production scope.
+/// — the N1 path cuts no production scope. On a linked lane the
+/// observed key call is not silently dropped: it counts once as
+/// `started_before_attach` in a partial section, with no row.
 #[test]
-fn key_operation_s1only_capture_stays_unavailable() {
+fn key_operation_s1only_capture_counts_calls_without_rows() {
     let mut guarded = GuardedScene::new();
     let (key, id) = guarded.register(1);
     assert_eq!(
@@ -15355,8 +15356,15 @@ fn key_operation_s1only_capture_stays_unavailable() {
     assert_eq!(guarded.registry.joint_feeds(), 0);
     let observations = guarded.registry.joint_observations(7);
     assert_eq!(observations.revision, 7);
-    assert_eq!(observations.status, ObsStatus::Unavailable);
+    assert_eq!(observations.status, ObsStatus::Partial);
     assert_eq!(observations.reason, "bootstrap_unavailable");
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: 1,
+        }]
+    );
     assert!(observations.key_operations.is_empty());
     assert!(guarded.registry.keyuse_for_test().open().is_empty());
     assert!(
@@ -15810,7 +15818,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
     assert_eq!(g.registry.keyuse_for_test().open().len(), 2);
     assert_eq!(
         g.registry.joint_observations(1).reason,
-        "bootstrap_unavailable"
+        "proof_refused_fallback"
     );
     if invalidate {
         let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
@@ -15865,7 +15873,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
     );
     assert_eq!(
         g.registry.joint_observations(2).reason,
-        "bootstrap_unavailable"
+        "proof_refused_fallback"
     );
     assert_eq!(
         g.scene.adapter.ledger().census(),
@@ -15887,7 +15895,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
         assert!(g.registry.keyuse_for_test().open().is_empty());
         assert_eq!(
             g.registry.joint_observations(3).reason,
-            "bootstrap_unavailable",
+            "proof_refused_fallback",
             "inert late delivery creates no object authority"
         );
     }
@@ -15938,7 +15946,7 @@ fn key_operation_n15_first_unsealable_fallback_keeps_accounting() {
     );
     assert_eq!(
         g.registry.joint_observations(1).reason,
-        "bootstrap_unavailable"
+        "proof_refused_fallback"
     );
 }
 
@@ -17384,15 +17392,18 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         0,
         "the duplicate 1025th init opens nothing and refuses nothing"
     );
-    assert_eq!(
+    // The fallback invents no object facts, but its replayed calls
+    // are counted, not dropped: the section turns partial under the
+    // fallback reason with every replayed call in one count.
+    assert_fallback_counts_only(
         main.coordinator.registry().joint_observations(7),
-        observations_before,
-        "the old publication survives the fallback intact"
+        &observations_before,
+        1025,
     );
-    assert_eq!(
+    assert_no_birth_counts_only(
         twin.coordinator.registry().joint_observations(7),
-        observations_before,
-        "the twin never invents object facts either"
+        &observations_before,
+        1025,
     );
     println!(
         "H3_MEM_1024_1025 {{\"staged_bytes_1024\": {bytes_1024}, \
@@ -17818,15 +17829,15 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
         1,
         "the refused assoc lands exactly one refused row"
     );
-    assert_eq!(
+    assert_fallback_counts_only(
         refusal.coordinator.registry().joint_observations(7),
-        r_observations_before,
-        "the fallback invents no object facts"
+        &r_observations_before,
+        1,
     );
-    assert_eq!(
+    assert_no_birth_counts_only(
         s1.coordinator.registry().joint_observations(7),
-        s1_observations_before,
-        "the direct twin invents no object facts either"
+        &s1_observations_before,
+        1,
     );
     for pipeline in [healthy, s1, refusal] {
         let registry = pipeline.coordinator.registry();
@@ -21687,6 +21698,61 @@ fn key_operation_linked_without_birth_publishes_partial_with_counted_calls() {
         "nothing observed stays unavailable"
     );
     assert!(observations.unattributed.is_empty());
+}
+
+/// A never-Joint direct twin on a linked lane: no session, object or
+/// key row is invented, and its direct key calls count once as
+/// `started_before_attach` in a partial section.
+fn assert_no_birth_counts_only(
+    after: crate::key_operation_projection::ObjectObservations,
+    before: &crate::key_operation_projection::ObjectObservations,
+    direct: u64,
+) {
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "bootstrap_unavailable"),
+        "counted direct calls make the no-birth section partial"
+    );
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: direct,
+        }],
+        "every direct key call counts once"
+    );
+    assert_eq!(after.sessions, before.sessions, "no session invented");
+    assert_eq!(after.objects, before.objects, "no object invented");
+    assert_eq!(after.key_operations, before.key_operations, "no key row invented");
+    assert_eq!(after.unknown_key_operations, before.unknown_key_operations);
+}
+
+/// A fallback before any Joint delivery: no session, object or key
+/// row appears beyond the earlier publication, and the replayed
+/// calls count once under `proof_refused_fallback` in a partial
+/// section (never a silent unavailable).
+fn assert_fallback_counts_only(
+    after: crate::key_operation_projection::ObjectObservations,
+    before: &crate::key_operation_projection::ObjectObservations,
+    replayed: u64,
+) {
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "proof_refused_fallback"),
+        "the counted fallback names itself"
+    );
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "proof_refused_fallback",
+            count: replayed,
+        }],
+        "every replayed call counts once"
+    );
+    assert_eq!(after.sessions, before.sessions, "no session invented");
+    assert_eq!(after.objects, before.objects, "no object invented");
+    assert_eq!(after.key_operations, before.key_operations, "no key row invented");
+    assert_eq!(after.unknown_key_operations, before.unknown_key_operations);
 }
 
 /// Late attach: an instance registered without a witnessed birth

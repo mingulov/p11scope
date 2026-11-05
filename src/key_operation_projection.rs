@@ -1100,6 +1100,10 @@ pub(crate) mod producer {
     /// Count what no per-key row can claim, per finite reason, from
     /// the feeds' retained counters. Derived only from counts
     /// already retained — no new capture. Zero reasons are omitted.
+    pub(crate) fn unattributed(stagings: &[&JointStaging]) -> Vec<UnattributedRow> {
+        collect_unattributed(stagings)
+    }
+
     fn collect_unattributed(stagings: &[&JointStaging]) -> Vec<UnattributedRow> {
         let sum = |pick: &dyn Fn(&JointStaging) -> u64| {
             stagings

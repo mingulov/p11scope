@@ -2356,8 +2356,23 @@ impl CallerRegistry {
         revision: u64,
     ) -> crate::key_operation_projection::ObjectObservations {
         let linked = self.journal_linked();
+        let stagings: Vec<&JointStaging> = self
+            .instance_state
+            .semantics
+            .values()
+            .map(|record| &record.feed)
+            .collect();
+        // Calls refused before application for an unproven or
+        // unbound caller never reach a feed: count them as not
+        // attributed, beside the rows of every proven caller.
+        let refused = self
+            .instance_state
+            .instance_calls_refused
+            .values()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+            .saturating_add(self.foreign_unrouted_calls);
         let Some(projection) = self.key_projection.as_ref() else {
-            return crate::key_operation_projection::ObjectObservations::unavailable(
+            let mut observations = crate::key_operation_projection::ObjectObservations::unavailable(
                 revision,
                 if linked {
                     "bootstrap_unavailable"
@@ -2365,13 +2380,29 @@ impl CallerRegistry {
                     "journal_unavailable"
                 },
             );
+            // Linked, but no feed ever reached Joint (no birth
+            // landed): the key calls the feeds and the refusal path
+            // did see still count under their named reasons, and
+            // the section is partial, never a silent unavailable
+            // (observer-first Chromium on fedora).
+            if linked {
+                for row in crate::key_operation_projection::producer::unattributed(&stagings) {
+                    observations.add_unattributed(row.reason, row.count);
+                }
+                observations.add_unattributed("foreign_or_unproven_caller", refused);
+                if !observations.unattributed.is_empty() {
+                    // Same reason precedence as the producer: a
+                    // counted loss or fallback names itself.
+                    observations.status = crate::key_operation_projection::ObsStatus::Partial;
+                    if stagings.iter().any(|staging| staging.degraded_loss()) {
+                        observations.reason = "authority_lost";
+                    } else if stagings.iter().any(|staging| staging.fell_back()) {
+                        observations.reason = "proof_refused_fallback";
+                    }
+                }
+            }
+            return observations;
         };
-        let stagings: Vec<&JointStaging> = self
-            .instance_state
-            .semantics
-            .values()
-            .map(|record| &record.feed)
-            .collect();
         let mut observations = if linked {
             crate::key_operation_projection::producer::commit(
                 revision,
@@ -2391,15 +2422,6 @@ impl CallerRegistry {
                 linked,
             )
         };
-        // Calls refused before application for an unproven or
-        // unbound caller never reach a feed: count them here as not
-        // attributed, beside the rows of every proven caller.
-        let refused = self
-            .instance_state
-            .instance_calls_refused
-            .values()
-            .fold(0u64, |total, count| total.saturating_add(*count))
-            .saturating_add(self.foreign_unrouted_calls);
         observations.add_unattributed("foreign_or_unproven_caller", refused);
         observations
     }
@@ -2814,6 +2836,7 @@ impl CallerRegistry {
         // ordered fallback before the first seal/failure delivery.
         // The latch carries no object or publication authority.
         let joint_path = self.joint_accounting;
+        let linked = self.journal_linked();
         let refused = if joint_path {
             self.reduce_with_joint_path(id, &input, ledger.as_deref_mut())
         } else {
@@ -2822,6 +2845,15 @@ impl CallerRegistry {
                 .semantics
                 .get_mut(&id)
                 .expect("retained edge");
+            // A linked Joint lane whose feeds never reached Joint (no
+            // birth landed yet) still counts each direct key call
+            // once, under the reason that kept it from attribution
+            // (`started_before_attach` for a feed without a witnessed
+            // birth): without this the whole section read
+            // `unavailable` with the observed calls unaccounted.
+            if linked {
+                state.feed.note_direct_reduction(&input.facts.function);
+            }
             state
                 .semantics
                 .as_mut()

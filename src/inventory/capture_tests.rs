@@ -7536,6 +7536,37 @@ mod publication_progress_tests {
             );
         }
 
+        // The post-pass coverage mark names the unscanned processes,
+        // not just their count: two newcomers (one hooks twice) leave
+        // one gap listing both pids.
+        #[test]
+        fn post_pass_exec_newcomers_name_their_pids() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_execs.push_back(vec![9, 10, 9]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("two post-pass EXEC newcomers must mark unknown coverage");
+            assert!(
+                reason.contains("pids 9, 10"),
+                "the gap must name the unscanned pids, got: {reason}"
+            );
+        }
+
         // Twin: a stop with no post-pass EXEC hooks leaves no coverage
         // mark — the disclosure fires only when newcomers exist.
         #[test]

@@ -2625,6 +2625,17 @@ mod tests {
         ));
     }
 
+    /// The global scan promise bounds its late edge: inventory
+    /// rescans in passes, and a process that starts after its last
+    /// pass is reported, not scanned.
+    #[test]
+    fn global_help_bounds_late_process_scanning() {
+        assert!(
+            USAGE.contains("a process that starts after its last pass is reported, not scanned"),
+            "{USAGE}"
+        );
+    }
+
     /// The C8 harness probes `--capture` on a usage line that names
     /// `p11scope inventory` (`inventory-native-oracle.py probe-help`): every
     /// inventory scope usage line carries it, in global and scoped help alike.

@@ -11977,7 +11977,7 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
     }
     let legacy = contract_section(
         acquire,
-        "let legacy = || {",
+        "let legacy = ||",
         "        };\n        if terminal {",
     )?;
     let (terminal, live) = legacy
@@ -11985,14 +11985,14 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
         .ok_or("missing legacy live reads")?;
     require_before(
         terminal,
-        "super::read(session, plan)?",
-        "super::kernel_evidence(session)?",
+        "super::read_with_gaps(session, plan)?",
+        "super::kernel_evidence_with_gaps(session)?",
         "legacy terminal read order",
     )?;
     require_before(
         live,
-        "super::kernel_evidence(session)?",
-        "super::read(session, plan)?",
+        "super::kernel_evidence_with_gaps(session)?",
+        "super::read_with_gaps(session, plan)?",
         "legacy live read order",
     )?;
     let fresh = contract_section(
@@ -12033,18 +12033,31 @@ fn assert_profile_collection_wiring(run: &str, projection: &str) -> Result<(), S
     )?;
     require_contract_marker(
         terminal,
-        "self.fresh_with(\n            plan, pins, profile, binding, acquire, legacy, generation, kernel,\n        )?\n        .require_terminal()",
-        "fresh terminal observation",
-    )?;
-    let terminal_acceptance = contract_section(
-        projection,
-        "    fn require_terminal(self)",
-        "/// The one collection owner",
+        "self.fresh_with(",
+        "terminal acquires a fresh observation",
     )?;
     require_contract_marker(
-        terminal_acceptance,
-        "if !self.new_acquisition || self.counter().is_some_and(|snapshot| !snapshot.is_fresh())",
-        "terminal rejects cached or unsuccessful observations",
+        terminal,
+        "never acquired a snapshot fails",
+        "terminal publishes stale, failing only without a snapshot",
+    )?;
+    if terminal.contains("require_terminal") {
+        return Err("terminal must publish stale, not reject it via require_terminal".into());
+    }
+    let from_counter = contract_section(
+        projection,
+        "    fn from_counter(snapshot: CounterSnapshot)",
+        "    pub(crate) fn reports(",
+    )?;
+    require_contract_marker(
+        from_counter,
+        "!snapshot.has_data()",
+        "terminal fails only without an acquired snapshot",
+    )?;
+    require_contract_marker(
+        from_counter,
+        "counter collection unavailable",
+        "unavailable terminal without data",
     )
 }
 
@@ -12080,9 +12093,9 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "Ok(None)",
         ),
         (
-            ".require_terminal()",
-            ".allow_cached_terminal()",
-            "fresh terminal observation",
+            "never acquired a snapshot fails",
+            "always fails",
+            "terminal publishes stale, failing only without a snapshot",
         ),
         (
             "kernel.ring_loss = 0;",

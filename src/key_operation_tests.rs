@@ -20397,8 +20397,15 @@ fn key_operation_info_call_before_seal_keeps_joint_feed() {
     // The info call arrives before the seal. It rides a
     // fixture-minted H0 ordinal (info calls are not attested
     // shapes); its S1 facts mirror the async carve-out fixture.
-    let info_pos = guarded.scene.fixture.admit_function("C_SignInit").h0_ordinal();
-    assert!(info_pos > init_pos, "non-vacuous: info call after the queue");
+    let info_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(
+        info_pos > init_pos,
+        "non-vacuous: info call after the queue"
+    );
     let info_facts = SemanticCall {
         function: "C_GetSlotInfo".into(),
         session: SESSION,
@@ -20485,7 +20492,14 @@ fn key_operation_partial_publication_counts_unattributed() {
     let mut keyuse = KeyUseReducer::new();
     let mut sink = Vec::new();
     for call in sign_flow()[0..3].iter() {
-        drive_quantum(&mut scene, &mut staging, &mut edge, &mut keyuse, &mut sink, call);
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut edge,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
     }
     let healthy = commit(31, &[&staging], &scene.model.project(), &keyuse);
     assert_eq!(healthy.status, ObsStatus::Populated);
@@ -20533,7 +20547,12 @@ fn key_operation_partial_publication_counts_unattributed() {
         outcome,
         crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
     ));
-    let fell = commit(32, &[&fall_staging], &fall_scene.model.project(), &fall_keyuse);
+    let fell = commit(
+        32,
+        &[&fall_staging],
+        &fall_scene.model.project(),
+        &fall_keyuse,
+    );
     assert_eq!(
         fell.status,
         ObsStatus::Partial,
@@ -20593,7 +20612,12 @@ fn key_operation_partial_publication_counts_unattributed() {
         outcome,
         crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
     ));
-    let lost = commit(33, &[&loss_staging], &loss_scene.model.project(), &loss_keyuse);
+    let lost = commit(
+        33,
+        &[&loss_staging],
+        &loss_scene.model.project(),
+        &loss_keyuse,
+    );
     assert_eq!(lost.status, ObsStatus::Partial);
     assert_eq!(lost.reason, "authority_lost");
     assert_eq!(
@@ -20654,7 +20678,11 @@ fn key_operation_joint_resumes_at_next_clean_point() {
     complete.authorized = true;
     complete.unambiguous = true;
     complete.attributable = true;
-    let complete_pos = guarded.scene.fixture.admit_function("C_SignInit").h0_ordinal();
+    let complete_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
     guarded.observe(&joint_key, complete_pos, complete);
     guarded
         .registry
@@ -20806,9 +20834,10 @@ fn key_operation_foreign_caller_counts_without_ending_joint() {
     let observations = guarded.registry.joint_observations(52);
     assert_eq!(observations.status, ObsStatus::Populated);
     assert!(
-        observations.unattributed.iter().any(|row| {
-            row.reason == "foreign_or_unproven_caller" && row.count == 1
-        }),
+        observations
+            .unattributed
+            .iter()
+            .any(|row| { row.reason == "foreign_or_unproven_caller" && row.count == 1 }),
         "the foreign call counts once: {:?}",
         observations.unattributed
     );

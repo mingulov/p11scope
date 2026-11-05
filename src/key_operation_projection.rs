@@ -591,7 +591,11 @@ impl ObjectObservations {
         if count == 0 {
             return;
         }
-        if let Some(row) = self.unattributed.iter_mut().find(|row| row.reason == reason) {
+        if let Some(row) = self
+            .unattributed
+            .iter_mut()
+            .find(|row| row.reason == reason)
+        {
             row.count = row.count.saturating_add(count);
         } else {
             self.unattributed.push(UnattributedRow { reason, count });

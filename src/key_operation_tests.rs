@@ -15324,6 +15324,71 @@ fn key_operation_loss_before_first_delivery_names_authority_lost() {
     assert!(after.key_operations.is_empty(), "no row is guessed");
 }
 
+/// Projection-path twin of the pre-delivery loss pin: after one
+/// delivered seal, semantic loss disposes the next staged call while
+/// the feed stays Joint. The delivered row stays, the disposed call
+/// counts as `record_lost`, and the section is partial under lost
+/// authority, never `populated` beside a counted loss.
+#[test]
+fn key_operation_loss_after_delivery_keeps_rows_partial() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    ingest_call(&mut g.scene, &init, pos);
+    let seal = g.scene.seal().expect("healthy call seals");
+    assert_eq!(
+        g.registry.deliver_joint_algorithm_seal_for_test(
+            id,
+            &seal,
+            &g.scene.model,
+            g.scene.adapter.ledger_mut()
+        ),
+        SealApplyOutcome::ReplayedOne
+    );
+    let delivered = g.registry.joint_observations(1);
+    assert_eq!(
+        (delivered.status, delivered.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let (facts, pos) = g.admit_shape(&sign);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.scene.adapter.ledger().staged(), 1);
+    let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
+    g.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(key.clone()),
+        position(g.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.registry.feed_mode_for_test(id), Some(FeedMode::Joint));
+    let after = g.registry.joint_observations(2);
+    assert_eq!(
+        after
+            .unattributed
+            .iter()
+            .map(|row| (row.reason, row.count))
+            .collect::<Vec<_>>(),
+        vec![("record_lost", 1)],
+        "the disposed call counts once"
+    );
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "a counted loss is never populated"
+    );
+}
+
 #[test]
 fn key_operation_joint_failure_delivery_retains_projection() {
     let mut guarded = GuardedScene::new();

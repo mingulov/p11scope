@@ -11707,6 +11707,45 @@ mod tests {
         );
     }
 
+    /// A child that answers the timeout SIGTERM by voluntarily exiting
+    /// with a high status keeps its own status unmarked: only a death
+    /// by the observer's signal is a requested kill, never a voluntary
+    /// exit, however high its code.
+    #[test]
+    fn requested_timeout_kill_must_not_claim_a_voluntary_high_exit() {
+        let signals = SignalState::new();
+        let mut child = spawn("/bin/sh", &["-c", "trap 'exit 200' TERM; sleep 10"]);
+        child.release().unwrap();
+        // Let the shell install its TERM trap and start sleeping, so the
+        // timeout SIGTERM below answers with a voluntary exit, not a race
+        // against startup.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(child.still_running());
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            true,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(200));
+        assert!(!still_running);
+        assert!(
+            !requested_kill,
+            "a voluntary exit keeps its status unmarked even above 128"
+        );
+    }
+
     /// The run's process exit code: a requested timeout kill and a
     /// handed-back child are observer success; otherwise the child's
     /// own status, as a shell would report it.

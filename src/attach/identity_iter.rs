@@ -8409,6 +8409,131 @@ mod tests {
         );
     }
 
+    /// The functional probe under a nested PID namespace: BPF numbers
+    /// tasks in the initial namespace while the observer numbers them
+    /// in its own, so the probe must translate (kind observers run
+    /// nested). Forks, enters a fresh pid/mount namespace pair with a
+    /// fresh /proc (the `unshare -pf --mount-proc` shape, without the
+    /// binary), re-execs this binary to run the inner probe there, and
+    /// asserts the inner positive ran (exit 0 plus `1 passed`, never a
+    /// zero-match pass). Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: functional probe passes in a nested pid namespace"]
+    fn functional_probe_passes_in_nested_pid_namespace() {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        let exe = std::env::current_exe().expect("own test binary");
+        let args = [
+            CString::new(exe.as_os_str().as_bytes()).expect("exe has no nul"),
+            CString::new("--exact").unwrap(),
+            CString::new(
+                "attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none",
+            )
+            .unwrap(),
+            CString::new("--ignored").unwrap(),
+            CString::new("--test-threads=1").unwrap(),
+            CString::new("--nocapture").unwrap(),
+        ];
+        let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let mut pipe = [0 as libc::c_int; 2];
+        // SAFETY: out-param pipe pair; the parent closes the write end
+        // after forking and reads the read end to EOF.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe works");
+        // SAFETY: the child only calls async-signal-safe libc, then
+        // re-execs or exits with a distinct status; all CStrings were
+        // built before forking. The parent waits below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for the nested probe runner");
+        if pid == 0 {
+            nested_probe_child(pipe[1], &argv);
+        }
+        // SAFETY: our own pipe write end; closing first lets EOF arrive
+        // when the re-exec'd grandchild exits.
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0, "close our write end");
+        // SAFETY: our own pipe read end, owned from here to EOF.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read inner output");
+        let mut status: libc::c_int = 0;
+        // SAFETY: waiting for our own forked child.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "reap the nested probe runner");
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "inner probe passed nested (runner status {status}): {text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed; 0 failed"),
+            "the inner positive ran (not a zero-match pass): {text}"
+        );
+    }
+
+    /// Child side of the nested probe runner: enter a fresh PID
+    /// namespace, fork the grandchild into it, and exit with the
+    /// grandchild's status (70 for a setup failure). Async-signal-safe
+    /// only: no allocation, no locks, `_exit` on every path. Call only
+    /// in the post-fork child.
+    fn nested_probe_child(write_fd: libc::c_int, argv: &[*const libc::c_char]) -> ! {
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWPID) != 0 {
+                libc::_exit(70);
+            }
+            let pid = libc::fork();
+            if pid < 0 {
+                libc::_exit(70);
+            }
+            if pid == 0 {
+                // Grandchild: fresh mount namespace, private mounts, a
+                // /proc bound to the new PID namespace, then re-exec.
+                if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                    libc::_exit(70);
+                }
+                if libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(70);
+                }
+                if libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(70);
+                }
+                if libc::dup2(write_fd, libc::STDOUT_FILENO) < 0
+                    || libc::dup2(write_fd, libc::STDERR_FILENO) < 0
+                {
+                    libc::_exit(70);
+                }
+                libc::execv(argv[0], argv.as_ptr());
+                libc::_exit(70);
+            }
+            // Close our copy of the write end so the parent sees EOF
+            // when the grandchild exits.
+            libc::close(write_fd);
+            let mut status: libc::c_int = 0;
+            if libc::waitpid(pid, &mut status, 0) != pid {
+                libc::_exit(70);
+            }
+            if libc::WIFEXITED(status) {
+                libc::_exit(libc::WEXITSTATUS(status));
+            }
+            libc::_exit(70);
+        }
+    }
+
     // -- D2c cost substrate (RED-first) ----------------------------------------
 
     #[test]

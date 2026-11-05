@@ -157,7 +157,7 @@ and local archive cache. All locked registry packages (including the
 [pkcs11-components](https://github.com/mingulov/pkcs11-components/) crates
 `pkcs11-types`/`pkcs11-module` 0.2.3) are separate Cargo inputs and
 must already be cached for an offline build from that checkout. The published
-v0.3.0 source export embeds the two exact pinned Aya archives, but fetching the
+source export embeds the two exact pinned Aya archives, but fetching the
 remaining locked Cargo dependencies requires network access or a populated
 cache. A separate full offline export can embed the complete dependency
 payload; see below.
@@ -178,24 +178,22 @@ assets and local release-mode builds.
 p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11scope/tree/v0.4.0)
 with no binary bundles. v0.5.0 was published on 2026-10-29
 ([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
-No v0.6.0 tag or binary bundles are published yet; build current source
-as described in [Build locally from source](#build-locally-from-source).
-GitHub's automatic source archive still needs the dependency inputs
-described above.
-
-The older [v0.3.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
+The [v0.6.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.6.0)
 provides a static x86-64 Linux observer bundle, optional glibc and musl discovery
-helper bundles, and a source export. The examples below install **v0.3.0**;
-they do not include the newer source's commands and fixes.
+helper bundles, and a source export. The examples below install **v0.6.0**.
 Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
+Older bundles remain under their release tags. To build current source
+instead, see [Build locally from source](#build-locally-from-source).
+GitHub's automatic source archive still needs the dependency inputs
+described above.
 
 | Bundle | Use |
 | --- | --- |
-| `p11scope-0.3.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
-| `p11scope-discover-0.3.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
-| `p11scope-discover-0.3.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+| `p11scope-0.6.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
+| `p11scope-discover-0.6.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
+| `p11scope-discover-0.6.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
 
 For example, download the observer and `SHA256SUMS` into a private directory,
 then verify the archive before extraction:
@@ -203,11 +201,11 @@ then verify the archive before extraction:
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.3.0/p11scope-0.3.0-x86_64-linux-musl.tar.gz
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.3.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope-0.6.0-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf p11scope-0.3.0-x86_64-linux-musl.tar.gz
-sudo install -m 0755 p11scope-0.3.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+tar -xzf p11scope-0.6.0-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.6.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
 p11scope --version
 sudo p11scope doctor
 ```
@@ -223,7 +221,7 @@ The observer needs Linux x86-64 and the kernel and privilege requirements
 below. The helper needs the matching provider ABI and libc; a 32-bit provider
 requires a separately built 32-bit helper.
 
-The v0.3.0 release also includes `p11scope-0.3.0-source.tar.gz`. It contains the
+The v0.6.0 release also includes `p11scope-0.6.0-source.tar.gz`. It contains the
 committed source and the two pinned Aya archives needed to reconstruct the
 local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described

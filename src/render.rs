@@ -6471,6 +6471,30 @@ pub(crate) mod tests {
         assert!(!empty.contains("were made in this window"), "{empty}");
     }
 
+    /// Under PARTIAL coverage the quiet-window startup sentence stays
+    /// silent: asserting that no calls were made would overclaim when
+    /// calls through unattached tables were explicitly not counted.
+    #[test]
+    fn scope_summary_with_zero_calls_under_partial_coverage_withholds_the_startup_hint() {
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/partial.so".into(),
+            reason: "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)".into(),
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let text = scope_summary("pid", &[], &ev);
+        assert!(
+            text.contains("No completed calls observed; coverage incomplete."),
+            "{text}"
+        );
+        assert!(
+            !text.contains("No PKCS#11 calls were made in this window"),
+            "a partial window must not assert no calls happened: {text}"
+        );
+    }
+
     /// No unverified slots, or every mapped provider attested (partial
     /// manifest coverage): the machine fragment alone stands, with no
     /// provider-manifest note.

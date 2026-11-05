@@ -20604,3 +20604,105 @@ fn key_operation_partial_publication_counts_unattributed() {
         }]
     );
 }
+
+/// Damage stays local and attribution resumes: after an ordered
+/// fallback ends a feed's Joint segment, the next operation init
+/// is a clean point — the feed stages again, its seals replay, and
+/// later signs attribute exactly. The fallback segment stays
+/// counted as not attributed; nothing is re-attributed by guess.
+#[test]
+fn key_operation_joint_resumes_at_next_clean_point() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // One exact Joint sign.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // An affecting unsealable completion behind a queued call
+    // forces the ordered fallback: this segment ends.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    complete.authorized = true;
+    complete.unambiguous = true;
+    complete.attributable = true;
+    guarded.observe(&joint_key, 1_000_000, complete);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the fallback ends only the current segment"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+
+    // The next init is a clean point: staging and seals resume.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne,
+        "the clean point re-enters Joint instead of reducing direct forever"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(41);
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "proof_refused_fallback");
+    let completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum::<u64>()
+        + observations
+            .key_operations
+            .iter()
+            .filter(|row| row.category == "sign")
+            .map(|row| row.completed)
+            .sum::<u64>();
+    assert_eq!(completed, 2, "both exact signs complete once");
+    assert!(
+        observations
+            .unattributed
+            .iter()
+            .any(|row| row.reason == "proof_refused_fallback" && row.count >= 1),
+        "the fallback segment stays counted: {:?}",
+        observations.unattributed
+    );
+}

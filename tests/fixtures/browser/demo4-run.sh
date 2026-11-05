@@ -232,7 +232,9 @@ if [ "$MODE" = first ]; then
     # give the observer a head start, then launch the browser and
     # let the seal complete over its softokn, all before the
     # post-attach signs are signalled.
-    wait_seal 20 || true
+    # DEMO4_HEAD_START (seconds, default 20) varies the browser's
+    # launch against the observer's startup for race exploration.
+    wait_seal "${DEMO4_HEAD_START:-20}" || true
     kill -0 "$observer_pid" 2>/dev/null \
         || { echo "FAIL observer-exited-before-launch"; tail -15 "$work/inventory.err"; trap - RETURN; exit 1; }
     : >"$work/launch"

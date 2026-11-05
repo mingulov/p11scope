@@ -246,30 +246,41 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
 
 Terminal text is short by default: the main results (providers, callers,
 functions and mechanisms, key-operation rows), one coverage status line
-(`complete`, or `partial` with gap counts), and a `run with -v for details`
-hint. `-v` / `--verbose` shows the full detail — every gap and limitation
-with reasons, evidence, per-slot or per-table data, timing — plus the
-informational stderr notes. `--quiet` prints only the summary head, for
-scripts. `--json` and `-o` are always complete at every verbosity. Gap
-names in default text are plain words; the machine names stay in JSON, and
-in `-v` beside the plain words. `trace` streams one line per event at every
-level; `-v` only adds its stderr notes.
+(`coverage: complete`, `coverage: counts complete` when only names are
+unconfirmed, or `coverage: partial` with plain-word reasons), and a
+`run with -v for details` hint. `-v` / `--verbose` shows the full detail —
+every gap and limitation with reasons, evidence, per-slot or per-table data,
+timing — plus the informational stderr notes. `--quiet` prints only the
+summary head, for scripts. `--json` and `-o` are always complete at every
+verbosity. Gap names in default text are plain words; the machine names stay
+in JSON, and in `-v` beside the plain words. `trace` streams one line per
+event at every level and ends with the same totals and coverage lines;
+`-v` pairs machine names beside the plain reasons and adds its stderr notes.
 
-Informational stderr notes (scan progress, later-pass lines, timing detail)
-are suppressed by default. Errors and actionable warnings stay, as do the
-one-line readiness and outcome signals that scripts and shell gates match:
-`p11scope: capturing:`, the first pass headline (`p11scope: pass 0:`), the
-`p11scope: discovery:` completion summary, the `capture ended:` markers,
-the semantic-lane seal, and the stop summaries.
+Default stderr keeps the readiness line (`p11scope: capturing:`, which says
+what the capture waits for while nothing is attached) and real warnings:
+errors, actionable warnings, the owned child's nonzero status
+(`command exited with status N`), and the outcome signals scripts match
+(the first pass headline, `capture ended:`, the semantic-lane seal, the
+stop summaries). Progress,
+statistics and all-clear lines — loader readiness, clean long-run reports,
+the `p11scope: discovery:` completion summary, per-module repeats, cleanup
+progress — print under `-v` or with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
+`run` on a terminal never clears the screen: the final frame prints once
+after the command exits.
 
 Trace rows show an executable label when p11scope can establish which process
-image made that call. Otherwise they say `Unknown executable` and retain the
-PID/TID. The label comes from the observed executable path: an interpreter may
-therefore appear as `python` or `sh`, rather than the script or service name.
-For cgroup traces, naming needs calls on both sides of a validated executable
-sample. Early calls and short-lived or infrequent callers can stay unknown;
-their count and admission rules are unchanged. Previously printed rows are
-not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
+image made that call. For a command the observer owns, rows the identity
+proof cannot resolve are labeled with the spawned command instead; anything
+else still says `Unknown executable` and retains the PID/TID. The label
+comes from the observed executable path: an interpreter may therefore appear
+as `python` or `sh`, rather than the script or service name. Event times are
+UTC. For cgroup traces, naming needs calls on both sides of a validated
+executable sample. Early calls and short-lived or infrequent callers can stay
+unknown; their count and admission rules are unchanged. Calls on functions
+p11scope could not verify show names without decoded parameters; the trace
+header says so once instead of marking every row. Previously printed rows
+are not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
 for the sampling and retention limits. Installed cgroup naming checks for v0.4
 are still in progress.
 
@@ -700,17 +711,21 @@ Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-
 
 A current capture's coverage line names why it is `PARTIAL`, grouped by the
 same classes `evidence.gap_classes` publishes, in plain words: for example
-`Coverage PARTIAL: names withheld (68 functions counted but not named)` for
+`coverage: counts complete; function names follow the standard PKCS#11 table
+and were not confirmed by a manifest (add --manifest to confirm)` for
 a clean scan-only capture (`verdict_detail: "attribution_only"`: counts are
-exact, only semantic interpretation is withheld), or
-`Coverage PARTIAL: calls may be missing (12 call records lost)` for a lossy
-one (`"concrete_gap"`). `Coverage PARTIAL: end of capture not fully confirmed
-(last calls may be missing)` means nothing concrete is behind the verdict
-(`"clean_but_unproven"`): the stop gate did not prove the final drain (see
-`evidence.stop_quiescence`). With `-v`, each plain reason is paired with its
+exact, only the names are unconfirmed), or
+`coverage: partial — calls may be missing (12 call records lost)` for a lossy
+one (`"concrete_gap"`). `coverage: partial — end of capture not fully
+confirmed (last calls may be missing)` means nothing concrete is behind the
+verdict (`"clean_but_unproven"`): the stop gate did not prove the final drain
+(see `evidence.stop_quiescence`). An owned run whose command ran ahead of
+probe attachment without pausing says
+`coverage: partial — the command loaded its provider before probes attached;
+rerun with --pause auto`. With `-v`, each plain reason is paired with its
 machine cause name, and the `Evidence:` line repeats the same verdict
 reasons after the probe and slot counts. A `COMPLETE` verdict reads
-`Coverage COMPLETE (nothing known was lost)`.
+`coverage: complete`.
 
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —

@@ -525,10 +525,21 @@ fn validate_closure_admission(
     wide: bool,
     strict: bool,
 ) -> Result<(), String> {
+    // The producer files a prefix-admitted closure as partial with
+    // its attached count; that shape validates in both modes. The
+    // retired refused-plus-prefix shape stays accepted only when
+    // relaxed, for reads of older captures.
+    let reason = admission.reason.unwrap_or("");
+    if admission.state == "partial"
+        && admission.class == "closure_array"
+        && reason.contains("template tables attached")
+        && reason.contains("(closure_prefix)")
+    {
+        return Ok(());
+    }
     match validate_whole_admission(admission, fixture, wide, strict) {
         Ok(()) => Ok(()),
         Err(error) if !strict => {
-            let reason = admission.reason.unwrap_or("");
             if admission.state == "refused"
                 && admission.class == "closure_array"
                 && reason.contains("template tables attached")
@@ -603,6 +614,16 @@ fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
             .ok_or("text refusal reason is missing")?;
         Ok(WholeAdmission {
             state: "refused",
+            class,
+            endpoints: None,
+            reason: Some(reason),
+        })
+    } else if let Some(partial) = line.strip_prefix("admission  partial (") {
+        let (class, reason) = partial
+            .split_once("): ")
+            .ok_or("text partial reason is missing")?;
+        Ok(WholeAdmission {
+            state: "partial",
             class,
             endpoints: None,
             reason: Some(reason),
@@ -806,7 +827,8 @@ fn catalog_partial_admission_accepts_prefix_shapes_with_counts() {
     // A provider prefix reads the same way: partial state plus the
     // attached count in JSON, partial verb in text. Both renderings
     // must parse (the text verb is new) and keep their counts.
-    let provider_reason = "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)";
+    let provider_reason =
+        "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)";
     let provider_json = serde_json::json!({
         "state": "partial", "class": "heuristic",
         "endpoints": 300, "reason": provider_reason,
@@ -845,6 +867,14 @@ fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
     assert_eq!(b["admission"]["scan_only"], true);
     match b["admission"]["state"].as_str() {
         Some("admitted") => assert_eq!(b["admission"]["endpoints"], 92),
+        Some("partial") if !strict_admission() => {
+            assert!(b["admission"]["endpoints"].as_u64().unwrap() > 0);
+            let reason = b["admission"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("endpoints attached") && reason.contains("(provider_prefix)"),
+                "relaxed B partial must be a named prefix gap with counts: {reason}"
+            );
+        }
         Some("refused") if !strict_admission() => {
             assert!(b["admission"]["endpoints"].is_null());
             let reason = b["admission"]["reason"].as_str().unwrap();
@@ -1114,6 +1144,7 @@ fn catalog_reader_finds_every_fixture_object() {
             .count() as u64
     };
     assert_eq!(doc["admission"]["admitted"], in_state("admitted"));
+    assert_eq!(doc["admission"]["partial"], in_state("partial"));
     assert_eq!(doc["admission"]["refused"], in_state("refused"));
     if !wide {
         assert!(doc["admission"]["refused"].as_u64().unwrap() >= 2);

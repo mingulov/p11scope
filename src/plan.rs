@@ -338,6 +338,16 @@ pub(crate) fn is_provider_prefix(reason: &str) -> bool {
         && reason.contains("(provider_prefix)")
 }
 
+/// Whether a `modules_skipped` reason records a partially covered
+/// module rather than one refused whole: a growth omission that kept
+/// its endpoints, a prefix-admitted closure array, or a
+/// prefix-admitted provider. Every consumer that splits partial from
+/// refused — the report, the terminal verdict, the system catalog —
+/// keys on this one predicate, so the three verdicts cannot disagree.
+pub(crate) fn is_partial_coverage(reason: &str) -> bool {
+    is_growth_omission(reason) || is_closure_array_prefix(reason) || is_provider_prefix(reason)
+}
+
 /// The omitted count a growth omission states — the `N` of
 /// `admitted module needs N more;` — or `None` for any other reason.
 pub(crate) fn growth_omitted_count(reason: &str) -> Option<usize> {
@@ -13083,6 +13093,42 @@ mod tests {
             assert!(
                 is_provider_prefix(prefix),
                 "a planner prefix stays recognized: {prefix}"
+            );
+        }
+    }
+
+    /// The shared partial-coverage classifier joins the three partial
+    /// kinds — growth omission, closure prefix, provider prefix — and
+    /// refuses every whole shape, including a holder path naming a tag.
+    #[test]
+    fn partial_coverage_classifier_joins_the_three_partial_kinds() {
+        for partial in [
+            "admitted module needs 2 more; only 512 attach slots are available; 511 are in use — \
+             2 endpoints not attached; kept its 511 attached endpoints",
+            "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)",
+            "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)",
+        ] {
+            assert!(
+                is_partial_coverage(partial),
+                "a partial gap must classify partial: {partial}"
+            );
+        }
+        for whole in [
+            "module needs 150 more; only 512 attach slots are available; 400 are in use \
+             (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
+             a prefix",
+            "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix \
+             of its 67 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
+             when mapped before the capture's first plan beside a provider or named by the operator, or \
+             as published tables)",
+            "a proxy closure array alone in the capture's first plan, or mapped during the capture, \
+             attaches only its published tables, and none of its 67 lookalike function tables is \
+             published yet (a proxy closure array is admitted whole, as a prefix when mapped before \
+             the capture's first plan beside a provider or named by the operator, or as published tables)",
+        ] {
+            assert!(
+                !is_partial_coverage(whole),
+                "a whole refusal must not classify partial: {whole}"
             );
         }
     }

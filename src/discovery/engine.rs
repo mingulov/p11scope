@@ -7574,8 +7574,16 @@ fn format_unreadable_member(pid: u32, detail: &str) -> String {
 }
 
 fn format_module_refusal(subject: &str, reason: &str) -> String {
+    // The stderr verdict agrees with the report: a partially covered
+    // module (growth kept, closure prefix, provider prefix) is named
+    // partial, never refused. Whole refusals keep their verb.
+    let verb = if crate::plan::is_partial_coverage(reason) {
+        "module partially covered"
+    } else {
+        "module refused"
+    };
     format!(
-        "p11scope: module refused: {} — {}",
+        "p11scope: {verb}: {} — {}",
         render::escape_controls(subject),
         render::escape_controls(reason)
     )

@@ -2140,10 +2140,7 @@ fn excluded_lines(ev: &Evidence) -> String {
 /// templates with no further hint; a refused provider points at `--module`
 /// (unless the reason already carries that hint, as shared-scope refusals do).
 fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
-    let status = if crate::plan::is_growth_omission(&skipped.reason)
-        || crate::plan::is_closure_array_prefix(&skipped.reason)
-        || crate::plan::is_provider_prefix(&skipped.reason)
-    {
+    let status = if crate::plan::is_partial_coverage(&skipped.reason) {
         "partially covered"
     } else {
         "not attached"
@@ -2639,11 +2636,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                     .discovery
                     .modules_skipped
                     .iter()
-                    .filter(|module| {
-                        crate::plan::is_growth_omission(&module.reason)
-                            || crate::plan::is_closure_array_prefix(&module.reason)
-                            || crate::plan::is_provider_prefix(&module.reason)
-                    })
+                    .filter(|module| crate::plan::is_partial_coverage(&module.reason))
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
                 for (n, label) in [

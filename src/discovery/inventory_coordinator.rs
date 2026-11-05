@@ -12947,6 +12947,7 @@ pub(crate) mod tests {
                 uncorroborated_candidates: 0,
                 module_ambiguous: 0,
                 admitted: paths.len(),
+                partial: 0,
                 refused: 0,
                 unresolved: 0,
             },

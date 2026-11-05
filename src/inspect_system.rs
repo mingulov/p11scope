@@ -882,6 +882,14 @@ pub(crate) enum AdmissionRecord {
         class: &'static str,
         endpoints: usize,
     },
+    /// A prefix-admitted (or growth-kept) object: some endpoints
+    /// attached, the rest disclosed in the gap reason with counts.
+    /// Partially covered, never refused.
+    Partial {
+        class: &'static str,
+        endpoints: usize,
+        reason: String,
+    },
     Refused {
         class: &'static str,
         reason: String,
@@ -895,6 +903,7 @@ impl AdmissionRecord {
     pub(crate) const fn state(&self) -> &'static str {
         match self {
             Self::Admitted { .. } => "admitted",
+            Self::Partial { .. } => "partial",
             Self::Refused { .. } => "refused",
             Self::Unresolved { .. } => "unresolved",
         }
@@ -902,7 +911,9 @@ impl AdmissionRecord {
 
     pub(crate) fn class(&self) -> Option<&'static str> {
         match self {
-            Self::Admitted { class, .. } | Self::Refused { class, .. } => Some(class),
+            Self::Admitted { class, .. }
+            | Self::Partial { class, .. }
+            | Self::Refused { class, .. } => Some(class),
             Self::Unresolved { .. } => None,
         }
     }
@@ -910,7 +921,9 @@ impl AdmissionRecord {
     pub(crate) fn reasons(&self) -> Vec<String> {
         match self {
             Self::Admitted { .. } => Vec::new(),
-            Self::Refused { reason, .. } => vec![reason.clone()],
+            Self::Partial { reason, .. } | Self::Refused { reason, .. } => {
+                vec![reason.clone()]
+            }
             Self::Unresolved { reasons } => reasons.clone(),
         }
     }
@@ -1031,6 +1044,7 @@ pub(crate) struct AdmissionSummary {
     pub uncorroborated_candidates: u64,
     pub module_ambiguous: usize,
     pub admitted: usize,
+    pub partial: usize,
     pub refused: usize,
     pub unresolved: usize,
 }
@@ -2100,7 +2114,19 @@ fn assemble(
             }
             continue;
         };
+        // A prefix-admitted (or growth-kept) object has both slots
+        // in the plan and a gap record: it files as partial with its
+        // attached count, never as refused. A partial-kind gap with no
+        // plan slots is a shape the merge never emits; it stays a
+        // whole refusal rather than inventing coverage.
         let admission = match (refused.get(&object), admitted.get(&object)) {
+            (Some(skip), Some(endpoints)) if crate::plan::is_partial_coverage(&skip.reason) => {
+                AdmissionRecord::Partial {
+                    class,
+                    endpoints: *endpoints,
+                    reason: skip.reason.clone(),
+                }
+            }
             (Some(skip), _) => AdmissionRecord::Refused {
                 class,
                 reason: skip.reason.clone(),
@@ -2385,6 +2411,10 @@ fn assemble(
         admitted: objects
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Admitted { .. }))
+            .count(),
+        partial: objects
+            .iter()
+            .filter(|object| matches!(object.admission, AdmissionRecord::Partial { .. }))
             .count(),
         refused: objects
             .iter()
@@ -2768,6 +2798,7 @@ fn render_json(catalog: &Catalog) -> serde_json::Value {
             "uncorroborated_candidates": catalog.admission.uncorroborated_candidates,
             "module_ambiguous": catalog.admission.module_ambiguous,
             "admitted": catalog.admission.admitted,
+            "partial": catalog.admission.partial,
             "refused": catalog.admission.refused,
             "unresolved": catalog.admission.unresolved,
         },
@@ -2847,6 +2878,17 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
         AdmissionRecord::Admitted { class, endpoints } => serde_json::json!({
             "class": class,
             "endpoints": endpoints,
+            "scan_only": true,
+            "note": SCAN_ONLY_NOTE,
+        }),
+        AdmissionRecord::Partial {
+            class,
+            endpoints,
+            reason,
+        } => serde_json::json!({
+            "class": class,
+            "endpoints": endpoints,
+            "reason": reason,
             "scan_only": true,
             "note": SCAN_ONLY_NOTE,
         }),
@@ -3018,6 +3060,15 @@ fn render_object(
             let _ = writeln!(
                 out,
                 "  admission  admitted ({class}, {endpoints} endpoints; {SCAN_ONLY_NOTE})"
+            );
+        }
+        AdmissionRecord::Partial { class, reason, .. } => {
+            // The reason already carries the attached-vs-needed
+            // counts; the line mirrors the refused shape.
+            let _ = writeln!(
+                out,
+                "  admission  partial ({class}): {} [{SCAN_ONLY_NOTE}]",
+                crate::render::escape_controls(reason),
             );
         }
         AdmissionRecord::Refused { class, reason } => {
@@ -3203,9 +3254,10 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
     }
     let _ = writeln!(
         out,
-        "admission: {} admitted, {} refused, {} unresolved ({} uncorroborated candidates, {} \
+        "admission: {} admitted, {} partial, {} refused, {} unresolved ({} uncorroborated candidates, {} \
          module-ambiguous; {SCAN_ONLY_NOTE})",
         catalog.admission.admitted,
+        catalog.admission.partial,
         catalog.admission.refused,
         catalog.admission.unresolved,
         catalog.admission.uncorroborated_candidates,
@@ -6161,11 +6213,15 @@ mod tests {
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Admitted { .. }))
             .count();
+        let partial = objects
+            .iter()
+            .filter(|object| matches!(object.admission, AdmissionRecord::Partial { .. }))
+            .count();
         let refused = objects
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Refused { .. }))
             .count();
-        let unresolved = objects.len() - admitted - refused;
+        let unresolved = objects.len() - admitted - partial - refused;
         Catalog {
             lowering: None,
             scan_status: "complete",
@@ -6209,6 +6265,7 @@ mod tests {
                 uncorroborated_candidates: 0,
                 module_ambiguous: 0,
                 admitted,
+                partial,
                 refused,
                 unresolved,
             },
@@ -6613,8 +6670,8 @@ mod tests {
             // and discloses the spilled table. JK-22a: the unaimed capture
             // admits the reserve-capped 300-endpoint prefix with a named
             // provider-prefix gap instead of refusing the module whole; the
-            // catalog still files a gapped module under `refused`, carrying
-            // the prefix reason.
+            // catalog files that gapped prefix as partial with its
+            // attached count, carrying the prefix reason.
             let aimed = scoped_catalog(
                 heuristic_provider(4, 150),
                 AdmissionPolicy::detailed(),
@@ -6634,8 +6691,13 @@ mod tests {
             let unaimed =
                 scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
             match catalog_admission(&unaimed) {
-                AdmissionRecord::Refused { class, reason } => {
+                AdmissionRecord::Partial {
+                    class,
+                    endpoints,
+                    reason,
+                } => {
                     assert_eq!(*class, "heuristic");
+                    assert_eq!(*endpoints, 300);
                     assert!(reason.contains("reserved"), "{reason}");
                     assert!(
                         reason.contains("300 of 600 endpoints attached")
@@ -7900,7 +7962,7 @@ mod tests {
         assert!(text.contains("PKCS 11"), "{text}");
         assert!(text.contains("processes: 2 scanned"), "{text}");
         assert!(
-            text.contains("0 admitted, 1 refused, 0 unresolved"),
+            text.contains("0 admitted, 0 partial, 1 refused, 0 unresolved"),
             "{text}"
         );
     }

@@ -171,7 +171,10 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
     // Drain stdout while the child runs: the final report can exceed the
     // 64 KiB pipe (an unaimed --system run names every unselected process),
     // and the observer's writer watchdog fails the run when nobody reads.
-    let stdout = child.stdout.take().expect("spawn_with_peak callers pipe stdout");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("spawn_with_peak callers pipe stdout");
     let drain = std::thread::spawn(move || {
         use std::io::Read as _;
         let mut stdout = stdout;

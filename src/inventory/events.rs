@@ -709,7 +709,8 @@ fn remove_retained_file(victim: &Path) -> Result<(), String> {
         let owner = metadata.uid();
         let current = unsafe { libc::geteuid() } as u32;
         // Rotations this run handed to the sudo invoker are evicted like
-        // the caller's own; anything else keeps the refusal.
+        // the caller's own; anything else keeps the refusal. Victims are
+        // always this run's rotations, whose ownership follows the live file.
         let handed_over =
             current == 0 && crate::output::sudo_invoker().is_some_and(|(uid, _)| uid == owner);
         if owner != current && !handed_over {

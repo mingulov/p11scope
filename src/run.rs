@@ -3892,6 +3892,10 @@ fn run_owned_inner_with_host(
                 reason: reason.to_owned(),
             });
 
+    // The overlay-witness BPF session load is process setup, not query
+    // work: run it before the child exists, never lazily inside a
+    // pause-cycle engine apply it can outlast (see preload_session).
+    crate::discovery::overlay_witness::preload_session();
     // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();

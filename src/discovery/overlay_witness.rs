@@ -235,6 +235,44 @@ fn witness_session() -> &'static Mutex<WitnessSession> {
     })
 }
 
+/// Load the process-wide witness session unless already loaded or
+/// already failed. Shared by the preload and the lazy query path so
+/// the two cannot diverge: a failed load remembers unavailable and
+/// later calls fail fast without retrying.
+fn ensure_session_loaded(guard: &mut WitnessSession) -> bool {
+    if guard.session.is_some() {
+        return true;
+    }
+    if guard.unavailable.is_some() {
+        return false;
+    }
+    match load_witness_session() {
+        Ok(session) => {
+            guard.session = Some(session);
+            true
+        }
+        Err(reason) => {
+            guard.unavailable = Some(reason);
+            false
+        }
+    }
+}
+
+/// Load the process-wide witness session now, outside any
+/// time-critical path. The one-time load (BPF verifier plus
+/// functional probe) is process setup, not query work: run lazily on
+/// the first overlay join it can exceed a 500ms pause-cycle engine
+/// apply and fail-close the query unavailable. Owned runs call this
+/// before spawning the child; a failed load remembers unavailable
+/// exactly like the lazy path, so behavior only ever moves earlier.
+pub(crate) fn preload_session() {
+    let mut guard = match witness_session().lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    ensure_session_loaded(&mut guard);
+}
+
 /// Prove the trigger range of `pid` is the scan's held file: install a
 /// dup of the held fd (never a path reopen) as one examined anchor,
 /// confirm the target with a probe that cannot fall back, and read the
@@ -290,18 +328,8 @@ fn prove_original_file_inner(
         Ok(guard) => guard,
         Err(_) => return WitnessVerdict::Failed(WitnessFailure::Unavailable),
     };
-    if let Some(reason) = guard.unavailable {
-        let _ = reason;
+    if !ensure_session_loaded(&mut guard) {
         return WitnessVerdict::Failed(WitnessFailure::Unavailable);
-    }
-    if guard.session.is_none() {
-        match load_witness_session() {
-            Ok(session) => guard.session = Some(session),
-            Err(reason) => {
-                guard.unavailable = Some(reason);
-                return WitnessVerdict::Failed(WitnessFailure::Unavailable);
-            }
-        }
     }
     // The install/run ceiling starts after the one-time session load:
     // the load is process setup (like the capture's), not query work,

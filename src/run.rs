@@ -2892,6 +2892,7 @@ fn capture_with_host(
         uretprobe_override,
         resource_start,
         a.select_endpoint.as_deref(),
+        None,
     )?;
     // A non-child's exit and explicit risk acceptance are observable facts.
     // Neither establishes its seccomp state, an affected kernel, or causation.
@@ -3094,6 +3095,7 @@ fn run_loop(
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
     select_endpoint: Option<&str>,
+    owned_command: Option<&str>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     // Authoritative attach stamp (T2, G-14): the session is fully attached
@@ -3146,6 +3148,7 @@ fn run_loop(
                 drain,
                 uretprobe_override,
                 resource_start,
+                owned_command,
             )
         }
     };
@@ -3189,6 +3192,7 @@ pub(crate) fn run_profile_loop_for_test(
         None,
         resource_start,
         select_endpoint,
+        None,
     )
 }
 
@@ -3889,9 +3893,12 @@ fn run_owned_inner_with_host(
         .ok_or_else(|| anyhow!("run: no command to exec"))?;
     // An exec failure is its own finite category (design §10.3). Resolving the
     // command first means a command that cannot run is refused by name before
-    // anything is forked, attached, or released past its barrier.
-    resolve_program(&program)
+    // anything is forked, attached, or released past its barrier. The
+    // canonical path also labels the trace lines the identity proof cannot
+    // resolve.
+    let resolved_command = resolve_program(&program)
         .map_err(|error| anyhow!("run: exec {}: {error}", Path::new(&program).display()))?;
+    let owned_command = resolved_command.to_string_lossy();
     // Name errors precede hazard errors: a script (or a non-executable)
     // is refused with its interpreter fix before any kernel verdict is
     // consulted, exactly as `spawn` would refuse it at the fork.
@@ -4119,6 +4126,7 @@ fn run_owned_inner_with_host(
         uretprobe_override,
         resource_start,
         args.select_endpoint.as_deref(),
+        Some(&owned_command),
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -6797,6 +6805,7 @@ fn capture_trace(
     drain: Duration,
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
+    owned_command: Option<&str>,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
     let cancellation = CaptureCancellation::default();
@@ -6847,6 +6856,9 @@ fn capture_trace(
         ));
     }
     let mut tracer = trace::Tracer::new(engine.plan());
+    if let (Some(command), Some(owned)) = (owned_command, owned.as_deref()) {
+        tracer.set_owned_command(owned.pid, command.to_string());
+    }
     #[cfg(feature = "h6-reexec-diagnostic")]
     let reexec_diagnostic = session.reexec_diagnostic();
 
@@ -6866,16 +6878,18 @@ fn capture_trace(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
-    if let Err(error) = emit_trace_line(
-        &format!(
-            "{}\n{}",
-            trace::capture_line(policy),
-            trace::identity_note()
-        ),
-        stdout,
-        &mut stdout_open,
-        out_file,
-    ) {
+    // The header says once that unverified calls are not decoded, when
+    // the plan watches any: no per-line marker repeats it.
+    let mut header = format!(
+        "{}\n{}",
+        trace::capture_line(policy),
+        trace::identity_note()
+    );
+    if trace::watches_unverified(engine.plan()) {
+        header.push('\n');
+        header.push_str(trace::unverified_note());
+    }
+    if let Err(error) = emit_trace_line(&header, stdout, &mut stdout_open, out_file) {
         return Err(finish_capture_error(
             error,
             engine,
@@ -7590,6 +7604,7 @@ fn capture_trace(
                         context.5,
                         context.6,
                         context.7,
+                        crate::cli::text_verbosity(),
                     )?;
                     crate::attach::reexec_diagnostic::terminal!(context.1, |diag| {
                         let gap = context.1.physical_gap_summary();
@@ -7691,6 +7706,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
+    verbosity: crate::cli::TextVerbosity,
 ) -> Result<()> {
     if evidence.trace_truncated {
         emit_trace_line(
@@ -7730,9 +7746,46 @@ fn emit_trace_terminal_accounted<W: Write>(
     stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
     flush_stdout(stdout, stdout_open)?;
     collect_sink_drops(stdout, scheduling, &mut None, Instant::now());
-    // Refresh from the accumulator — the profile terminal does the same —
-    // then resolve the file record's exact total: counted drops plus any
-    // file/stdout record-length delta from the terminal flush's own drops.
+    // Refresh from the accumulator — the profile terminal does the same.
+    evidence.scheduling = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+    // F-4: the terminal flush's own drops landed after the verdict. Judge the
+    // record and the returned evidence on the final data accounting. With `-o`
+    // stdout is display only, so this never changes the file record's
+    // length and the byte-exact total below stays exact. The verdict judges
+    // the data bytes only: the human tail below is display, and its drops
+    // must never gate PARTIAL.
+    evidence.settle_terminal(true);
+    // The human tail, after the machine records: totals, one coverage
+    // line, and the `-v` hint in default text. Its stdout copy flushes
+    // with the terminal bytes so the file record's total below stays
+    // byte-exact; its file copy lands after the file EVIDENCE so COUNT
+    // still immediately precedes EVIDENCE there.
+    let sum = |field: fn(&metrics::SlotReport) -> u64| {
+        reports
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(field(row)))
+    };
+    let tail = trace::terminal_summary(
+        sum(|row| row.calls),
+        sum(|row| row.errors),
+        sum(|row| row.in_flight),
+        evidence,
+        verbosity,
+    );
+    for line in &tail {
+        emit_trace_line(
+            line,
+            stdout,
+            stdout_open,
+            &mut None::<std::io::Sink>,
+        )?;
+    }
+    stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+    flush_stdout(stdout, stdout_open)?;
+    collect_sink_drops(stdout, scheduling, &mut None, Instant::now());
+    // Refresh again — now including the tail's own drops — then resolve
+    // the file record's exact total: counted drops plus any file/stdout
+    // record-length delta from the terminal flushes' own drops.
     evidence.scheduling = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
     let counted = evidence.scheduling.sink_dropped_bytes;
     let total = resolve_terminal_sink_total(counted, stdout_line_len, |candidate| {
@@ -7740,15 +7793,17 @@ fn emit_trace_terminal_accounted<W: Write>(
         trace::evidence_line(evidence, policy).len() + 1
     });
     evidence.scheduling.sink_dropped_bytes = total;
-    // F-4: the terminal flush's own drops landed after the verdict. Judge the
-    // record and the returned evidence on the final accounting. With `-o`
-    // stdout is display only, so this never changes the file record's
-    // length and the byte-exact total above stays exact.
-    evidence.settle_terminal(true);
     if let Some(file) = out_file.as_mut() {
         writeln!(file, "{}", trace::evidence_line(evidence, policy))
             .context("writing trace output file")?;
         file.flush().context("flushing trace output file")?;
+    }
+    {
+        let mut discard = std::io::sink();
+        let mut discard_open = true;
+        for line in &tail {
+            emit_trace_line(line, &mut discard, &mut discard_open, out_file)?;
+        }
     }
     Ok(())
 }
@@ -18080,6 +18135,7 @@ mod tests {
             &mut sink,
             &mut stdout_open,
             &mut file,
+            crate::cli::TextVerbosity::Concise,
         )
         .unwrap();
         done.store(true, Ordering::SeqCst);
@@ -18096,7 +18152,7 @@ mod tests {
             "EVIDENCE sink_dropped_bytes ({reported}) != actual missing bytes ({missing})"
         );
         assert!(reported > 0, "fixture dropped nothing: test is vacuous");
-        assert_eq!(timeouts, 3, "expected a drop in every phase");
+        assert_eq!(timeouts, 4, "expected a drop in every phase");
         assert_eq!(
             record["scheduling"]["sink_policy"].as_str().unwrap(),
             render::SINK_POLICY_BOUNDED_WAIT_DROP,
@@ -18142,6 +18198,7 @@ mod tests {
             &mut sink,
             &mut stdout_open,
             &mut None::<Vec<u8>>,
+            crate::cli::TextVerbosity::Concise,
         )
         .unwrap();
         let done = Arc::new(AtomicBool::new(true));
@@ -23237,7 +23294,7 @@ mod correction1_tests {
     }
 
     #[test]
-    fn authentic_unbound_and_closed_trace_preserves_unverified_provider_annotation() {
+    fn authentic_unbound_and_closed_trace_withholds_unverified_provider_semantics() {
         for closed in [false, true] {
             let mut c = Consumer::new(true, false);
             if closed {
@@ -23258,10 +23315,8 @@ mod correction1_tests {
             ev.mechanism = 1;
             c.feed([ev]);
             let line = String::from_utf8(c.output).unwrap();
-            assert!(
-                line.contains("C_OpenSession [semantics unverified]"),
-                "{line}"
-            );
+            assert!(line.contains("C_OpenSession"), "{line}");
+            assert!(!line.contains("[semantics unverified]"), "{line}");
             assert!(!line.contains("sess#"));
             assert!(!line.contains("CKM_"));
             assert_eq!(c.tracer.raw_calls(), before + 1);

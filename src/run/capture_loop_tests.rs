@@ -1122,7 +1122,11 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
         .unwrap();
         assert_eq!(snapshot, 0);
     }
-    assert!(String::from_utf8_lossy(&context.stdout).contains("[semantics unverified]"));
+    // The downgraded slot's line names the function with no per-line
+    // marker; the header note covers unverified slots once.
+    let stdout = String::from_utf8_lossy(&context.stdout);
+    assert!(stdout.contains(" C_OpenSession "), "{stdout}");
+    assert!(!stdout.contains("[semantics unverified]"), "{stdout}");
 }
 
 struct TickContext {

@@ -2376,9 +2376,8 @@ pub fn scope_summary_with_verbosity(
             }
         }
     }
-    text.push_str(&format!(
-        "{calls} completed calls; {errors} returned errors; {open} entries without an observed return.\n"
-    ));
+    text.push_str(&totals_line(calls, errors, open));
+    text.push('\n');
     text.push_str(&coverage_line(ev, verbose));
     text.push('\n');
     if verbosity != TextVerbosity::Quiet {
@@ -3198,6 +3197,11 @@ fn missed_provider_load(ev: &Evidence) -> bool {
                 .filter(|skip| skip.name == DISCOVERY_SUBJECT)
                 .count()
                 > 1)
+}
+
+/// The totals line shared by the profile summary and the trace tail.
+pub(crate) fn totals_line(calls: u64, errors: u64, open: u64) -> String {
+    format!("{calls} completed calls; {errors} returned errors; {open} entries without an observed return.")
 }
 
 /// The one coverage line shared by the profile summary and the trace
@@ -6278,12 +6282,14 @@ pub(crate) mod tests {
             };
             // Task 1.3: the scan-only table is unlinked, so the trace never
             // names the slot — it shows the ordinal that reached it (review
-            // answer (c)); the counts and RVs are retained unchanged.
+            // answer (c)); the counts and RVs are retained unchanged, with
+            // no per-line marker (the header says once that unverified
+            // calls are not decoded).
             let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
                 format!(
-                    " Unknown executable (PID 100, TID 1) unknown#{ordinal} [semantics unverified] → {rv} 100ns"
+                    " Unknown executable (PID 100, TID 1) unknown#{ordinal} → {rv} 100ns"
                 ),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );

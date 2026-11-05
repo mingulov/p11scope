@@ -3793,6 +3793,103 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
     );
 }
 
+/// Renaming an awaiting-publication gap's display text must not change the
+/// named-capture start decision: the refusal kind is typed at plan time,
+/// never re-derived from wording.
+#[test]
+fn awaiting_start_decision_survives_a_gap_rewording() {
+    let published_source = p11kit_like_64_table_module();
+    let mut closure = published_source.clone();
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    engine.pinned = pins;
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let mut plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+    assert!(
+        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "starts unpublished: {}",
+        plan.modules_skipped[0].reason
+    );
+    assert!(
+        refusal_error(&plan).is_none(),
+        "an awaiting gap alone starts the capture"
+    );
+    for skipped in &mut plan.modules_skipped {
+        skipped.reason = "a reworded gap that names no rule".to_string();
+    }
+    assert!(
+        refusal_error(&plan).is_none(),
+        "renaming the gap text must not block the start: {:?}",
+        plan.modules_skipped
+    );
+}
+
+/// Renaming an awaiting-publication gap's display text must not change the
+/// pause-seed decision: a seed with no plan owner stays terminal for the
+/// cycle whatever the gap says.
+#[test]
+fn awaiting_seed_decision_survives_a_gap_rewording() {
+    let published_source = p11kit_like_64_table_module();
+    let mut closure = published_source.clone();
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    let mut candidate = engine
+        .live_candidate(pins, vec![closure.clone()], Vec::new())
+        .expect("the unpublished rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        plan::is_closure_awaiting_publication(&candidate.plan.modules_skipped[0].reason),
+        "starts unpublished: {}",
+        candidate.plan.modules_skipped[0].reason
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: closure.path.clone(),
+        file_offset: 0x10000,
+    };
+    assert!(
+        seed_without_owner_is_terminal(&candidate, &seed),
+        "the unpublished seed is terminal before the rewording"
+    );
+    for skipped in &mut candidate.plan.modules_skipped {
+        skipped.reason = "a reworded gap that names no rule".to_string();
+    }
+    assert!(
+        seed_without_owner_is_terminal(&candidate, &seed),
+        "renaming the gap text must not make the seed incomplete: {:?}",
+        candidate.plan.modules_skipped
+    );
+}
+
 #[test]
 fn start_attempt_stages_initial_facts_before_active_cleanup() {
     let (mut engine, _, _, _) = engine_with_overlay(56);

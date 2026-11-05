@@ -6663,9 +6663,7 @@ fn open_native_lane_with(
                 let summary = crate::attach::summarize_native_preparation_error(&error);
                 return unavailable(
                     coordinator,
-                    format!(
-                        "live capture refused ({summary}); run with sudo for full capture"
-                    ),
+                    format!("live capture refused ({summary}); run with sudo for full capture"),
                 );
             }
             return Err(error);
@@ -9836,8 +9834,7 @@ mod tests {
     #[test]
     fn auto_pid_run_passes_preflight_to_scan_on_host_refusal() {
         use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
-        let refusal =
-            MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
         let mut stdout = Vec::new();
         let code = super::native_preparation_test::with(
             move |_, _, _| Err(refusal.into()),
@@ -9896,8 +9893,7 @@ mod tests {
     fn auto_pid_capture_falls_back_to_scan_on_host_refusal() {
         use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
         let mut coordinator = coordinator();
-        let refusal =
-            MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
         let lane = open_native_lane_with(
             CaptureMode::Auto,
             BackendSelection::Auto,

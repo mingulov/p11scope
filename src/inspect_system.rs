@@ -3023,9 +3023,7 @@ fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerb
     let mem_unreadable = catalog
         .processes
         .iter()
-        .filter(|process| {
-            matches!(process.status, MemberStatus::MemoryUnavailable { .. })
-        })
+        .filter(|process| matches!(process.status, MemberStatus::MemoryUnavailable { .. }))
         .count();
     let found = catalog.processes.len();
     let detail = if matched == 0 && mem_unreadable == 0 && checked == found {
@@ -8774,8 +8772,7 @@ mod tests {
         // Stale inventoried total: the header must count processes, not it.
         catalog.scanned = 2;
         catalog.maps_matched = 0;
-        let concise =
-            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(
             concise.contains("1 checked in detail, 0 matched from maps, 1 memory unreadable"),
             "{concise}"
@@ -8792,8 +8789,7 @@ mod tests {
     #[test]
     fn header_labels_deep_scan_time_not_scan_took() {
         let catalog = catalog_with(Vec::new());
-        let concise =
-            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(concise.contains("deep scans 7 ms"), "{concise}");
         assert!(!concise.contains("scan took"), "{concise}");
     }
@@ -8812,12 +8808,10 @@ mod tests {
                 endpoints: 68,
             },
         )]);
-        let concise =
-            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(!concise.contains("object[0]"), "{concise}");
         assert!(concise.contains("/opt/provider.so"), "{concise}");
-        let verbose =
-            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(verbose.contains("object[0]"), "{verbose}");
     }
 
@@ -8948,7 +8942,10 @@ mod tests {
             },
         ));
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
-        assert!(concise.contains("3 files over 256 MiB not read"), "{concise}");
+        assert!(
+            concise.contains("3 files over 256 MiB not read"),
+            "{concise}"
+        );
         assert_eq!(
             concise
                 .lines()

@@ -1375,7 +1375,10 @@ mod tests {
             &PinnedObjects::empty(),
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(verbose.contains("ptrace"), "the reason must be named: {verbose}");
+        assert!(
+            verbose.contains("ptrace"),
+            "the reason must be named: {verbose}"
+        );
         assert!(
             verbose.contains("CAP_SYS_PTRACE") || verbose.contains("ptrace_scope"),
             "say what would fix it: {verbose}"
@@ -1977,7 +1980,10 @@ mod tests {
                 double_loaded: false,
                 same_file_loads: 1,
                 view: crate::process::ProcessViewId(0),
-                mount_namespace: crate::process::MountNamespaceId { device: 1, inode: 1 },
+                mount_namespace: crate::process::MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
                 decoder_abi: None,

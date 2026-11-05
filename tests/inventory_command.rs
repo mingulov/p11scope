@@ -856,7 +856,7 @@ fn out_file_matches_stdout_document() {
 /// The NSS-softokn-shaped fixture publishes 8 interface-linked tables of 68
 /// distinct entry targets each (`catalog-nss/provider.c`): 544 endpoints,
 /// past the 512-slot Detailed ceiling `inspect` judges by, inside the
-/// 4096-endpoint Inventory budget the inventory command instruments under.
+/// 32768-endpoint Inventory budget the inventory command instruments under.
 /// Its verdict must be the Inventory one.
 #[test]
 fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
@@ -934,16 +934,16 @@ fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
     assert_scan_only_entries(edges[0], "driver -> ic-nss.so");
     // The first verdict stood: no admission change history.
     assert_eq!(module["admission"]["history"], serde_json::json!([]));
-    // The run's attach set holds the module's 544 endpoints of 4096.
+    // The run's attach set holds the module's 544 endpoints of 32768.
     assert_eq!(
         doc["budgets"]["inventory_endpoints"],
-        serde_json::json!({"limit": 4096, "occupied": 8 * 68, "refused": 0}),
+        serde_json::json!({"limit": 32768, "occupied": 8 * 68, "refused": 0}),
         "budgets: {}",
         doc["budgets"]
     );
     assert_eq!(
         doc["budgets"]["inventory_attach_modules"],
-        serde_json::json!({"limit": 4096, "occupied": 1, "refused": 0}),
+        serde_json::json!({"limit": 32768, "occupied": 1, "refused": 0}),
     );
     assert_eq!(doc["observation"]["usage_feed"], false);
     drop(guard);

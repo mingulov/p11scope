@@ -1525,18 +1525,18 @@ fn budgets_carry_the_inventory_attach_set_endpoints() {
     let harness = varied_harness();
     let document = harness.render();
     let row = &document["budgets"]["inventory_endpoints"];
-    assert_eq!(row["limit"], 4096, "the coordinator's Inventory budget");
+    assert_eq!(row["limit"], 32768, "the coordinator's Inventory budget");
     assert_eq!(
         row["occupied"],
         harness.coordinator().attach_set().len(),
         "occupancy is the attach set's endpoint count"
     );
     let presentation = capture_for(&harness, &document);
-    assert_eq!(presentation.budgets.inventory_endpoints_limit, 4096);
+    assert_eq!(presentation.budgets.inventory_endpoints_limit, 32768);
     assert_eq!(document["budgets"]["inventory_endpoints"]["refused"], 0);
     assert_eq!(
         document["budgets"]["inventory_attach_modules"],
-        serde_json::json!({"limit": 4096, "occupied": 0, "refused": 0})
+        serde_json::json!({"limit": 32768, "occupied": 0, "refused": 0})
     );
     let snapshot = render_snapshot(&presentation);
     let budgets = snapshot
@@ -1545,7 +1545,7 @@ fn budgets_carry_the_inventory_attach_set_endpoints() {
         .unwrap();
     assert!(
         budgets.contains(
-            " | inventory_endpoints 0/4096 refused 0 | inventory_attach_modules 0/4096 refused 0 | "
+            " | inventory_endpoints 0/32768 refused 0 | inventory_attach_modules 0/32768 refused 0 | "
         ),
         "{budgets}"
     );

@@ -2288,8 +2288,10 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
         // A quiet window over mapped providers is usually correct —
         // the target simply made no PKCS#11 calls — but it reads as a
         // failure. Say when providers are typically called and name
-        // the wider target a narrower scope should try.
-        if !ev.discovery.modules.is_empty() {
+        // the wider target a narrower scope should try. Only when
+        // coverage is COMPLETE: under PARTIAL the assertion would
+        // overclaim calls explicitly not counted.
+        if ev.completeness == "COMPLETE" && !ev.discovery.modules.is_empty() {
             text.push_str(
                 "No PKCS#11 calls were made in this window; providers are often called only at startup. ",
             );

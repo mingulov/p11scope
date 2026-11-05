@@ -855,6 +855,11 @@ struct Scene {
     /// decoded provider tables from scan 2 on. The discarded scan then
     /// holds a never-admitted provider member that is old, not new.
     straggler: Option<(u32, u64)>,
+    /// Forces the straggler's member status in every scan instead of
+    /// the default above. A forced unscanned status carries no decoded
+    /// tables: the discarded scan then holds an unscanned
+    /// never-admitted member for the dropped-coverage mark.
+    straggler_status: Option<crate::inspect_system::MemberStatus>,
     scans: usize,
     /// The first collection waits for this many discovery services (C5.7
     /// threading boundary): it cannot finish unless the loop services the
@@ -898,6 +903,7 @@ impl Scene {
             joiner_maps_matched: false,
             joiner_interfaces: false,
             straggler: None,
+            straggler_status: None,
             scans: 0,
             collect_gate: None,
             staged_lifecycle: Vec::new(),
@@ -979,7 +985,8 @@ impl Scene {
                 .map(|(pid, _)| {
                     let is_joiner = self.joiner.is_some_and(|joiner| joiner.0 == *pid);
                     let is_straggler = self.straggler.is_some_and(|straggler| straggler.0 == *pid);
-                    let straggler_scanned = is_straggler && self.scans >= 2;
+                    let straggler_scanned =
+                        is_straggler && self.scans >= 2 && self.straggler_status.is_none();
                     crate::inspect_system::Observation {
                         pid: *pid,
                         path: path.clone(),
@@ -1035,6 +1042,9 @@ impl Scene {
                         pid: *pid,
                         status: if is_joiner && self.joiner_maps_matched {
                             crate::inspect_system::MemberStatus::MapsMatched
+                        } else if is_straggler && let Some(forced) = self.straggler_status.as_ref()
+                        {
+                            forced.clone()
                         } else if is_straggler && self.scans < 2 {
                             crate::inspect_system::MemberStatus::NotSelected { loss: None }
                         } else {
@@ -7212,6 +7222,8 @@ mod publication_progress_tests {
 
         const POST_PASS_GAP_SUBJECT: &str = "discovery coverage ended before stop";
 
+        const DROPPED_COVERAGE_SUBJECT: &str = "dropped collection coverage";
+
         fn post_pass_gap_reason(pids: &[u32]) -> String {
             format!(
                 "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown (pids {})",
@@ -7507,6 +7519,112 @@ mod publication_progress_tests {
             assert!(
                 !has_old_newcomer_wording(&driver.scene),
                 "the mark must not claim the old member is new: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // An old process that every pass leaves unscanned (`NotSelected`
+        // past the cap, never admitted) and that the discarded pass also
+        // never scans: the drop names its pid, so an in-window process
+        // enumerated only in a discarded collection is never silent.
+        #[test]
+        fn stop_discard_with_unscanned_old_member_names_its_pid() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.source.spawn(9, 900);
+            driver.scene.straggler = Some((9, 900));
+            driver.scene.straggler_status =
+                Some(crate::inspect_system::MemberStatus::NotSelected { loss: None });
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(9).is_none(),
+                "no pass ever admitted the capped-out member"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == DROPPED_COVERAGE_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("an unscanned member dropped at stop must mark its pid");
+            assert!(
+                reason.contains("pids 9"),
+                "the gap must name the unscanned pid, got: {reason}"
+            );
+        }
+
+        // Twin: a selected-but-unreadable member in the discarded pass
+        // is unscanned too — its member gaps drop with the catalog, so
+        // the drop names its pid the same way.
+        #[test]
+        fn stop_discard_with_unreadable_old_member_names_its_pid() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.source.spawn(9, 900);
+            driver.scene.straggler = Some((9, 900));
+            driver.scene.straggler_status = Some(crate::inspect_system::MemberStatus::Unreadable {
+                reason: "pin failed".into(),
+            });
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(9).is_none(),
+                "no pass ever admitted the unreadable member"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == DROPPED_COVERAGE_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("an unreadable member dropped at stop must mark its pid");
+            assert!(
+                reason.contains("pids 9"),
+                "the gap must name the unreadable pid, got: {reason}"
+            );
+        }
+
+        // Twin: a discarded pass whose members all scanned or already
+        // admitted leaves no dropped-coverage mark — the disclosure
+        // fires only for unscanned never-admitted members.
+        #[test]
+        fn stop_discard_with_scanned_members_marks_no_dropped_coverage() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != DROPPED_COVERAGE_SUBJECT),
+                "a clean discard must not mark dropped coverage: {:?}",
                 driver.scene.gap_subjects(),
             );
         }

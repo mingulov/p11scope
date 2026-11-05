@@ -129,10 +129,11 @@ User-facing limits live in
   taking no heuristic slots. Calls it forwards are counted at the
   attached backend providers, named with counts on the gap line; calls
   the layer answers itself are not counted. When nothing is published
-  yet, a named gap says so and the capture continues. A real provider
-  that still does not fit is admitted on the leading prefix that fits,
-  with a named partial gap, and refused whole only when not even its
-  strongest table fits.
+  yet, a named gap says so and the capture continues; an operator-named
+  layer keeps a reserve-capped prefix for the remote-client case. A
+  real provider that still does not fit is admitted on the leading
+  prefix that fits, with a named partial gap, and refused whole only
+  when not even its strongest table fits.
 - A discovery pass that cannot yet scan a caller (usually one with no
   observed call yet) now reports a `semantic admission deferred` note
   instead of a refusal: tracking starts at a later pass and waiting

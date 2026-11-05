@@ -140,8 +140,11 @@ taking no heuristic slots, so the layer can never crowd out a real
 provider and is never refused outright. Calls it forwards are counted
 at the attached backend providers, named with counts on the gap line;
 calls the layer answers itself are not counted. When nothing is
-published yet, a named gap says so and the capture continues (costs of
-covering the layer are measured in
+published yet, a named gap says so and the capture continues. An
+operator-named layer (`--module <path>`) is the sole exception: it
+keeps a reserve-capped leading-templates prefix, because a remote
+client's tables are handed out before any export probe can observe the
+return (costs of covering the layer are measured in
 `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
 An ordinary provider that does not fit whole in a shared-scope Detailed
 capture is admitted on the leading-tables prefix that fits,

@@ -11525,6 +11525,86 @@ mod tests {
     }
 
     #[test]
+    fn json_unbound_use_carries_folded_entry_counts() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        // A short-lived image used the module 744 times and exited before
+        // any poll could bind it; the row stays unbound (no_live_caller).
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["entries"], 744,
+            "unbound entry counts fold to the module: {}",
+            document["modules"][0]["unbound_use"]
+        );
+    }
+
+    #[test]
+    fn text_module_detail_states_unbound_entry_lower_bound() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        // Same short-lived unbound row as the JSON twin above.
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            text.contains("at least 744 entries"),
+            "module detail states the unbound lower bound:\n{text}"
+        );
+    }
+
+    #[test]
     fn the_stop_line_reads_as_one_sentence() {
         let line = stop_line(&lane_summary(
             crate::inventory_capture::Retirement::Unsettled("budget passed".into()),

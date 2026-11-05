@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "browser"))
 import cells
 import flows
 import oracle
+import profiles
 import softhsm
 import tls_server
 
@@ -166,6 +167,30 @@ def needs_chromium(test):
         return test(self)
 
     return wrapper
+
+
+class NssSeedCells(unittest.TestCase):
+    """DEMO-4: the empty-password NSS DB seed gives a browser its own
+    token with a usable client key — no PIN prompt, no external token."""
+
+    def test_seed_nss_client_credential_installs_key_and_cert(self):
+        for tool in ("certutil", "pk12util", "openssl"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} missing")
+        work = Path(tempfile.mkdtemp(prefix="g33-nssseed-"))
+        self.addCleanup(shutil.rmtree, work, True)
+        cred = softhsm.generate_client_credential(work / "cred")
+        dbdir = work / "nssdb"
+        profiles.seed_nss_client_credential(dbdir, cred, "g33-nss-client")
+        import subprocess
+        listing = subprocess.run(
+            ["certutil", "-K", "-d", f"sql:{dbdir}"],
+            check=True, capture_output=True, text=True)
+        self.assertIn("g33-nss-client", listing.stdout)
+        certs = subprocess.run(
+            ["certutil", "-L", "-d", f"sql:{dbdir}"],
+            check=True, capture_output=True, text=True)
+        self.assertIn("g33-nss-client", certs.stdout)
 
 
 class BrowserCells(unittest.TestCase):

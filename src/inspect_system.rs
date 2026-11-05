@@ -3149,11 +3149,21 @@ fn render_object(
     verbosity: crate::cli::TextVerbosity,
 ) {
     let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
-    let _ = writeln!(
-        out,
-        "object[{index}]  {}",
-        crate::render::escape_controls(&object.path)
-    );
+    // Concise names the provider file like pid-inspect; the `object[N]`
+    // index stays verbose-only for cross-references.
+    if verbose {
+        let _ = writeln!(
+            out,
+            "object[{index}]  {}",
+            crate::render::escape_controls(&object.path)
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "module  {}",
+            crate::render::escape_controls(&object.path)
+        );
+    }
     if verbose {
         let _ = writeln!(
             out,

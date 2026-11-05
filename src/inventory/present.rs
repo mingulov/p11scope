@@ -1424,9 +1424,13 @@ fn concise_gap_summary_line(gaps: &[GapView], _suppressed: u64) -> Option<String
     if gaps.is_empty() {
         return None;
     }
+    // Deleted mappings are unloaded libraries, not loss: fold them to one
+    // plain trailing group instead of leading per-path groups.
+    let (deleted, rest): (Vec<_>, Vec<_>) =
+        gaps.iter().partition(|gap| gap.reason == "deleted mapping");
     let mut groups: std::collections::BTreeMap<(String, String), usize> =
         std::collections::BTreeMap::new();
-    for gap in gaps {
+    for gap in rest {
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
         *groups.entry((subject, reason)).or_insert(0) += 1;
@@ -1440,6 +1444,13 @@ fn concise_gap_summary_line(gaps: &[GapView], _suppressed: u64) -> Option<String
         .take(shown)
         .map(|((subject, reason), count)| format!("{count} × {subject} — {reason}"))
         .collect();
+    if !deleted.is_empty() {
+        parts.push(format!(
+            "{} × unloaded librar{} — mapped files were deleted (not loss)",
+            deleted.len(),
+            if deleted.len() == 1 { "y" } else { "ies" },
+        ));
+    }
     let more = ranked.len().saturating_sub(shown);
     if more > 0 {
         parts.push(format!("and {more} more"));
@@ -1460,7 +1471,7 @@ fn render_limits_line(out: &mut String, budgets: &BudgetView) {
     let plural = |count: usize| if count == 1 { "" } else { "s" };
     let _ = writeln!(
         out,
-        "limits: {} caller{}, {} provider file{}, {} link{} ({} refused); {} function{} watched of {} ({} refused). Full budget detail: -v or --json.",
+        "limits: {} caller{}, {} provider file{}, {} edge{} ({} refused); {} function{} watched of {} ({} refused). Full budget detail: -v or --json.",
         budgets.callers_occupied,
         plural(budgets.callers_occupied),
         budgets.modules_occupied,
@@ -1553,6 +1564,7 @@ fn gap_plain_reason(reason: &str) -> &str {
         "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection" => {
             "some processes were identified from /proc only"
         }
+        "deleted mapping" => "mapped file was deleted (not loss)",
         other => other,
     }
 }

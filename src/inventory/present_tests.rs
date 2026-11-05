@@ -2433,13 +2433,13 @@ fn concise_limits_line_uses_singular_nouns_for_one() {
         .find(|line| line.starts_with("limits:"))
         .unwrap_or_else(|| panic!("no limits line: {out}"));
     assert!(
-        limits.starts_with("limits: 1 caller, 1 provider file, 1 link (0 refused);"),
+        limits.starts_with("limits: 1 caller, 1 provider file, 1 edge (0 refused);"),
         "{limits}"
     );
     assert!(limits.contains("function"), "{limits}");
     assert!(!limits.contains("callers"), "{limits}");
     assert!(!limits.contains("files"), "{limits}");
-    assert!(!limits.contains("links"), "{limits}");
+    assert!(!limits.contains("edges"), "{limits}");
 }
 
 /// CLI-1: the verbose snapshot keeps the full `Details:` tail and no hint.

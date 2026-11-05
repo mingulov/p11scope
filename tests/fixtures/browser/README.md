@@ -28,6 +28,10 @@ end to end beside independent TLS-layer ground truth.
 - `register-suite.patch` — wiring patch (NOT applied): adds the suite plus
   its `run-python-suites.py` entry. The controller applies it at
   integration; this worktree never registers the suite itself.
+- `ff-mari-only.py` — standalone diagnosis script (not a cell): NSS-level
+  token login via Marionette chrome js-ctypes, then plain and
+  client-cert navigations with no Playwright. Reproduces the post-login
+  provider crash behind calibrated boundary 1.
 
 ## Setup (installed gate host)
 
@@ -120,6 +124,17 @@ What the catalog proves:
    pass; the PINBOUND twins assert the stall instead. A login-free
    provider (auto-login shim over SoftHSM) would unlock a sign-positive
    cell; it is follow-up work, not v1.
+   Update (2026-11-05, Fedora 44): an NSS-level login *is* reachable
+   without a prompt — chrome-context js-ctypes `PK11_CheckUserPassword`
+   on the in-process `libnss3` (see `ff-mari-only.py`; Playwright
+   dialogs, Marionette alert text, WebDriver BiDi prompts, and raw
+   side-session `C_Login` were all verified dead ends). The next wall
+   is the provider: after that login, the first TLS navigation kills
+   Firefox with SIGSEGV inside `libsofthsm2.so`
+   (softhsm-2.7.0-0.1.rc1, fault offset ~0xb7f17 per `eu-stack`;
+   reproduced Marionette-only, so no Playwright/Juggler involvement;
+   no-login controls navigate fine). A sign-positive Firefox cell
+   therefore also needs a SoftHSM build without that crash.
 2. **`p11scope run` + Chromium aborts (SIGABRT, 3/4 launches).** The
    abort precedes any mapping (single-process included; stabilized flags
    do not help), implicating the observer's loader hooks during

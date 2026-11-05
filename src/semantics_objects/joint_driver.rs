@@ -2168,8 +2168,20 @@ impl RawJointQuantum {
         // is provably another caller's (there is no bound caller to
         // differ from), so the localized refusal must not taint it: the
         // interval is fenced as loss below instead, and a process that
-        // binds later can still enter Joint above that fence.
+        // binds later can still enter Joint above that fence. The one
+        // exception is an image with a BEGIN still open in this
+        // quantum: its terminal can still arrive and would be
+        // unaccountable, so it keeps the localized refusal.
         let pre_key = !unlocalized && owner.adapter.keys.is_empty();
+        let open_images: std::collections::BTreeSet<(u64, u64)> = if pre_key {
+            self.invocations
+                .iter()
+                .filter(|invocation| !invocation.terminal)
+                .map(|invocation| super::JournalAdapter::image_of_begin(&invocation.begin))
+                .collect()
+        } else {
+            Default::default()
+        };
         let failure = (unlocalized || affecting).then(|| {
             let gap = if overflow {
                 JournalGap::CutExhausted
@@ -2177,9 +2189,13 @@ impl RawJointQuantum {
                 self.disposal_gap(&owner.adapter, unlocalized)
             };
             if pre_key {
-                owner
-                    .adapter
-                    .refuse_disposed_raw(&mut owner.model, std::iter::empty(), false, gap)
+                owner.adapter.refuse_disposed_raw(
+                    &mut owner.model,
+                    self.affecting_images()
+                        .filter(|image| open_images.contains(image)),
+                    false,
+                    gap,
+                )
             } else {
                 owner.adapter.refuse_disposed_raw(
                     &mut owner.model,
@@ -2193,7 +2209,24 @@ impl RawJointQuantum {
         // There is no H8 dispatch, claim, grant or synthetic terminal. Keep
         // first-affecting sightings monotonic, including fork children.
         for (item, quiet, _) in self.classified_items() {
-            if pre_key {
+            let item_open = match item {
+                super::JournalIngestItem::Journal(record) => match record {
+                    super::JournalRecord::Begin(begin) => {
+                        open_images.contains(&super::JournalAdapter::image_of_begin(begin))
+                    }
+                    super::JournalRecord::End(end) => open_images.contains(&super::end_image(end)),
+                    super::JournalRecord::Abandon(abandon) => {
+                        open_images.contains(&(abandon.image_cookie(), abandon.image_exec()))
+                    }
+                },
+                super::JournalIngestItem::Ordinary(record) => {
+                    let event = &record.base.event;
+                    open_images.contains(&(event.image.task_cookie, event.image.exec_id))
+                        || open_images
+                            .contains(&(event.child_image.task_cookie, event.child_image.exec_id))
+                }
+            };
+            if pre_key && !item_open {
                 owner.adapter.note_disposed_without_sighting();
             } else {
                 let _ = owner.adapter.note_consumed_item(item, quiet);

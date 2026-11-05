@@ -13117,6 +13117,9 @@ mod tests {
             "module needs 150 more; only 512 attach slots are available; 400 are in use \
              (400 active, 0 retired; held by /opt/(provider_prefix)/lib.so 400) — refusing to attach \
              a prefix",
+            "module needs 150 more; only 512 attach slots are available; 400 are in use \
+             (400 active, 0 retired; held by /opt/template tables attached; calls through the others \
+             are not counted/lib.so 400) — refusing to attach a prefix",
             "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix \
              of its 67 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
              when mapped before the capture's first plan beside a provider or named by the operator, or \

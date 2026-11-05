@@ -63590,8 +63590,15 @@ fn named_pid_scan_failure_after_exit_gaps_instead_of_aborting() {
 #[test]
 fn named_pid_with_live_view_still_discovers() {
     // Healthy twin: a live named view still discovers (full coverage
-    // unchanged when the process exists).
-    let pid = std::process::id();
+    // unchanged when the process exists). The target is a small `sleep`
+    // fixture, never the test binary itself: an instrumented coverage
+    // build exceeds the per-object byte cap and gaps as designed.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
     let view = ProcessView::open(ProcessViewId(41), pid).unwrap();
     let args = CaptureArgs {
         track_short_lived: false,
@@ -63618,6 +63625,8 @@ fn named_pid_with_live_view_still_discovers() {
     let scope = Scope::Pid(pid);
     let engine = Engine::discover(&args, &scope, Some(view)).expect("live pid discovers");
     assert!(engine.counters.object_skips.is_empty());
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 #[test]

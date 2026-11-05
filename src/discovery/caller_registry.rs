@@ -3098,6 +3098,7 @@ impl CallerRegistry {
     }
 
     /// Calls shed unrouted from provably other callers, lifetime.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn foreign_unrouted_calls(&self) -> u64 {
         self.foreign_unrouted_calls
     }

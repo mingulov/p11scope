@@ -1091,6 +1091,9 @@ pub struct Evidence {
     pub pause_attempts: u64,
     pub pause_confirmed: u64,
     pub pause_partial: u64,
+    /// `--pause always` degrades that collected unpaused instead of
+    /// aborting (never-stop). Each forces `PARTIAL`.
+    pub pause_unavailable: u64,
     /// Present only for `run`: true only when capture ended while the owned
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1849,6 +1852,7 @@ impl Evidence {
             self.task_uprobe_link_losses > 0,
         );
         cause(o, "pause_partial", self.pause_partial > 0);
+        cause(o, "pause_unavailable", self.pause_unavailable > 0);
         cause(o, "loader_discovery", !self.loader_discovery.complete());
         cause(
             o,
@@ -2633,6 +2637,10 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                 count(ev.task_uprobe_link_losses, "task-uprobe links lost")
             }
             "pause_partial" => count(ev.pause_partial, "partial pauses"),
+            "pause_unavailable" => count(
+                ev.pause_unavailable,
+                "pause unavailable (collected unpaused)",
+            ),
             "loader_discovery" => {
                 let loader = &ev.loader_discovery;
                 if loader.hits == 0 && loader.strategies.debug_state_every_hit == 1 {
@@ -3876,6 +3884,7 @@ pub(crate) mod tests {
             pause_attempts: 0,
             pause_confirmed: 0,
             pause_partial: 0,
+            pause_unavailable: 0,
             child_still_running: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,

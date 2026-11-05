@@ -333,25 +333,6 @@ fn loader_retirement_never_owns_an_untimed_session_dequeue() {
     assert!(retirement.contains("collect(session)"));
 }
 
-/// The generic (non-terminal) drain never retries: `drain_discovery_tick`
-/// aborts the run on `?` (src/run.rs) instead of retaining and replaying
-/// anything. Its error text must not claim retention the terminal routes
-/// actually perform.
-#[test]
-fn generic_drain_failure_states_no_retention_claim() {
-    let record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-    let retained =
-        IncompleteTerminalDrain::new(vec![record], 0, 0, anyhow!("scripted ring read failed"));
-
-    let error = Engine::generic_drain_error(retained.into());
-
-    assert_eq!(error.to_string(), "scripted ring read failed");
-    assert!(
-        !error.to_string().contains("retained"),
-        "the generic drain retains nothing across ticks: {error:#}"
-    );
-}
-
 fn malformed_dequeues(count: usize) -> Vec<Result<Option<crate::events::DiscoveryItem>>> {
     (0..count)
         .map(|_| Ok(Some(crate::events::DiscoveryItem::Malformed)))
@@ -14145,6 +14126,7 @@ fn evidence_verdict(
         pause_attempts: 0,
         pause_confirmed: 0,
         pause_partial: 0,
+        pause_unavailable: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -34308,6 +34290,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         pause_attempts: 0,
         pause_confirmed: 0,
         pause_partial: 0,
+        pause_unavailable: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -63392,4 +63375,117 @@ fn stamped_legacy_fixture_reports_no_surface_gap() {
             evidence.completeness
         );
     }
+}
+
+#[test]
+fn named_pid_race_reports_partial_instead_of_aborting() {
+    // Never-stop: a named --pid that exits before discovery (or never
+    // existed) reports an empty PARTIAL plan like the cgroup path, not an
+    // abort with no report. RED: currently Err, dropping the report.
+    let pid = u32::MAX;
+    let args = CaptureArgs {
+        track_short_lived: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Pid(pid),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = Scope::Pid(pid);
+    let engine = Engine::discover(&args, &scope, None).expect("exited pid gaps, not aborts");
+    assert!(engine.plan.modules.is_empty());
+}
+
+#[test]
+fn named_pid_with_live_view_still_discovers() {
+    // Healthy twin: a live named view still discovers (full coverage
+    // unchanged when the process exists).
+    let pid = std::process::id();
+    let view = ProcessView::open(ProcessViewId(41), pid).unwrap();
+    let args = CaptureArgs {
+        track_short_lived: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Pid(pid),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = Scope::Pid(pid);
+    let engine = Engine::discover(&args, &scope, Some(view)).expect("live pid discovers");
+    assert!(engine.counters.object_skips.is_empty());
+}
+
+#[test]
+fn live_transport_failure_applies_prefix_and_gaps_instead_of_aborting() {
+    // Never-stop: a dequeue transport error mid-frame applies the pulled
+    // prefix, records a transport gap, and continues to the next tick.
+    // RED: currently Err, dropping the prefix.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session = ScriptedSession::default();
+    session.dequeues.extend(malformed_dequeues(2));
+    session
+        .dequeues
+        .push_back(Err(anyhow::anyhow!("scripted transport failure")));
+    engine
+        .drain_discovery_shallow_from(&mut session, false)
+        .expect("transport failure gaps, not aborts");
+    assert_eq!(engine.malformed_discovery, 2);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.starts_with("discovery transport unavailable")),
+        "{:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn live_clean_prefix_applies_without_transport_gap() {
+    // Healthy twin: a clean prefix applies with no transport gap.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session = ScriptedSession::default();
+    session.dequeues.extend(malformed_dequeues(2));
+    engine
+        .drain_discovery_shallow_from(&mut session, false)
+        .expect("clean prefix applies");
+    assert_eq!(engine.malformed_discovery, 2);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.starts_with("discovery transport unavailable")),
+        "{:?}",
+        engine.counters.object_skips
+    );
 }

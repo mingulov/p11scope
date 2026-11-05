@@ -151,7 +151,12 @@ SCHEDULING_PHASE_TS_KEYS = ("attach_mono_ns", "loop_start_mono_ns",
 SCHEDULING_LOOP_END_REASONS = {"expiry", "operator_stop", "target_exit",
                                "limit_reached", "error", "unstarted"}
 PAUSE_VALUES = ("none", "sigstop", "partial")
-PAUSE_COUNTERS = ("pause_attempts", "pause_confirmed", "pause_partial")
+PAUSE_COUNTERS = (
+    "pause_attempts",
+    "pause_confirmed",
+    "pause_partial",
+    "pause_unavailable",
+)
 DISCOVERY_LOSS_COUNTERS = (
     "discovery_ring_loss",
     "discovery_state_failures",
@@ -1745,6 +1750,7 @@ def expected_gap_classes(evidence):
             ("discovery_truncated", evidence["discovery_truncated"] > 0),
             ("task_uprobe_link_losses", evidence["task_uprobe_link_losses"] > 0),
             ("pause_partial", evidence["pause_partial"] > 0),
+            ("pause_unavailable", evidence["pause_unavailable"] > 0),
             ("loader_discovery", not loader_discovery_complete(evidence["loader_discovery"])),
             ("scheduling.terminal_drain_truncated", scheduling["terminal_drain_truncated"] is True),
             (
@@ -2670,13 +2676,21 @@ def exact_live_discovery_evidence(evidence, *, run=False):
     require(evidence["pause"] in PAUSE_VALUES, f"pause: {evidence['pause']!r}")
     for counter in PAUSE_COUNTERS:
         require(u64(evidence[counter]), f"{counter}: {evidence[counter]!r}")
-    attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
+    attempts, confirmed, partial, unavailable = (
+        evidence[name] for name in PAUSE_COUNTERS
+    )
     require(
-        confirmed + partial == attempts,
-        f"pause counters do not add up: {attempts} != {confirmed} + {partial}",
+        confirmed + partial + unavailable == attempts,
+        f"pause counters do not add up: {attempts} != {confirmed} + {partial} + {unavailable}",
     )
     # The published value is exactly the lattice, never an independent label.
-    wanted = "none" if attempts == 0 else "partial" if partial else "sigstop"
+    wanted = (
+        "none"
+        if attempts == 0
+        else "partial"
+        if (partial or unavailable)
+        else "sigstop"
+    )
     require(evidence["pause"] == wanted, f"pause: want {wanted}, got {evidence['pause']}")
     for counter in DISCOVERY_LOSS_COUNTERS:
         require(u64(evidence[counter]), f"{counter}: {evidence[counter]!r}")
@@ -3659,8 +3673,9 @@ def validate_canary(lane, document, target_bits=64):
             )
             require(
                 (evidence["pause"], evidence["pause_attempts"],
-                 evidence["pause_confirmed"], evidence["pause_partial"])
-                == ("none", 0, 0, 0),
+                 evidence["pause_confirmed"], evidence["pause_partial"],
+                 evidence["pause_unavailable"])
+                == ("none", 0, 0, 0, 0),
                 "owned metrics requires exact never-pause evidence",
             )
     elif policy == "object":

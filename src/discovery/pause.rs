@@ -178,6 +178,10 @@ pub(crate) struct PauseCounters {
     pub(crate) attempts: u64,
     pub(crate) confirmed: u64,
     pub(crate) partial: u64,
+    /// `--pause always` degrades that collected unpaused instead of
+    /// aborting (never-stop F-16). Each counts as partial for the
+    /// status and the `PARTIAL` verdict.
+    pub(crate) unavailable: u64,
 }
 
 impl PauseCounters {
@@ -187,6 +191,7 @@ impl PauseCounters {
             attempts,
             confirmed: attempts,
             partial: 0,
+            unavailable: 0,
         }
     }
 
@@ -196,19 +201,23 @@ impl PauseCounters {
             attempts,
             confirmed: 0,
             partial: attempts,
+            unavailable: 0,
         }
     }
 
     pub(crate) fn status(self) -> PauseStatus {
-        match (self.attempts, self.partial) {
-            (0, _) => PauseStatus::None,
-            (_, 0) => PauseStatus::Sigstop,
+        match (self.attempts, self.partial, self.unavailable) {
+            (0, _, _) => PauseStatus::None,
+            (_, 0, 0) => PauseStatus::Sigstop,
             _ => PauseStatus::Partial,
         }
     }
 
     fn valid(self) -> bool {
-        self.confirmed.saturating_add(self.partial) == self.attempts
+        self.confirmed
+            .saturating_add(self.partial)
+            .saturating_add(self.unavailable)
+            == self.attempts
     }
 }
 
@@ -2146,6 +2155,18 @@ impl PauseCoordinator {
         self.counters
     }
 
+    /// Records one `--pause always` degrade that collected unpaused
+    /// instead of aborting (never-stop). The attempt was already counted
+    /// by `begin_attempt`; this moves it to `unavailable` (partial).
+    pub(crate) fn note_unavailable(&mut self) {
+        self.counters.unavailable = self.counters.unavailable.saturating_add(1);
+        debug_assert!(
+            self.counters.valid(),
+            "unavailable must stay within attempts: {:?}",
+            self.counters
+        );
+    }
+
     /// Records a stopped-sample instant toward the first hold: the child
     /// was proven stopped at `now`. Frozen holds never move.
     fn note_hold_sample(&mut self, now: u64) {
@@ -3990,6 +4011,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(
@@ -4063,6 +4085,7 @@ mod tests {
                     attempts: 1,
                     confirmed: 0,
                     partial: 0,
+                    unavailable: 0,
                 }
             );
             assert_eq!(
@@ -4342,6 +4365,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
     }
@@ -4582,6 +4606,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert!(!coordinator.rearming_enabled());
@@ -7113,6 +7138,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -7148,6 +7174,7 @@ mod tests {
                 attempts: 2,
                 confirmed: 1,
                 partial: 1,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -7185,6 +7212,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -7223,6 +7251,7 @@ mod tests {
                 attempts: 1,
                 confirmed: 0,
                 partial: 0,
+                unavailable: 0,
             }
         );
         assert_eq!(io.authorization, None);
@@ -8839,6 +8868,7 @@ mod tests {
                             attempts: 2,
                             confirmed: 1,
                             partial: 1,
+                            unavailable: 0,
                         }
                     );
                     assert_eq!(coordinator.status(), PauseStatus::Partial);
@@ -8852,6 +8882,7 @@ mod tests {
                             attempts: 2,
                             confirmed: 1,
                             partial: 0,
+                            unavailable: 0,
                         }
                     );
                 }
@@ -8870,14 +8901,24 @@ mod tests {
                 attempts: 2,
                 confirmed: 1,
                 partial: 1,
+                unavailable: 0,
+            },
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 0,
+                unavailable: 1,
             },
         ] {
-            assert_eq!(counters.confirmed + counters.partial, counters.attempts);
+            assert_eq!(
+                counters.confirmed + counters.partial + counters.unavailable,
+                counters.attempts
+            );
             assert_eq!(
                 counters.status(),
-                match (counters.attempts, counters.partial) {
-                    (0, _) => PauseStatus::None,
-                    (_, 0) => PauseStatus::Sigstop,
+                match (counters.attempts, counters.partial, counters.unavailable) {
+                    (0, _, _) => PauseStatus::None,
+                    (_, 0, 0) => PauseStatus::Sigstop,
                     _ => PauseStatus::Partial,
                 }
             );

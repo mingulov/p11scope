@@ -674,6 +674,11 @@ of:
 
 Counts are array lengths; no path, PID, or error chain leaves diagnostics.
 
+`evidence.pause_unavailable` (integer, required, default 0) counts `--pause
+always` degrades that collected unpaused instead of aborting. Each forces
+`PARTIAL` via the `pause_unavailable` gap cause; `evidence.pause` reads
+`partial` when either `pause_partial` or `pause_unavailable` is nonzero.
+
 ## Migration
 
 Consumers must migrate live profile dispatch from

@@ -2762,9 +2762,18 @@ fn capture_with_host(
     }
     let (scope, named_view) = match &a.scope {
         ScopeArg::Pid(p) => {
-            let view = ProcessView::open(ProcessViewId(0), *p)
-                .map_err(|error| anyhow!("--pid {p}: {error}"))?;
-            (Scope::Pid(*p), Some(view))
+            // Never-stop: a named pid that exits before the view opens
+            // reports an empty PARTIAL plan via discovery (which gaps the
+            // race like a cgroup member) instead of aborting with no report.
+            match ProcessView::open(ProcessViewId(0), *p) {
+                Ok(view) => (Scope::Pid(*p), Some(view)),
+                Err(error) => {
+                    emit_capture_diagnostic(&format!(
+                        "p11scope: --pid {p}: {error}; reporting an empty partial capture"
+                    ));
+                    (Scope::Pid(*p), None)
+                }
+            }
         }
         ScopeArg::Cgroup(c) => (scope::capture_cgroup(c)?, None),
         // No named view and no cgroup path: discovery sweeps /proc itself.
@@ -3946,13 +3955,25 @@ fn run_owned_inner_with_host(
             .expect("owned child is present before arm");
         let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
         if let Err(error) = owned.coordinator.arm(&mut io) {
-            return Err(finish_capture_error(
-                pause_failure(error),
-                &mut engine,
-                &mut session,
-                Some(&mut owned),
-                &stop,
-            ));
+            // Never-stop: an Always arm failure that is not lifecycle
+            // collects unpaused with a pause_unavailable gap instead of
+            // aborting before the capture. Lifecycle still aborts.
+            if error.lifecycle() {
+                return Err(finish_capture_error(
+                    pause_failure(error),
+                    &mut engine,
+                    &mut session,
+                    Some(&mut owned),
+                    &stop,
+                ));
+            }
+            let always = error.required();
+            retire_pause_policy(error).map_err(|error| {
+                finish_capture_error(error, &mut engine, &mut session, Some(&mut owned), &stop)
+            })?;
+            if always {
+                owned.coordinator.note_unavailable();
+            }
         }
     }
 
@@ -3983,7 +4004,7 @@ fn run_owned_inner_with_host(
             .expect("owned child is present after release");
         let mut io = SessionPauseIo::new(&mut engine, &mut session, child, &marker, &cancelled);
         if let Err(error) = owned.coordinator.revalidate_after_release(&mut io) {
-            if error.required() || error.lifecycle() {
+            if error.lifecycle() {
                 return Err(finish_capture_error(
                     pause_failure(error),
                     &mut engine,
@@ -3992,7 +4013,13 @@ fn run_owned_inner_with_host(
                     &stop,
                 ));
             }
-            retire_pause_policy(error)?;
+            let always = error.required();
+            retire_pause_policy(error).map_err(|error| {
+                finish_capture_error(error, &mut engine, &mut session, Some(&mut owned), &stop)
+            })?;
+            if always {
+                owned.coordinator.note_unavailable();
+            }
         }
     }
 
@@ -4731,7 +4758,11 @@ fn drain_discovery_tick(
         Ok(Some(changed)) => Ok((changed, true)),
         Ok(None) => Ok((engine.drain_discovery(session)?, false)),
         Err(error) => {
+            let always = error.required() && !error.lifecycle();
             retire_pause_policy(error)?;
+            if always {
+                owned.coordinator.note_unavailable();
+            }
             Ok((engine.drain_discovery(session)?, false))
         }
     }
@@ -4755,9 +4786,9 @@ impl TickPauseIo for SessionPauseIo<'_> {
 /// run the same code. It runs the frame pass's own pause entry,
 /// `service_pause`, without the frame's ordinary discovery, so a disabled or
 /// retired policy leaves discovery to the next frame. An error is retired
-/// exactly as a frame retires it (`retire_pause_policy`: `always` or a
-/// lifecycle failure ends the capture). The tick's `(plan_changed, paused)`
-/// reports whatever the call applied either way.
+/// exactly as a frame retires it (`retire_pause_policy`: lifecycle ends the
+/// capture, `always` degrades to unpaused with a gap). The tick's
+/// `(plan_changed, paused)` reports whatever the call applied either way.
 fn pending_stop_pass(
     coordinator: &mut PauseCoordinator,
     io: &mut impl TickPauseIo,
@@ -4765,7 +4796,11 @@ fn pending_stop_pass(
     let paused = match service_pause(coordinator, io) {
         Ok(serviced) => serviced,
         Err(error) => {
+            let always = error.required() && !error.lifecycle();
             retire_pause_policy(error)?;
+            if always {
+                coordinator.note_unavailable();
+            }
             false
         }
     };
@@ -4795,14 +4830,24 @@ fn service_pending_stop(
 /// `auto` is explicit best effort: a nonfatal coordinator failure has already
 /// retired the policy and accounted itself as one partial attempt, so the
 /// capture continues on the ordinary cadence and renders `pause: partial`
-/// rather than failing. A required (`always`) or lifecycle failure is never
-/// downgraded that way — it stops the command after safe cleanup (§10.3).
+/// rather than failing. A lifecycle failure is never downgraded that way —
+/// it stops the command after safe cleanup (§10.3). A required (`always`)
+/// non-lifecycle failure degrades to unpaused with a named
+/// `pause_unavailable` gap (never-stop): the caller records one
+/// unavailable attempt and the capture continues, reporting `PARTIAL`.
 fn retire_pause_policy(error: PauseError) -> Result<()> {
-    if error.required() || error.lifecycle() {
+    if error.lifecycle() {
         return Err(pause_failure(error));
     }
     // The pause error chain can quote discovery-batch application failures,
     // which handle target-named records; escape at this terminal boundary too.
+    if error.required() {
+        emit_capture_diagnostic(&format!(
+            "p11scope: pause unavailable: {}; collecting unpaused and reporting pause_unavailable",
+            render::escape_controls(&error.to_string())
+        ));
+        return Ok(());
+    }
     emit_capture_diagnostic(&format!(
         "p11scope: pause: {}; the capture continues unpaused and reports pause: partial",
         render::escape_controls(&error.to_string())
@@ -8968,6 +9013,7 @@ pub(crate) fn evidence_for(
         pause_attempts: pause.attempts,
         pause_confirmed: pause.confirmed,
         pause_partial: pause.partial,
+        pause_unavailable: pause.unavailable,
         child_still_running,
         discovery_ring_loss,
         discovery_state_failures,
@@ -12093,6 +12139,7 @@ mod tests {
         resumed_at: Vec<u64>,
         authorization_reads: usize,
         dequeues: usize,
+        arm_error: Option<String>,
     }
 
     /// The helper's stop, as the kernel performs it: a loader hook in the
@@ -12167,6 +12214,9 @@ mod tests {
         }
 
         fn arm(&mut self) -> std::result::Result<(), String> {
+            if let Some(error) = self.held.arm_error.clone() {
+                return Err(error);
+            }
             self.held.authorization = Some(p11scope_ebpf_common::PAUSE_ARMED);
             Ok(())
         }
@@ -12351,6 +12401,7 @@ mod tests {
                             attempts: 1,
                             confirmed: 0,
                             partial: 1,
+                            unavailable: 0,
                         },
                         "{case}: the stop that never confirmed must be reported as partial"
                     );
@@ -12650,11 +12701,13 @@ mod tests {
             attempts: stops,
             confirmed: stops,
             partial: 0,
+            unavailable: 0,
         };
         let unconfirmed = |partial| PauseCounters {
             attempts: 1,
             confirmed: 0,
             partial,
+            unavailable: 0,
         };
         let serviced =
             |case, policy, first_ticks, stops, idle_authorization_reads| HeldStopOutcome {
@@ -19463,6 +19516,7 @@ mod tests {
                     attempts: 5,
                     confirmed: 5,
                     partial: 0,
+                    unavailable: 0,
                 },
                 "sigstop",
                 0,
@@ -19472,6 +19526,7 @@ mod tests {
                     attempts: 5,
                     confirmed: 2,
                     partial: 3,
+                    unavailable: 0,
                 },
                 "partial",
                 1,
@@ -21015,6 +21070,76 @@ mod tests {
             );
             assert_eq!(diag.trace_counts(), want, "actual reducer branch {mode}");
         }
+    }
+
+    #[test]
+    fn pause_always_arm_failure_degrades_to_unpaused_with_gap() {
+        // Never-stop: --pause always that fails to arm collects unpaused
+        // with a named pause_unavailable gap (PARTIAL), not an abort.
+        // RED: currently Err, aborting the capture.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let child = spawn(sleeper.to_str().unwrap(), &[]);
+        let signals = SignalState::new();
+        let mut held = HeldPause::default();
+        let mut coordinator = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            PauseCoordinator::preflight(crate::cli::PausePolicy::Always, &child, &mut io).unwrap()
+        };
+        held.arm_error = Some("scripted arm failure".into());
+        let error = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            coordinator
+                .arm(&mut io)
+                .expect_err("scripted arm must fail")
+        };
+        assert!(error.required());
+        assert!(!error.lifecycle());
+        retire_pause_policy(error).expect("always arm failure gaps, not aborts");
+        // The caller records one unavailable attempt (as the production
+        // tick paths do); the status is partial and the verdict is PARTIAL.
+        coordinator.note_unavailable();
+        assert_eq!(coordinator.counters().unavailable, 1);
+        assert_eq!(
+            coordinator.counters().status(),
+            crate::discovery::pause::PauseStatus::Partial
+        );
+    }
+
+    #[test]
+    fn pause_always_successful_arm_needs_no_gap() {
+        // Healthy twin: a successful --pause always arm needs no gap.
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let child = spawn(sleeper.to_str().unwrap(), &[]);
+        let signals = SignalState::new();
+        let mut held = HeldPause::default();
+        let mut coordinator = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            PauseCoordinator::preflight(crate::cli::PausePolicy::Always, &child, &mut io).unwrap()
+        };
+        let outcome = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            coordinator.arm(&mut io).expect("arm succeeds")
+        };
+        assert_eq!(outcome, ArmResult::Armed);
+        assert_eq!(coordinator.counters().unavailable, 0);
     }
 }
 

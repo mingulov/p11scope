@@ -6804,7 +6804,25 @@ fn discover_plan(
         };
         let view = match opened {
             Ok(view) => view,
-            Err(error) if named => return Err(anyhow!(error)),
+            Err(error) if named => {
+                // Never-stop: a named pid that exits between scope
+                // resolution and discovery gaps like a cgroup member and
+                // reports an empty PARTIAL plan. A missing view for a live
+                // pid stays a programmer error (fatal).
+                if process::generation_gone(*pid) {
+                    if let Some(skipped) = unreadable_member_skip(
+                        *pid,
+                        true,
+                        &format!("the named process exited before discovery: {error}"),
+                        &mut discovered.base_counters.noise,
+                    ) {
+                        attribution::note(&skipped);
+                        discovered.base_counters.object_skips.push(skipped);
+                    }
+                    continue;
+                }
+                return Err(anyhow!(error));
+            }
             Err(error) => {
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
@@ -6857,10 +6875,9 @@ fn discover_plan(
                 );
                 discovered.views.push(view);
             }
-            // The pid the operator named *is* the capture; any other is one of many
-            // in a cgroup, and may legitimately exit between listing and scanning —
-            // legitimate, but still a process whose providers went unexamined.
-            Err(error) if named => return Err(error),
+            // Never-stop: a named pid that exits between listing and
+            // scanning gaps exactly like a cgroup member and reports an
+            // empty PARTIAL plan — never an abort with no report.
             Err(error) => {
                 // Allocated but never admitted: the failed scan drops
                 // this view, so its ID returns to the pool.
@@ -25033,28 +25050,29 @@ impl Engine {
                     records.extend(drained);
                     malformed = malformed.saturating_add(drained_malformed);
                 }
-                // The budgeted pull only fails on a transport failure; its
-                // prefix is dropped with the route, never retained.
+                // Never-stop: a transport failure applies the pulled
+                // prefix, records a transport gap, and continues to the
+                // next tick — never an abort that drops the prefix.
                 Err(error) => {
                     let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
-                    return Err(Self::generic_drain_error(incomplete.into()));
+                    records.extend(incomplete.records);
+                    malformed = malformed.saturating_add(incomplete.malformed);
+                    self.mark_partial(
+                        "live discovery transport",
+                        &format!(
+                            "discovery transport unavailable: dequeue failed after {} records ({} malformed); prefix applied",
+                            records.len(),
+                            malformed
+                        ),
+                    );
+                    self.frame_fresh_blocked = false;
+                    return Ok((records, malformed, false));
                 }
             }
         }
         let fresh_blocked = !observed_empty;
         self.frame_fresh_blocked = fresh_blocked;
         Ok((records, malformed, fresh_blocked))
-    }
-
-    /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
-    /// route instead of retaining and replaying anything, so a collection
-    /// failure here must not carry the terminal routes' "N terminal
-    /// record(s) retained for retry" claim — nothing is retained.
-    fn generic_drain_error(error: anyhow::Error) -> anyhow::Error {
-        match error.downcast::<IncompleteTerminalDrain>() {
-            Ok(incomplete) => anyhow::Error::msg(incomplete.cause),
-            Err(error) => error,
-        }
     }
 
     /// Ordinary discovery records this Engine currently holds in userspace:
@@ -28915,12 +28933,29 @@ impl Engine {
             // fresh room the frame could not reach; an empty pull is a
             // quiet pass, not a re-latch.
             let budget = Cell::new(self.shared_allowance_remaining(session, 0));
-            let (pulled, pulled_malformed, _) = Self::collect_discovery_records_budgeted(
+            // Never-stop: a transport failure applies the pulled prefix
+            // with a gap instead of aborting the backlog pass.
+            let (pulled, pulled_malformed) = match Self::collect_discovery_records_budgeted(
                 session,
                 &budget,
                 LIVE_DISCOVERY_DRAIN_QUANTUM,
-            )
-            .map_err(Self::generic_drain_error)?;
+            ) {
+                Ok((pulled, pulled_malformed, _)) => (pulled, pulled_malformed),
+                Err(error) => {
+                    let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                    let pulled = incomplete.records;
+                    let pulled_malformed = incomplete.malformed;
+                    self.mark_partial(
+                            "live discovery transport",
+                            &format!(
+                                "discovery transport unavailable: dequeue failed after {} records ({} malformed); prefix applied",
+                                pulled.len(),
+                                pulled_malformed
+                            ),
+                        );
+                    (pulled, pulled_malformed)
+                }
+            };
             malformed = pulled_malformed;
             fresh_records = pulled.len();
             pulled

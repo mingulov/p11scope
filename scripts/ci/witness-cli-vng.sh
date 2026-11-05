@@ -9,11 +9,20 @@
 # so TESTBIN and OUTDIR must live under /home. Inside the guest the cells
 # run with TMPDIR on a guest-local tmpfs: the shared 9p tree slows
 # capture cells and remaps ownership. OUTDIR receives cells/results.jsonl,
-# cells/summary.txt, one cells/<test>.log per cell, run.log, uname.txt
-# and vng-console.log.
+# cells/summary.txt, one cells/<test>.log per cell, run.log, uname.txt,
+# vng-console.log and the staged kernel-config.
+#
+# The pre-arm witness needs the running kernel's LTO status from
+# /boot/config-{release}, but the shared rootfs only carries the host's
+# configs. The harness stages the booted kernel's config from the vng
+# cache as OUTDIR/kernel-config and the guest installs it over a tmpfs
+# /boot before the cells run; without it the witness stays unavailable
+# and the exact-count cells fail. WITNESS_VNG_CACHE overrides the cache
+# root for tests.
 #
 # Exit codes: 0 every cell passed; 1 a cell failed; 2 harness error
-# (bad usage, vng failure, wrong guest kernel, missing results);
+# (bad usage, vng failure, wrong guest kernel, missing results,
+# missing kernel config);
 # 77 a prerequisite is missing (vng not on PATH).
 #
 # Apt prerequisites on a GitHub ubuntu-26.04 runner (installed by the
@@ -43,6 +52,21 @@ HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 RUNNER="$HERE/run-witness-cli.sh"
 [ -x "$RUNNER" ] || { echo "witness-cli-vng.sh: cell runner missing: $RUNNER" >&2; exit 2; }
 umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e -- "$OUT") || exit 2
+# Stage the booted kernel's config for the guest LTO gate: the vng cache
+# holds exactly one config per kernel tag.
+VNG_CACHE="${WITNESS_VNG_CACHE:-$HOME/.cache/virtme-ng}"
+shopt -s nullglob
+configs=("$VNG_CACHE/$KERNEL/amd64/boot"/config-*)
+shopt -u nullglob
+if [ "${#configs[@]}" != 1 ]; then
+    echo "witness-cli-vng.sh: want exactly one kernel config for $KERNEL in $VNG_CACHE, found ${#configs[@]}" >&2
+    exit 2
+fi
+cp -p "${configs[0]}" "$OUT/kernel-config" || exit 2
+grep -q CONFIG_LTO "$OUT/kernel-config" || {
+    echo "witness-cli-vng.sh: staged kernel config lacks CONFIG_LTO for $KERNEL" >&2
+    exit 2
+}
 
 # Single-quote a path for the guest shell.
 q() {
@@ -55,6 +79,12 @@ q() {
     cat <<'INNER_EOF'
 uname -r > "$OUT/uname.txt"
 [ "$(id -u)" = 0 ] || { echo "guest root required"; exit 2; }
+# The witness LTO gate reads /boot/config-{release}; the shared rootfs
+# only has the host's, so install the staged booted-kernel config over a
+# guest-local /boot before the cells run.
+mount -t tmpfs -o mode=755 tmpfs /boot || exit 2
+cp "$OUT/kernel-config" "/boot/config-$(uname -r)" || exit 2
+grep -q CONFIG_LTO "/boot/config-$(uname -r)" || exit 2
 T=/tmp/witness-work
 mkdir -p "$T" && mount -t tmpfs -o mode=700,size=2G tmpfs "$T" || exit 2
 df -T "$T" | tail -n 1

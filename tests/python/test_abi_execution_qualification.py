@@ -155,7 +155,7 @@ def build_evidence(driver, functions, *, slots=104, unverified=104,
     evidence = {
         "slots": slots, "semantic_unverified_slots": unverified,
         "unprotected_live_windows": 1, "module_unresolved_slots": 0,
-        "pause_partial": 0, "vendor_interfaces": 0,
+        "pause_partial": 0, "pause_unavailable": 0, "vendor_interfaces": 0,
         "drain_proven": True, "provider_changed": False,
         "templates_truncated": False,
         "scheduling": {"terminal_drain_truncated": False,

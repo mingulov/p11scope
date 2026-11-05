@@ -54,6 +54,7 @@
         "table_entries", "task_uprobe_link_losses", "template_tail_failures",
         "templates_truncated", "unmatched_closes", "unmatched_returns",
         "unprotected_live_windows",
+        "unpublished_mechanisms",
         "unregistered_mechanisms", "uretprobe_override", "vendor_interfaces",
         "verdict_detail"
       ],
@@ -487,6 +488,7 @@
         "templates_truncated": {"type": "boolean"},
         "unmatched_closes": {"type": "integer", "minimum": 0},
         "unmatched_returns": {"type": "integer", "minimum": 0},
+        "unpublished_mechanisms": {"type": "integer", "minimum": 0},
         "unregistered_mechanisms": {"type": "integer", "minimum": 0},
         "uretprobe_override": {
           "type": ["object", "null"],

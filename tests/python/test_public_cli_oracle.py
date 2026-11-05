@@ -40,7 +40,8 @@ VERDICT_COUNTERS = (
     "semantic_history_drops", "pending_at_end", "orphan_ops", "unmatched_closes",
     "shape_decode_failures", "shape_decode_total_failures", "discovery_conflicts",
     "discovery_uncorroborated", "module_ambiguous", "semantic_unverified_slots",
-    "module_unresolved_slots", "unprotected_live_windows", "pause_partial", "vendor_interfaces")
+    "module_unresolved_slots", "unprotected_live_windows", "pause_partial", "pause_unavailable",
+    "unpublished_mechanisms", "vendor_interfaces")
 PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
                   "pid_descendant_gaps", "multi_rebuild_gaps")
 

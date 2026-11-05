@@ -12646,8 +12646,9 @@ mod tests {
     /// Afterwards an idle tick costs one authorization read while the
     /// successor stays armed, and nothing once the pause is disarmed. The
     /// semantics around it hold. A genuinely failed cycle still resumes the
-    /// child and goes partial under `auto`, and ends the capture under
-    /// `always`. A pending operator stop wins: the tick services nothing, and
+    /// child and goes partial under `auto`, and collects unpaused with an
+    /// unavailable gap under `always`. A pending operator stop wins: the tick
+    /// services nothing, and
     /// cleanup resumes the child and reports the stop (`auto` partial, `always`
     /// refused). Under the frame-only gate every stop stayed held through all
     /// the ticks and cleanup reported it unconfirmed.
@@ -12800,6 +12801,12 @@ mod tests {
             partial,
             unavailable: 0,
         };
+        let unavailable = || PauseCounters {
+            attempts: 1,
+            confirmed: 0,
+            partial: 0,
+            unavailable: 1,
+        };
         let serviced =
             |case, policy, first_ticks, stops, idle_authorization_reads| HeldStopOutcome {
                 case,
@@ -12863,16 +12870,16 @@ mod tests {
                 1,
                 ticks - 2,
             ),
-            // The failed cycle resumes the child, and its required failure
-            // ends the capture on that tick.
+            // The failed cycle resumes the child, counts one unavailable
+            // attempt and collects unpaused; the capture continues.
             HeldStopOutcome {
                 case: HeldStop::Failed,
                 policy: Always,
-                first_ticks: [(Some(DiscoveryPass::PendingStop), false, false), idle],
-                ended_by_pause_failure: true,
+                first_ticks: [(Some(DiscoveryPass::PendingStop), true, false), idle],
+                ended_by_pause_failure: false,
                 held_after_ticks: false,
-                counters_after_ticks: unconfirmed(0),
-                counters_after_cleanup: unconfirmed(0),
+                counters_after_ticks: unavailable(),
+                counters_after_cleanup: unavailable(),
                 cleanup_refused: false,
                 resumes: 1,
                 idle_authorization_reads: 0,

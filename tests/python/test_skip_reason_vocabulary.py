@@ -41,6 +41,11 @@ PRODUCER_CONSTANTS = (
     "LOADER_CONTEXT_CAPACITY_EXHAUSTED",
     "LOADER_SCAN_LEDGER_EXCEEDED",
     "LOADER_ARM_LEDGER_FULL",
+    # Never-stop discovery gaps: one bad manifest object, pre-arm path,
+    # or live-ring dequeue gaps without aborting siblings.
+    "MANIFEST_OBJECT_UNAVAILABLE",
+    "PREARM_OBJECT_UNAVAILABLE",
+    "DISCOVERY_TRANSPORT_UNAVAILABLE",
 )
 
 
@@ -60,7 +65,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; everything else renders one of the
-    eleven discovery reasons. The split mirrors `capture_skipped_out`'s
+    fourteen discovery reasons. The split mirrors `capture_skipped_out`'s
     branches; the strings themselves come from the source, never from a
     copy pasted into this test.
     """
@@ -80,8 +85,11 @@ def producer_reasons():
         const["LOADER_CONTEXT_CAPACITY_EXHAUSTED"],
         const["LOADER_SCAN_LEDGER_EXCEEDED"],
         const["LOADER_ARM_LEDGER_FULL"],
+        const["MANIFEST_OBJECT_UNAVAILABLE"],
+        const["PREARM_OBJECT_UNAVAILABLE"],
+        const["DISCOVERY_TRANSPORT_UNAVAILABLE"],
     }
-    assert len(entry) == 2 and len(discovery) == 11, const
+    assert len(entry) == 2 and len(discovery) == 14, const
     return entry, discovery
 
 

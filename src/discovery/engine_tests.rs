@@ -33029,9 +33029,26 @@ fn discovery_dependency_fallback_rejects_an_unrelated_modules_table() {
     );
     discovered.manifest_inputs.push(input);
 
-    let error = rebuild_discovered(&mut discovered)
-        .expect_err("only the exact manifest module's scan view may replace its dependency");
-    assert!(error.to_string().contains("object 1"), "{error:#}");
+    // Never-stop: the stale object gaps instead of aborting the
+    // rebuild; the unrelated table still cannot replace its dependency.
+    rebuild_discovered(&mut discovered).expect(
+        "only the exact manifest module's scan view may replace its dependency, so the stale object gaps",
+    );
+    assert!(
+        discovered
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("stale manifest object 1")
+                && skip.reason.contains("has no scanned replacement")),
+        "the uncovered stale object is a recorded gap: {:?}",
+        discovered.counters.object_skips
+    );
+    assert!(
+        discovered.counters.notes.is_empty(),
+        "no fallback to the unrelated table was taken: {:?}",
+        discovered.counters.notes
+    );
 }
 
 #[test]

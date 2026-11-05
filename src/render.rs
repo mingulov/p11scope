@@ -2149,11 +2149,11 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
     let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
     if crate::plan::is_closure_array_refusal(&skipped.reason) {
         body.push_str(&closure_forwarding_hint(ev, reports));
-        body.push_str(" Calls the forwarding layer answers itself are not counted.");
+        body.push_str(". Calls the forwarding layer answers itself are not counted.");
     } else if crate::plan::is_closure_array_prefix(&skipped.reason) {
         body.push_str(&closure_forwarding_hint(ev, reports));
         body.push_str(
-            " Calls the forwarding layer answers itself through a template \
+            ". Calls the forwarding layer answers itself through a template \
              that was not attached are not counted.",
         );
     } else if !skipped.reason.contains("--module") {

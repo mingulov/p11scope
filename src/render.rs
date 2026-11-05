@@ -2342,7 +2342,7 @@ fn unattributed_provider_line(ev: &Evidence) -> String {
     };
     format!(
         "Attribution: {} of {} mapped provider file{} {} no manifest ({}); counts are exact, \
-         names are withheld — rerun with --manifest for each mapped provider file.\n",
+         names are unconfirmed — rerun with --manifest for each mapped provider file.\n",
         unattested.len(),
         modules.len(),
         if modules.len() == 1 { "" } else { "s" },
@@ -7815,7 +7815,7 @@ pub(crate) mod tests {
         assert!(
             text.contains(
                 "Attribution: 1 of 2 mapped provider files has no manifest (libsoftokn3.so); \
-                 counts are exact, names are withheld"
+                 counts are exact, names are unconfirmed"
             ),
             "{text}"
         );
@@ -7849,7 +7849,7 @@ pub(crate) mod tests {
         assert!(
             text.contains(
                 "Attribution: 2 of 3 mapped provider files have no manifest (a.so, b.so); \
-                 counts are exact, names are withheld"
+                 counts are exact, names are unconfirmed"
             ),
             "{text}"
         );

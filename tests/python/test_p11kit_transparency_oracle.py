@@ -146,6 +146,24 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(FUNCS["EvidenceError"]):
             FUNCS["parse_spy_log"](text)
 
+    def test_spy_parser_multiplexed_accepts_per_pid_sequences(self):
+        first = spy_log_text(["C_Initialize", "C_GetSlotList"], pids=[11, 11])
+        second = spy_log_text(["C_Initialize", "C_GetSlotList"], pids=[22, 22])
+        counts, _, _, pids, incomplete = FUNCS["parse_spy_log"](
+            first + second, multiplexed=True)
+        self.assertEqual(counts, {"C_Initialize": 2, "C_GetSlotList": 2})
+        self.assertEqual(pids, [11, 22])
+        self.assertEqual(incomplete, [])
+        with self.assertRaises(FUNCS["EvidenceError"]):
+            FUNCS["parse_spy_log"](first + second)
+
+    def test_spy_parser_multiplexed_rejects_pid_reorder(self):
+        text = spy_log_text(["C_Initialize", "C_GetSlotList", "C_OpenSession"],
+                            pids=[11, 11, 11])
+        text = text.replace("2: C_OpenSession", "1: C_OpenSession")
+        with self.assertRaises(FUNCS["EvidenceError"]):
+            FUNCS["parse_spy_log"](text, multiplexed=True)
+
     def test_workload_parser_accepts_both_orders(self):
         for ready_first in (True, False):
             expected, targets, pid = FUNCS["parse_workload"](
@@ -772,8 +790,39 @@ def inventory_entry(pin, state, endpoints, reasons=()):
     }
 
 
+def doubled_ledger_lines():
+    lines = ledger_lines()
+    payload = json.loads(lines[-1][len("LEDGER "):])
+    for func in payload["functions"]:
+        func["attempts"] *= 2
+        func["successful"] *= 2
+    lines[-1] = "LEDGER " + json.dumps(payload)
+    return lines
+
+
+def doubled_spy_names(*, drop=0):
+    names = []
+    for name, count in workload_ledger().items():
+        names += [name] * (2 * count)
+    for _ in range(drop):
+        if "C_GetFunctionList" in names:
+            names.remove("C_GetFunctionList")
+        else:
+            names.remove("C_Digest")
+    return names
+
+
+def spy_log_text(names, *, pids, loaded="/owned.so"):
+    lines = ["OpenSC PKCS#11 spy", 'Loaded: "%s"' % loaded]
+    for seq, (pid, name) in enumerate(zip(pids, names)):
+        lines += ["%d: %s" % (seq, name), "P:%d; T:0x1" % pid,
+                  "Returned:  0 CKR_OK"]
+    return "\n".join(lines) + "\n"
+
+
 class InventoryTests(unittest.TestCase):
-    def run_inventory(self, modules, *, want=0, admitted=(), refused=()):
+    def run_inventory(self, modules, *, want=0, admitted=(), refused=(),
+                      module_use=None):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             inv = {"schema": "p11scope/inventory/v1", "modules": modules}
@@ -788,6 +837,14 @@ class InventoryTests(unittest.TestCase):
                 args += ["--expect-admitted", "%s:%d" % (pins[name], count)]
             for name, substring in refused:
                 args += ["--expect-refused", str(pins[name]), substring]
+            if module_use is not None:
+                name, ledger, spy, bindings = module_use
+                (tmp / "use.ledger").write_text("\n".join(ledger))
+                (tmp / "use.spy").write_text(spy)
+                args += ["--expect-module-use", str(pins[name]),
+                         "--ledger", str(tmp / "use.ledger"),
+                         "--spy", str(tmp / "use.spy"),
+                         "--bindings", str(bindings)]
             proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
@@ -821,6 +878,54 @@ class InventoryTests(unittest.TestCase):
     def test_admitted_when_refusal_expected_fails(self):
         modules = [inventory_entry(PROXY, "admitted", 410)]
         self.run_inventory(modules, refused=(("proxy", "needs"),), want=1)
+
+    def use_case(self, *, entries, drop=2, bindings=2, pids=None):
+        ledger = doubled_ledger_lines()
+        names = doubled_spy_names(drop=drop) + ["C_GetInterface"] * bindings
+        if pids is None:
+            half = len(names) // 2
+            first, second = names[:half], names[half:]
+            spy = (spy_log_text(first, pids=[123] * len(first))
+                   + spy_log_text(second, pids=[124] * len(second)))
+        else:
+            spy = spy_log_text(names, pids=pids)
+        entry = inventory_entry(OWNED, "admitted", 68)
+        entry["unbound_use"] = {"first_ns": 1, "rows": bindings,
+                                "reasons": ["before-admission"],
+                                "entries": entries}
+        return [entry], ("owned", ledger, spy, bindings)
+
+    def test_module_use_exact_passes(self):
+        modules, use = self.use_case(entries=44)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use)
+        self.assertTrue(result["pass"])
+        self.assertIn("module use", result["detail"])
+
+    def test_module_use_short_entries_fails(self):
+        modules, use = self.use_case(entries=43)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use, want=1)
+        self.assertIn("module use", result["detail"])
+
+    def test_module_use_spy_shortfall_fails(self):
+        modules, use = self.use_case(entries=44, drop=3)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use, want=1)
+        self.assertIn("module use", result["detail"])
+
+    def test_module_use_proxy_surplus_passes(self):
+        modules, use = self.use_case(entries=45, drop=1)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use)
+        self.assertTrue(result["pass"])
+        self.assertIn("surplus +1", result["detail"])
+
+    def test_module_use_pid_mismatch_fails(self):
+        modules, use = self.use_case(entries=46, pids=[123] * 44)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use, want=1)
+        self.assertIn("module use", result["detail"])
 
 
 SHELL = ROOT / "scripts/ci/p11kit-transparency.sh"

@@ -277,6 +277,50 @@ class WitnessCliScriptTests(unittest.TestCase):
                                         timeout=30)
                 self.assertEqual(result.returncode, 2, result.stderr)
 
+    def run_script_with_cache(self, kernel, cache_files, mode="all-pass"):
+        """Run the guest script with a stub vng cache holding cache_files.
+
+        cache_files maps relative paths under the cache root to contents;
+        the script must stage the booted kernel's config for the guest LTO
+        gate (vng guests share the host rootfs, so /boot lacks it)."""
+        cache = self.work / "vng-cache"
+        for rel, content in cache_files.items():
+            target = cache / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        env = dict(os.environ, FAKE_VNG_MODE=mode,
+                   FAKE_CELLS_FILE=str(self.cells_file),
+                   WITNESS_CLI_VNG_TEST="1",
+                   WITNESS_VNG_CACHE=str(cache))
+        env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
+        out = self.work / "out"
+        command = [str(SCRIPT), str(self.testbin), str(out), kernel]
+        return subprocess.run(command, capture_output=True, text=True,
+                              timeout=120, env=env), out
+
+    def test_guest_gets_booted_kernel_config(self):
+        config = "CONFIG_LTO_NONE=y\n"
+        result, out = self.run_script_with_cache(
+            "v6.18.58",
+            {"v6.18.58/amd64/boot/config-6.18.58-061858-generic": config},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        staged = out / "kernel-config"
+        self.assertTrue(staged.is_file(),
+                        "the harness must stage the booted kernel config")
+        self.assertEqual(staged.read_text(encoding="utf-8"), config)
+
+    def test_missing_kernel_config_is_a_harness_error(self):
+        result, _ = self.run_script_with_cache("v6.18.58", {})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("kernel config", result.stderr)
+
+    def test_guest_installs_kernel_config_over_boot(self):
+        for pin in ("kernel-config", "/boot/config-", "mount -t tmpfs",
+                    "CONFIG_LTO"):
+            with self.subTest(pin=pin):
+                self.assertIn(pin, self.script_text)
+
 
 if __name__ == "__main__":
     unittest.main()

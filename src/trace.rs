@@ -279,11 +279,13 @@ pub fn unverified_note() -> &'static str {
     "Calls on unverified functions are not decoded (names only)."
 }
 
-/// True when the plan watches a function whose semantics are not
-/// authorized: those calls render names without decoded parameters,
-/// and the trace header says so once.
+/// True when the trace header must say once that unverified calls are
+/// not decoded: the plan watches an unauthorized function, or it is
+/// still empty — an owned run discovers its provider after release,
+/// and scan-found slots are never authorized, so the note errs toward
+/// disclosure.
 pub(crate) fn watches_unverified(plan: &AttachPlan) -> bool {
-    plan.slots.iter().any(|slot| !slot.semantic_authorized)
+    plan.slots.is_empty() || plan.slots.iter().any(|slot| !slot.semantic_authorized)
 }
 
 /// The human tail a trace ends with, after the machine-readable
@@ -1551,9 +1553,14 @@ mod tests {
         let line = tracer.on_event(&open_event(100, 0xdead_beef), &mut state);
         assert!(line.contains("C_OpenSession"), "{line}");
         assert!(!line.contains("[semantics unverified]"), "{line}");
-        assert!(unverified_note().contains("not decoded"), "{}", unverified_note());
+        assert!(
+            unverified_note().contains("not decoded"),
+            "{}",
+            unverified_note()
+        );
         assert!(watches_unverified(&plan));
         assert!(!watches_unverified(&test_plan()));
+        assert!(watches_unverified(&AttachPlan::from_slots(vec![])));
     }
 
     /// CLI text: the trace tail reports totals, one coverage line, and
@@ -1564,13 +1571,7 @@ mod tests {
         let mut ev = crate::render::tests::evidence();
         ev.event_loss = 1;
         ev.verdict();
-        let concise = terminal_summary(
-            19,
-            0,
-            0,
-            &ev,
-            crate::cli::TextVerbosity::Concise,
-        );
+        let concise = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Concise);
         assert_eq!(
             concise,
             vec![
@@ -1580,8 +1581,7 @@ mod tests {
                 crate::cli::VERBOSE_HINT.to_string(),
             ]
         );
-        let verbose =
-            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose);
+        let verbose = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose);
         assert_eq!(verbose.len(), 2);
         assert!(verbose[1].contains("(event_loss)"), "{verbose:?}");
         assert!(

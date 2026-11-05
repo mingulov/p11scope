@@ -550,6 +550,8 @@ fn diff_report_schema() -> String {
         after,
         json: true,
         out: None,
+        verbose: false,
+        quiet: false,
     };
     let mut out = Vec::new();
     let code = run_with_writer(&args, &mut out).unwrap();

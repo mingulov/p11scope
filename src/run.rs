@@ -2763,6 +2763,16 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     capture_with_host(a, &crate::attach::require_multi_capable_host)
 }
 
+/// Attach-start context for every failure except the already-complete
+/// missing-process line, which passes through untouched.
+fn attach_session_context(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::process::MissingNamedProcess>() {
+        error
+    } else {
+        error.context("starting attach session")
+    }
+}
+
 fn capture_with_host(
     a: &CaptureArgs,
     host: &dyn Fn() -> crate::attach::MultiHostVerdict,
@@ -2787,6 +2797,11 @@ fn capture_with_host(
             match ProcessView::open(ProcessViewId(0), *p) {
                 Ok(view) => (Scope::Pid(*p), Some(view)),
                 Err(error) => {
+                    // A pid with no live process fails here with the one
+                    // operator line: attach would refuse it below anyway.
+                    if crate::process::generation_gone(*p) {
+                        return Err(crate::process::MissingNamedProcess { pid: *p }.into());
+                    }
                     emit_capture_diagnostic(&format!(
                         "p11scope: --pid {p}: {error}; reporting an empty partial capture"
                     ));
@@ -2851,12 +2866,16 @@ fn capture_with_host(
     ));
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
-    if engine.plan().modules.is_empty() {
+    // A named pid that died after scope resolution fails below with the one
+    // missing-process line instead; the hint would only restate it.
+    let named_pid_gone =
+        matches!(&a.scope, ScopeArg::Pid(pid) if crate::process::generation_gone(*pid));
+    if engine.plan().modules.is_empty() && !named_pid_gone {
         emit_capture_diagnostic(&no_modules_hint(&a.scope));
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
-        .context("starting attach session")?;
+        .map_err(attach_session_context)?;
     run_loop(
         &mut engine,
         &mut session,
@@ -3961,7 +3980,7 @@ fn run_owned_inner_with_host(
     // `initial_set_capture = none` with sticky `PARTIAL`.
     let mut session = engine
         .start_owned_session(policy, &mut child, args.ring_bytes, args.attach_backend)
-        .context("starting attach session")
+        .map_err(attach_session_context)
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
     let preflight = {
@@ -5239,7 +5258,7 @@ fn target_exit_cleanup_pending_line(tripped: bool) -> Option<String> {
 
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
-const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
+pub(crate) const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
 
 fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
     max_events.unwrap_or(DEFAULT_TRACE_MAX_EVENTS)

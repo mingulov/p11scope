@@ -622,6 +622,8 @@ fn args() -> (tempfile::TempDir, InventoryDiffArgs) {
             after,
             json: true,
             out: None,
+            verbose: false,
+            quiet: false,
         },
     )
 }

@@ -1288,6 +1288,27 @@ fn pin_failure(pid: u32) -> String {
     }
 }
 
+/// A named `--pid` with no live process behind it. Every command reports
+/// it as one complete stderr line with exit 1 and no added context.
+/// Typed so each boundary (`run`, `inspect`, `inventory`, `main`) can
+/// pass it through instead of wrapping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingNamedProcess {
+    pub pid: u32,
+}
+
+impl std::fmt::Display for MissingNamedProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "no process with PID {} (it exited, or the PID is mistyped)",
+            self.pid
+        )
+    }
+}
+
+impl std::error::Error for MissingNamedProcess {}
+
 impl PidPin {
     pub fn open(pid: u32) -> Result<Self, String> {
         let start_time = process_start_time(pid).ok();

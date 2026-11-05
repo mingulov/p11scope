@@ -138,10 +138,22 @@ fn run() -> Result<i32> {
                 a.json,
                 a.max_scan_pids,
             )
-            .with_context(|| scope)
+            .map_err(|error| {
+                if error.is::<p11scope::process::MissingNamedProcess>() {
+                    error
+                } else {
+                    error.context(scope)
+                }
+            })
         }
-        Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
-        Ok(Command::InventoryDiff(a)) => inventory_diff::run(&a),
+        Ok(Command::Doctor(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict)
+        }
+        Ok(Command::InventoryDiff(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            inventory_diff::run(&a)
+        }
         // `inventory`'s hard failures — an unreadable target, an
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
@@ -192,7 +204,9 @@ fn run() -> Result<i32> {
                 a.quiet,
             )
             .map_err(|error| {
-                if error.is::<pidns::NumberingMismatch>() {
+                if error.is::<pidns::NumberingMismatch>()
+                    || error.is::<p11scope::process::MissingNamedProcess>()
+                {
                     error
                 } else {
                     error.context(scope)

@@ -1305,6 +1305,14 @@ fn run_with_terminal_budget(
         }
         InventoryRunScope::Cgroup => crate::pidns::require_inventory_cgroup_numbering(&numbering)?,
     }
+    // A named pid with no live process fails here with the one operator
+    // line, before any sink exists: there is nothing to scan, and the
+    // native lane would refuse it below anyway.
+    if let InventoryRunScope::Pid(pid) = scope
+        && crate::process::generation_gone(pid)
+    {
+        return Err(crate::process::MissingNamedProcess { pid }.into());
+    }
     if request.path.is_some() && capture == CaptureMode::Scan {
         anyhow::bail!("--diagnostics requires native capture or auto fallback");
     }

@@ -682,7 +682,17 @@ fn run_with_view(
     out: &mut dyn std::io::Write,
     view: Result<ProcessView, String>,
 ) -> Result<i32> {
-    let view = view.map_err(|reason| unreadable_target_error(pid, &reason))?;
+    let view = match view {
+        Ok(view) => view,
+        Err(reason) => {
+            // A pid with no live process fails with the one operator line;
+            // anything else keeps the cause-naming hard error below.
+            if crate::process::generation_gone(pid) {
+                return Err(crate::process::MissingNamedProcess { pid }.into());
+            }
+            return Err(unreadable_target_error(pid, &reason));
+        }
+    };
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
     let mut context = (ProcessViewImageReader::new(&view), budget);
@@ -937,10 +947,14 @@ mod tests {
     #[test]
     fn unreadable_process_namespace_is_a_hard_error_with_guidance() {
         let reason = "cannot identify process mount namespace: Permission denied (os error 13)";
+        // A live pid: the seam simulates a namespace failure after the view
+        // opened, while a pid with no live process takes the missing line.
+        let pid = std::process::id();
+        let sudo = format!("sudo p11scope inspect --pid {pid}");
         for json in [false, true] {
             let mut stdout = Vec::new();
             let error = run_with_view(
-                1379,
+                pid,
                 &[],
                 &[],
                 &HookRegistry::builtin(),
@@ -952,10 +966,7 @@ mod tests {
             .to_string();
             assert!(stdout.is_empty(), "json={json}: {stdout:?}");
             assert!(error.contains(reason), "{error}");
-            assert!(
-                error.contains("sudo p11scope inspect --pid 1379"),
-                "{error}"
-            );
+            assert!(error.contains(&sudo), "{error}");
             assert!(error.contains("unknown, not absent"), "{error}");
             assert!(
                 !error.contains("/maps"),

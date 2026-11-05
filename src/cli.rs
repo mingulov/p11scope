@@ -412,6 +412,12 @@ pub struct InventoryDiffArgs {
     pub after: PathBuf,
     pub json: bool,
     pub out: Option<PathBuf>,
+    /// `-v`/`--verbose`: full text detail. Default off; refused beside
+    /// `--quiet`.
+    pub verbose: bool,
+    /// `--quiet`: the concise summary without the detail hint. Default
+    /// off; refused beside `--verbose`.
+    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -457,12 +463,12 @@ impl HelpTopic {
         match self {
             HelpTopic::Global => USAGE.to_string(),
             HelpTopic::Profile => PROFILE_HELP.to_string(),
-            HelpTopic::Trace => TRACE_HELP.to_string(),
+            HelpTopic::Trace => trace_help(),
             HelpTopic::Run => RUN_HELP.to_string(),
             HelpTopic::Inspect => INSPECT_HELP.to_string(),
             HelpTopic::Doctor => DOCTOR_HELP.to_string(),
             HelpTopic::Inventory => inventory_help(),
-            HelpTopic::InventoryDiff => INVENTORY_DIFF_HELP.to_string(),
+            HelpTopic::InventoryDiff => inventory_diff_help(),
         }
     }
 }
@@ -515,7 +521,7 @@ usage:
   p11scope inventory --pid <n> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
   p11scope inventory --cgroup <path> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
   p11scope inventory --system [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
-  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
   p11scope doctor [--pid <n>] [--cgroup <path>] [--extra-strict] [-v] [--quiet]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -581,7 +587,7 @@ exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong argum
 ";
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
-const TRACE_HELP: &str = "usage:
+const TRACE_HELP_HEAD: &str = "usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
@@ -602,8 +608,19 @@ Executable names require verified event-image evidence; missing identity stays u
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
-Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED names the effective cap.
--o copies the trace to a file; -o - uses stdout only.
+";
+
+/// The `--max-events` default cap line carries the live constant, never a
+/// hard-coded copy: the number below follows
+/// [`crate::run::DEFAULT_TRACE_MAX_EVENTS`].
+fn trace_cap_line() -> String {
+    format!(
+        "Without --max-events, trace stops at a {}-event default cap; TRUNCATED names the effective cap.\n",
+        grouped_count(crate::run::DEFAULT_TRACE_MAX_EVENTS),
+    )
+}
+
+const TRACE_HELP_TAIL: &str = "-o copies the trace to a file; -o - uses stdout only.
 Ctrl-C or SIGTERM ends capture cleanly.
 Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing).
 exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
@@ -703,7 +720,7 @@ const INVENTORY_HELP_HEAD: &str = "usage:
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
                    [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope inventory --pid 4242 --capture scan --json -o inventory.json
@@ -735,7 +752,7 @@ fn inventory_max_endpoints_line() -> String {
     )
 }
 
-const INVENTORY_HELP_TAIL: &str = "--capture scan disables usage BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+const INVENTORY_HELP_TAIL: &str = "--capture scan disables usage BPF and leaves usage unknown. auto prefers native and falls back to scan with a named gap (needs root for live capture; without root a PID capture still reports its scan). native fails if unavailable.
 Inventory rescans in passes; a process that starts after its last pass is reported, not scanned (system and pid scopes).
 System inventory selects its identity backend separately; --identity-backend auto may load identity BPF even with --capture scan.
 For system inventory that loads no BPF, use: p11scope inventory --system --capture scan --identity-backend userspace
@@ -765,18 +782,77 @@ fn inventory_help() -> String {
 }
 
 /// Offline diff help is separate from capture scope and privileges.
-const INVENTORY_DIFF_HELP: &str = "usage:
-  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
+const INVENTORY_DIFF_HELP_HEAD: &str = "usage:
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
 
 Compare saved p11scope/inventory/v1 files offline, without privileges.
 Default stdout is readable text; --json writes one inventory-diff/v1 JSON document.
+Default text output is concise: counts plus caveats. -v, --verbose shows full detail; --quiet omits the detail hint.
 -o saves the same JSON atomically before stdout. Use -- before dash-prefixed inputs.
 Stdin (-) and -o - are unsupported; use --json for JSON on stdout.
 exit codes: differences and unknown evidence exit 0; input/output failures exit 1; usage exits 2.
 Counts describe independent windows; absence does not prove removal.
-Per input: 64 MiB read, 250,000 rows, 16,384 decoded bytes per string/key,
-nesting depth 64, and 2,000,000 JSON values plus object keys.
 ";
+
+/// The per-input bounds line carries the live reader constants, never a
+/// hard-coded copy: the numbers below follow
+/// [`crate::inventory_diff::input`]'s `DEFAULT_INPUT_*` bounds.
+fn inventory_diff_limits_line() -> String {
+    use crate::inventory_diff::input::{
+        DEFAULT_INPUT_BYTES, DEFAULT_INPUT_DEPTH, DEFAULT_INPUT_NODES, DEFAULT_INPUT_ROWS,
+        DEFAULT_INPUT_STRING_BYTES,
+    };
+    format!(
+        "Per input: {} read, {} rows, {} decoded bytes per string/key,\nnesting depth {}, and {} JSON values plus object keys.\n",
+        mib_or_bytes(DEFAULT_INPUT_BYTES as u64),
+        grouped_count(DEFAULT_INPUT_ROWS as u64),
+        grouped_count(DEFAULT_INPUT_STRING_BYTES as u64),
+        grouped_count(DEFAULT_INPUT_DEPTH as u64),
+        grouped_count(DEFAULT_INPUT_NODES as u64),
+    )
+}
+
+/// The assembled diff help: head plus the live bounds line.
+fn inventory_diff_help() -> String {
+    format!("{INVENTORY_DIFF_HELP_HEAD}{}", inventory_diff_limits_line())
+}
+
+/// The assembled trace help: head, the live cap line, and tail.
+fn trace_help() -> String {
+    format!("{TRACE_HELP_HEAD}{}{TRACE_HELP_TAIL}", trace_cap_line())
+}
+
+/// A count with thousands separators (`10000000` -> `10,000,000`), for
+/// help lines built from constants.
+fn grouped_count(mut value: u64) -> String {
+    if value == 0 {
+        return "0".to_string();
+    }
+    let mut groups = Vec::new();
+    while value > 0 {
+        groups.push(format!("{:03}", value % 1000));
+        value /= 1000;
+    }
+    if let Some(most) = groups.last_mut() {
+        *most = most.trim_start_matches('0').to_string();
+        if most.is_empty() {
+            *most = "0".to_string();
+        }
+    }
+    groups.reverse();
+    groups.join(",")
+}
+
+/// A byte bound as whole MiB when exact (`67108864` -> `64 MiB`),
+/// otherwise as raw bytes so help never rounds.
+fn mib_or_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes % MIB == 0 {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
 
 const REMOVED_FLAG_HINT: &str = "removed in productization slice 1a: the observer pins provider \
 identity by SHA-256 and fstat; see docs/usage.md";
@@ -1453,6 +1529,8 @@ fn parse_inventory_diff(
     let mut inputs = Vec::new();
     let mut json = false;
     let mut out = None;
+    let mut verbose = false;
+    let mut quiet = false;
     let mut positional = false;
     while let Some(value) = args.next() {
         if !positional {
@@ -1467,6 +1545,14 @@ fn parse_inventory_diff(
                         return Err(error("--json given twice"));
                     }
                     json = true;
+                    continue;
+                }
+                Some("-v" | "--verbose") => {
+                    verbose = true;
+                    continue;
+                }
+                Some("--quiet") => {
+                    quiet = true;
                     continue;
                 }
                 Some("-o") => {
@@ -1509,6 +1595,8 @@ fn parse_inventory_diff(
             "inventory diff requires exactly BEFORE and AFTER files",
         ));
     }
+    TextVerbosity::resolve(verbose, quiet)
+        .map_err(|error| error.with_topic(HelpTopic::InventoryDiff))?;
     let after = inputs.pop().expect("two input paths validated");
     let before = inputs.pop().expect("two input paths validated");
     Ok(InventoryDiffArgs {
@@ -1516,6 +1604,8 @@ fn parse_inventory_diff(
         after,
         json,
         out,
+        verbose,
+        quiet,
     })
 }
 
@@ -2923,6 +3013,53 @@ mod tests {
     }
 
     #[test]
+    fn inventory_diff_parses_verbosity_and_defaults_it_off() {
+        let Command::InventoryDiff(plain) =
+            parse(args(&["inventory", "diff", "before.json", "after.json"])).unwrap()
+        else {
+            panic!("expected diff")
+        };
+        assert!(!plain.verbose, "verbose defaults off");
+        assert!(!plain.quiet, "quiet defaults off");
+        let Command::InventoryDiff(verbose) = parse(args(&[
+            "inventory",
+            "diff",
+            "-v",
+            "before.json",
+            "after.json",
+        ]))
+        .unwrap() else {
+            panic!("expected diff")
+        };
+        assert!(verbose.verbose, "-v selects verbose");
+        assert!(!verbose.quiet);
+        let Command::InventoryDiff(quiet) = parse(args(&[
+            "inventory",
+            "diff",
+            "before.json",
+            "after.json",
+            "--quiet",
+        ]))
+        .unwrap() else {
+            panic!("expected diff")
+        };
+        assert!(!quiet.verbose);
+        assert!(quiet.quiet, "--quiet selects quiet");
+    }
+
+    #[test]
+    fn inventory_help_states_the_auto_pid_scan_fallback() {
+        let help = HelpTopic::Inventory.text();
+        assert!(
+            help.contains(
+                "auto prefers native and falls back to scan with a named gap (needs root \
+                 for live capture; without root a PID capture still reports its scan)"
+            ),
+            "{help}"
+        );
+    }
+
+    #[test]
     fn dr04_caller_metadata_is_opt_in_and_accepts_split_and_equals_forms() {
         let default = parse(args(&["inventory", "--pid", "7"])).unwrap();
         assert!(format!("{default:?}").contains("caller_metadata: None"));
@@ -3523,6 +3660,8 @@ mod tests {
             vec!["inspect", "--pid", "7", "--quiet", "-v"],
             vec!["inspect", "--system", "--verbose", "--quiet"],
             vec!["inventory", "--pid", "7", "--quiet", "--verbose"],
+            vec!["doctor", "--quiet", "--verbose"],
+            vec!["inventory", "diff", "a.json", "b.json", "-v", "--quiet"],
         ] {
             let Err(CliError::Usage { message, .. }) = parse(args(&argv)) else {
                 panic!("{argv:?} should refuse the contradictory pair");
@@ -3622,7 +3761,7 @@ mod tests {
         assert!(help.contains("without changing capture scope"), "{help}");
         assert!(help.contains("auto or native"), "{help}");
         assert!(help.contains("after capture stops"), "{help}");
-        assert!(!INVENTORY_DIFF_HELP.contains("--diagnostics"));
+        assert!(!inventory_diff_help().contains("--diagnostics"));
     }
 
     #[test]
@@ -4538,7 +4677,7 @@ mod tests {
             );
         }
         assert!(
-            !TRACE_HELP.contains("--select-endpoint"),
+            !trace_help().contains("--select-endpoint"),
             "trace streams raw events and must not offer endpoint selection"
         );
     }
@@ -4583,7 +4722,7 @@ mod tests {
         ));
         for help in [
             PROFILE_HELP.to_string(),
-            TRACE_HELP.to_string(),
+            trace_help(),
             RUN_HELP.to_string(),
             HelpTopic::Inventory.text(),
         ] {
@@ -4941,8 +5080,8 @@ mod tests {
         // somewhere (see every_flag_is_documented_in_some_help). The
         // late-process scope bound moved with the notes into
         // inventory help (see inventory_help_bounds_late_process_scanning).
-        assert_eq!(USAGE.len(), 2705);
-        assert_eq!(hash, 0xec545c3dc707163b);
+        assert_eq!(USAGE.len(), 2720);
+        assert_eq!(hash, 0x80058f0fef22a940);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 
@@ -4951,15 +5090,17 @@ mod tests {
     #[test]
     fn help_uses_plain_words_without_internal_names() {
         let inventory = HelpTopic::Inventory.text();
+        let trace = trace_help();
+        let diff = inventory_diff_help();
         let helps = [
             ("USAGE", USAGE),
             ("PROFILE_HELP", PROFILE_HELP),
-            ("TRACE_HELP", TRACE_HELP),
+            ("TRACE_HELP", trace.as_str()),
             ("RUN_HELP", RUN_HELP),
             ("INSPECT_HELP", INSPECT_HELP),
             ("DOCTOR_HELP", DOCTOR_HELP),
             ("INVENTORY_HELP", inventory.as_str()),
-            ("INVENTORY_DIFF_HELP", INVENTORY_DIFF_HELP),
+            ("INVENTORY_DIFF_HELP", diff.as_str()),
         ];
         for (name, help) in helps {
             for jargon in [
@@ -4987,7 +5128,8 @@ mod tests {
         }
         // The plain replacements land where the jargon was. Notes live in
         // scoped help; global help stays short.
-        for help in [PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+        let trace = trace_help();
+        for help in [PROFILE_HELP, trace.as_str(), RUN_HELP] {
             assert!(
                 help.contains("checked against the scan when possible"),
                 "{help:.200}"
@@ -5024,7 +5166,8 @@ mod tests {
 
     #[test]
     fn help_states_manifest_attestation_and_scan_only_limits() {
-        for help in [PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+        let trace = trace_help();
+        for help in [PROFILE_HELP, trace.as_str(), RUN_HELP] {
             for statement in [
                 "--manifest is explicit operator attestation of exact accepted function-name/offset claims",
                 "scan-only discovery is counted but not named",
@@ -5196,7 +5339,8 @@ mod tests {
 
     #[test]
     fn help_documents_the_new_capture_flags() {
-        for help in [PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+        let trace = trace_help();
+        for help in [PROFILE_HELP, trace.as_str(), RUN_HELP] {
             for statement in ["--ring-bytes", "--drain-interval-ms"] {
                 assert!(help.contains(statement), "missing help text: {statement}");
             }
@@ -5204,17 +5348,57 @@ mod tests {
     }
 
     // SYSPLAN residual F-17 (RED): the hidden 10M default trace cap is
-    // surfaced in help.
+    // surfaced in help, rendered from the live constant.
     #[test]
     fn help_surfaces_default_trace_event_cap() {
+        let help = trace_help();
+        let live = grouped_count(crate::run::DEFAULT_TRACE_MAX_EVENTS);
         assert!(
-            TRACE_HELP.contains("10,000,000"),
-            "help never names the default trace event cap"
+            help.contains(&live),
+            "help never names the default trace event cap {live}"
         );
+        assert_eq!(live, "10,000,000", "the default cap moved; update the pin");
         assert!(
-            TRACE_HELP.contains("TRUNCATED"),
+            help.contains("TRUNCATED"),
             "help never explains the TRUNCATED line"
         );
+    }
+
+    #[test]
+    fn help_counts_group_with_thousands_separators() {
+        for (value, expected) in [
+            (0, "0"),
+            (7, "7"),
+            (64, "64"),
+            (999, "999"),
+            (1000, "1,000"),
+            (16384, "16,384"),
+            (250000, "250,000"),
+            (2000000, "2,000,000"),
+            (10000000, "10,000,000"),
+        ] {
+            assert_eq!(grouped_count(value), expected, "value={value}");
+        }
+        assert_eq!(mib_or_bytes(67_108_864), "64 MiB");
+        assert_eq!(mib_or_bytes(1024), "1024 bytes");
+    }
+
+    #[test]
+    fn diff_help_publishes_the_live_input_bounds() {
+        use crate::inventory_diff::input::{
+            DEFAULT_INPUT_BYTES, DEFAULT_INPUT_DEPTH, DEFAULT_INPUT_NODES, DEFAULT_INPUT_ROWS,
+            DEFAULT_INPUT_STRING_BYTES,
+        };
+        let help = inventory_diff_help();
+        for expected in [
+            mib_or_bytes(DEFAULT_INPUT_BYTES as u64),
+            grouped_count(DEFAULT_INPUT_ROWS as u64),
+            grouped_count(DEFAULT_INPUT_STRING_BYTES as u64),
+            grouped_count(DEFAULT_INPUT_DEPTH as u64),
+            grouped_count(DEFAULT_INPUT_NODES as u64),
+        ] {
+            assert!(help.contains(&expected), "missing {expected:?}: {help}");
+        }
     }
 
     // SYSPLAN residual F-26 (RED): every P11SCOPE_* behavior switch is

@@ -3,7 +3,7 @@
 
 // parse_snapshot and reduced-limit entry points are retained reader test seams.
 #[allow(dead_code)]
-mod input;
+pub(crate) mod input;
 
 mod compare;
 mod model;

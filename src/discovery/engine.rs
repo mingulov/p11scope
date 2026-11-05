@@ -8882,7 +8882,7 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
 /// and its modules stay unknown rather than absent.
 fn missing_named_process_message(pid: u32) -> String {
     if crate::process::generation_gone(pid) {
-        format!("no process with PID {pid} (it exited, or the PID is mistyped)")
+        crate::process::MissingNamedProcess { pid }.to_string()
     } else {
         format!("process with PID {pid} could not be scanned; its modules are unknown, not absent")
     }
@@ -8896,7 +8896,14 @@ fn start_retained_with<S>(
 ) -> Result<S> {
     if named && discovered.views.len() != 1 {
         // A named scope always carries its PID; anything else here is a
-        // test fixture, which keeps the internal wording.
+        // test fixture, which keeps the internal wording. A pid with no
+        // live process fails typed, so the caller passes the one line
+        // through instead of wrapping it in attach context.
+        if let Scope::Pid(pid) = &discovered.scope
+            && crate::process::generation_gone(*pid)
+        {
+            return Err(crate::process::MissingNamedProcess { pid: *pid }.into());
+        }
         let message = match &discovered.scope {
             Scope::Pid(pid) => missing_named_process_message(*pid),
             _ => "the named process generation was not retained through discovery".to_string(),

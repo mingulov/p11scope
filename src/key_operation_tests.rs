@@ -20462,3 +20462,140 @@ fn key_operation_info_call_before_seal_keeps_joint_feed() {
         "the sign completes exactly once through the Joint path"
     );
 }
+
+/// Joint never stops as a whole at publication: a feed that fell
+/// back or lost authority keeps its already-attributed and
+/// S1-preserved rows under `partial`, with the unattributed calls
+/// counted per named reason beside them. The healthy twin stays
+/// populated with zero unattributed and byte-stable v1 JSON.
+#[test]
+fn key_operation_partial_publication_counts_unattributed() {
+    let instance = RegistryInstanceId::from_raw(3);
+
+    // Healthy twin: everything seals, nothing is unattributed.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        drive_quantum(&mut scene, &mut staging, &mut edge, &mut keyuse, &mut sink, call);
+    }
+    let healthy = commit(31, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(healthy.status, ObsStatus::Populated);
+    assert_eq!(healthy.reason, "none");
+    assert!(
+        healthy.unattributed.is_empty(),
+        "a fully sealed flow attributes everything"
+    );
+    let healthy_json = object_observations_json(&healthy);
+    assert_eq!(healthy_json["version"], 1, "healthy output stays v1");
+    assert!(
+        healthy_json.get("unattributed").is_none(),
+        "no unattributed key while every count is zero"
+    );
+
+    // Proof-only fallback: replayed S1 rows stay visible as partial,
+    // and the three replayed calls count as not attributed.
+    let mut fall_scene = JointScene::new();
+    let fall_bootstrap = fall_scene.bootstrap();
+    let mut fall_staging = JointStaging::select_joint(Some(&fall_bootstrap));
+    let mut fall_edge = EdgeSemantics::default();
+    let mut fall_keyuse = KeyUseReducer::new();
+    let mut fall_sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut fall_scene, &mut fall_staging, call);
+    }
+    let failure = fall_scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &fall_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = fall_staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &fall_scene.model,
+        fall_scene.adapter.ledger_mut(),
+        &mut fall_edge,
+        &mut fall_keyuse,
+        instance,
+        &mut fall_sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    let fell = commit(32, &[&fall_staging], &fall_scene.model.project(), &fall_keyuse);
+    assert_eq!(
+        fell.status,
+        ObsStatus::Partial,
+        "fallback keeps its rows visible instead of ending the section"
+    );
+    assert_eq!(fell.reason, "proof_refused_fallback");
+    assert!(
+        !fell.unknown_key_operations.is_empty(),
+        "fallback preserves replayed S1"
+    );
+    assert_eq!(
+        fell.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "proof_refused_fallback",
+            count: 3,
+        }],
+        "the replayed calls count once as not attributed"
+    );
+    let fell_json = object_observations_json(&fell);
+    assert_eq!(fell_json["version"], 3);
+    assert_eq!(
+        fell_json["unattributed"],
+        serde_json::json!([{"reason": "proof_refused_fallback", "count": 3}])
+    );
+
+    // Real loss: the disposed call counts as record_lost; the
+    // section is partial, never a whole-capture unavailability.
+    let mut loss_scene = JointScene::new();
+    let loss_bootstrap = loss_scene.bootstrap();
+    let mut loss_staging = JointStaging::select_joint(Some(&loss_bootstrap));
+    let mut loss_edge = EdgeSemantics::default();
+    let mut loss_keyuse = KeyUseReducer::new();
+    let mut loss_sink = Vec::new();
+    prepare_call(
+        &mut loss_scene,
+        &mut loss_staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let loss_failure = loss_scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &loss_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut loss_h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = loss_staging.apply_algorithm_failure_for_test(
+        &loss_failure,
+        &mut loss_h3,
+        &loss_scene.model,
+        loss_scene.adapter.ledger_mut(),
+        &mut loss_edge,
+        &mut loss_keyuse,
+        instance,
+        &mut loss_sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let lost = commit(33, &[&loss_staging], &loss_scene.model.project(), &loss_keyuse);
+    assert_eq!(lost.status, ObsStatus::Partial);
+    assert_eq!(lost.reason, "authority_lost");
+    assert_eq!(
+        lost.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 1,
+        }]
+    );
+}

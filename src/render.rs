@@ -2367,6 +2367,21 @@ pub(crate) fn apply_counter_snapshot(
     }
 }
 
+/// Derive the legacy read gap from the protected snapshot, mirroring the
+/// counter gap above. A legacy slot or evidence read failure never blanks
+/// the capture; it reports zeros as unknown with this named gap.
+pub(crate) fn apply_legacy_gaps(ev: &mut Evidence, snapshot: &crate::metrics::CaptureSnapshot) {
+    if snapshot.has_legacy_gap() {
+        let observation = &mut ev.gap_classes.observation;
+        if !observation.causes.contains(&"legacy_collection") {
+            observation.causes.push("legacy_collection");
+        }
+        observation.status = "lossy";
+        ev.completeness = "PARTIAL";
+        ev.verdict_detail = VERDICT_CONCRETE_GAP;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn live_snapshot_scoped(
     snapshot: &crate::metrics::CaptureSnapshot,
@@ -2690,6 +2705,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "provider_changed" => "provider changed".to_string(),
             "trace_truncated" => "trace truncated at its event cap".to_string(),
             "counter_collection" => "counter collection incomplete".to_string(),
+            "legacy_collection" => "legacy collection incomplete".to_string(),
             "proc_namespace_mismatch" => {
                 "/proc numbering foreign: kernel PIDs unresolvable".to_string()
             }
@@ -3057,6 +3073,22 @@ pub(crate) fn with_counter_snapshot(
             .as_object_mut()
             .expect("capture renderer emits an evidence object")
             .insert("counter_collection".into(), collection);
+    }
+    document
+}
+
+/// Optional legacy gap object, omitted when the legacy read was exact.
+/// Counts and finite reason names only; zeros in the rows are unknown, not
+/// exact, whenever this object is present.
+pub(crate) fn with_legacy_snapshot(
+    mut document: serde_json::Value,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) -> serde_json::Value {
+    if let Some(collection) = snapshot.legacy_collection() {
+        document["evidence"]
+            .as_object_mut()
+            .expect("capture renderer emits an evidence object")
+            .insert("legacy_collection".into(), collection);
     }
     document
 }

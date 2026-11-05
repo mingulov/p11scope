@@ -61,6 +61,17 @@ terminal read publishes the last good snapshot as stale with `PARTIAL`;
 only a capture that never acquired a snapshot fails. This metadata
 does not select a backend or add capture fields.
 
+When a legacy (non-counter) aggregate read cannot read one slot's counters
+or one kernel-evidence cell, its evidence also contains an optional additive
+`legacy_collection` object. Exact legacy reads omit it. Its keys are
+`unread_stats` (how many slots read zero as unknown), `rv_failed` (whether
+the return-value table read failed), and `unknown_evidence` (finite names of
+the unread evidence cells). Zeros in the rows are unknown, not exact,
+whenever this object is present. Like `counter_collection`, it adds
+`legacy_collection` to the observation gap causes and requires `PARTIAL`
+with `verdict_detail: "concrete_gap"`. This is a v3-additive disclosure
+that introduces no new schema revision.
+
 When a metrics+counter capture carries an endpoint selection (`--select-endpoint`),
 the terminal evidence also contains an optional additive `selected_detail`
 envelope. Captures without the flag omit it. Its keys are `selection` (the

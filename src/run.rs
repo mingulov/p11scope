@@ -5875,6 +5875,7 @@ fn capture_profile(
                 session.unpublished_mechanisms(),
             );
             render::apply_counter_snapshot(&mut ev, &snapshot);
+            render::apply_legacy_gaps(&mut ev, &snapshot);
             let frame = render::live_snapshot_scoped(
                 &snapshot,
                 &ev,
@@ -6582,6 +6583,7 @@ fn capture_profile(
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
         render::apply_counter_snapshot(&mut ev, &snapshot);
+        render::apply_legacy_gaps(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
         let frame = render::live_snapshot_scoped(
             &snapshot,
@@ -6609,6 +6611,7 @@ fn capture_profile(
             profile,
         );
         render::apply_counter_snapshot(&mut ev, &snapshot);
+        render::apply_legacy_gaps(&mut ev, &snapshot);
         let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
         for summary in &summaries {
@@ -6643,6 +6646,7 @@ fn capture_profile(
                 render::json(reports, &ev, &capture)
             };
             let j = render::with_counter_snapshot(j, &snapshot);
+            let j = render::with_legacy_snapshot(j, &snapshot);
             let j = match selection_ledger {
                 Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
                 None => j,

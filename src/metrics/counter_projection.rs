@@ -5,7 +5,7 @@ use super::counter_collector::{
     CounterCellDelta, CounterCollector, CounterHealth, CounterIssue, CounterLimits,
     CounterObservation, CounterRead, ReadReservation, ReadStage, ReadWindow, tree_bytes,
 };
-use super::{KernelEvidence, SlotReport};
+use super::{KernelEvidence, LegacyReadGaps, SlotReport};
 use crate::discovery::identity::PinnedObjects;
 use crate::plan::{AttachKey, AttachPlan, SlotOrdinal};
 use crate::semantics_edge::resources::{
@@ -171,7 +171,7 @@ impl CounterCaptureInputs {
 
 #[derive(Debug, Clone)]
 enum CaptureData {
-    Legacy(Vec<SlotReport>, KernelEvidence),
+    Legacy(Vec<SlotReport>, KernelEvidence, LegacyReadGaps),
     Counter(CounterSnapshot),
 }
 
@@ -217,14 +217,14 @@ impl CaptureSnapshot {
 
     pub(crate) fn reports(&self) -> &[SlotReport] {
         match &self.data {
-            CaptureData::Legacy(reports, _) => reports,
+            CaptureData::Legacy(reports, _, _) => reports,
             CaptureData::Counter(snapshot) => snapshot.reports(),
         }
     }
 
     pub(crate) fn kernel_evidence(&self) -> KernelEvidence {
         match &self.data {
-            CaptureData::Legacy(_, kernel) => *kernel,
+            CaptureData::Legacy(_, kernel, _) => *kernel,
             CaptureData::Counter(snapshot) => snapshot
                 .kernel_evidence()
                 .expect("a presented counter snapshot retains actual kernel evidence"),
@@ -234,6 +234,31 @@ impl CaptureSnapshot {
     pub(crate) fn has_counter_gap(&self) -> bool {
         self.counter()
             .is_some_and(|snapshot| !snapshot.is_fresh() || snapshot.discontinuity())
+    }
+
+    fn legacy_gaps(&self) -> Option<&LegacyReadGaps> {
+        match &self.data {
+            CaptureData::Legacy(_, _, gaps) => Some(gaps),
+            CaptureData::Counter(_) => None,
+        }
+    }
+
+    pub(crate) fn has_legacy_gap(&self) -> bool {
+        self.legacy_gaps().is_some_and(|gaps| !gaps.is_clean())
+    }
+
+    /// Optional legacy gap object for the evidence document: counts and
+    /// finite reason names only. Omitted when the legacy read was exact.
+    pub(crate) fn legacy_collection(&self) -> Option<serde_json::Value> {
+        let gaps = self.legacy_gaps()?;
+        if gaps.is_clean() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "unread_stats": gaps.slots.unread_stats,
+            "rv_failed": gaps.slots.rv_failed,
+            "unknown_evidence": gaps.unknown_names(),
+        }))
     }
 
     /// Metadata can only be obtained from this accepted protected snapshot.
@@ -322,14 +347,24 @@ impl CaptureCollection {
     ) -> anyhow::Result<CaptureSnapshot> {
         // A new scoped, opaque binding comes only from actual preparation.
         let binding = session.counter_reader_binding();
-        let legacy = || {
+        let legacy = || -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)> {
             // Preserve the existing order of ordinary live/terminal reads.
             if terminal {
-                let reports = super::read(session, plan)?;
-                Ok((reports, super::kernel_evidence(session)?))
+                let (reports, slots) = super::read_with_gaps(session, plan)?;
+                let kernel = super::kernel_evidence_with_gaps(session)?;
+                let gaps = LegacyReadGaps {
+                    slots,
+                    unknown_evidence: kernel.unknown_cells,
+                };
+                Ok((reports, kernel, gaps))
             } else {
-                let kernel = super::kernel_evidence(session)?;
-                Ok((super::read(session, plan)?, kernel))
+                let kernel = super::kernel_evidence_with_gaps(session)?;
+                let (reports, slots) = super::read_with_gaps(session, plan)?;
+                let gaps = LegacyReadGaps {
+                    slots,
+                    unknown_evidence: kernel.unknown_cells,
+                };
+                Ok((reports, kernel, gaps))
             }
         };
         if terminal {
@@ -376,7 +411,7 @@ impl CaptureCollection {
             CounterLimits,
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
-        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)>,
         generation: NonZeroU64,
         kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
@@ -385,12 +420,14 @@ impl CaptureCollection {
                 if self.counter.is_some() {
                     anyhow::bail!("counter collection requires its prepared Session binding");
                 }
-                let (reports, mut kernel) = legacy()?;
+                let (reports, mut kernel, mut gaps) = legacy()?;
                 if !profile {
                     kernel.ring_loss = 0;
+                    kernel.unknown_cells &= !super::LEGACY_UNKNOWN_RING_LOSS;
+                    gaps.unknown_evidence = kernel.unknown_cells;
                 }
                 Ok(CaptureSnapshot {
-                    data: CaptureData::Legacy(reports, kernel),
+                    data: CaptureData::Legacy(reports, kernel, gaps),
                     new_acquisition: true,
                 })
             }
@@ -484,7 +521,7 @@ impl CaptureCollection {
             CounterLimits,
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
-        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)>,
         generation: NonZeroU64,
         kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
@@ -723,11 +760,11 @@ pub(super) mod tests {
     };
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
-    use crate::metrics::KernelEvidence;
     use crate::metrics::counter_collector::{
         CounterCell, CounterHealth, CounterIssue, CounterLimits, CounterRead, CounterRow,
         ReadReservation, ReadStage, ReadWindow,
     };
+    use crate::metrics::{KernelEvidence, LegacyReadGaps};
     use crate::plan::{AdmissionPolicy, AttachPlan};
     use crate::process::{MountNamespaceId, ProcessViewId};
     use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
@@ -947,7 +984,13 @@ pub(super) mod tests {
                     profile,
                     Ok(None::<()>),
                     |(), _, _, _, _| panic!("ordinary snapshot cannot acquire counters"),
-                    || Ok((Vec::new(), KernelEvidence::default())),
+                    || {
+                        Ok((
+                            Vec::new(),
+                            KernelEvidence::default(),
+                            LegacyReadGaps::default(),
+                        ))
+                    },
                     std::num::NonZeroU64::new(1).unwrap(),
                     || Ok(KernelEvidence::default()),
                 )
@@ -1184,6 +1227,7 @@ pub(super) mod tests {
                                 unmatched_returns: 3,
                                 ..Default::default()
                             },
+                            LegacyReadGaps::default(),
                         ))
                     },
                     std::num::NonZeroU64::new(1).unwrap(),
@@ -1197,6 +1241,109 @@ pub(super) mod tests {
             );
             assert_eq!(snapshot.kernel_evidence().unmatched_returns, 3);
         }
+    }
+
+    #[test]
+    fn legacy_gaps_publish_partial_with_named_reasons() {
+        use crate::metrics::{LEGACY_UNKNOWN_OWNER, LEGACY_UNKNOWN_RING_LOSS};
+        let (_file, plan, pins) = fixture();
+        let mut collection = CaptureCollection::new(None);
+        let snapshot = collection
+            .fresh_with(
+                &plan,
+                &pins,
+                true,
+                Ok(None::<()>),
+                |(), _, _, _, _| panic!("ordinary Session must not use counter reader"),
+                || {
+                    Ok((
+                        Vec::new(),
+                        KernelEvidence {
+                            unknown_cells: LEGACY_UNKNOWN_RING_LOSS | LEGACY_UNKNOWN_OWNER,
+                            ..Default::default()
+                        },
+                        LegacyReadGaps {
+                            slots: crate::metrics::LegacySlotGaps {
+                                unread_stats: 2,
+                                rv_failed: true,
+                            },
+                            unknown_evidence: LEGACY_UNKNOWN_RING_LOSS | LEGACY_UNKNOWN_OWNER,
+                        },
+                    ))
+                },
+                std::num::NonZeroU64::new(1).unwrap(),
+                || Ok(KernelEvidence::default()),
+            )
+            .unwrap();
+        assert!(snapshot.has_legacy_gap());
+        assert!(!snapshot.has_counter_gap());
+        assert!(snapshot.counter_collection().is_none());
+        let gaps = snapshot.legacy_collection().unwrap();
+        assert_eq!(gaps["unread_stats"], 2);
+        assert_eq!(gaps["rv_failed"], true);
+        assert_eq!(
+            gaps["unknown_evidence"],
+            serde_json::json!(["ring_loss", "owner"])
+        );
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "COMPLETE");
+        crate::render::apply_legacy_gaps(&mut evidence, &snapshot);
+        assert_eq!(evidence.completeness, "PARTIAL");
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"legacy_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
+        let document =
+            crate::render::with_legacy_snapshot(serde_json::json!({"evidence": {}}), &snapshot);
+        assert_eq!(document["evidence"]["legacy_collection"], gaps);
+    }
+
+    #[test]
+    fn legacy_exact_omits_gaps_and_stays_complete() {
+        let (_file, plan, pins) = fixture();
+        let mut collection = CaptureCollection::new(None);
+        let snapshot = collection
+            .fresh_with(
+                &plan,
+                &pins,
+                true,
+                Ok(None::<()>),
+                |(), _, _, _, _| panic!("ordinary Session must not use counter reader"),
+                || {
+                    Ok((
+                        Vec::new(),
+                        KernelEvidence::default(),
+                        LegacyReadGaps::default(),
+                    ))
+                },
+                std::num::NonZeroU64::new(1).unwrap(),
+                || Ok(KernelEvidence::default()),
+            )
+            .unwrap();
+        assert!(!snapshot.has_legacy_gap());
+        assert!(snapshot.legacy_collection().is_none());
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_legacy_gaps(&mut evidence, &snapshot);
+        assert_eq!(evidence.completeness, "COMPLETE");
+        assert!(
+            !evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"legacy_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
+        let document =
+            crate::render::with_legacy_snapshot(serde_json::json!({"evidence": {}}), &snapshot);
+        assert!(document["evidence"].get("legacy_collection").is_none());
     }
 
     #[test]

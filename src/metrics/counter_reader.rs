@@ -837,6 +837,7 @@ impl CounterSource for NativeSource<'_> {
             unregistered_mechanisms: read(EVIDENCE_UNREGISTERED_MECHANISMS)?,
             abi_refusals: read(EVIDENCE_ABI_REFUSALS)?,
             control: KernelControl::from_cells(Some(owner), Some(cookie), Some(root)),
+            unknown_cells: 0,
         })
     }
     fn now(&self) -> Option<u64> {

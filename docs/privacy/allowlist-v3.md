@@ -42,7 +42,9 @@ which names the admitted-prefix counts in module gaps,
 and [detach-quarantine refusal publication](#detach-quarantine-refusal-publication-ruling-jk-22a-2026-11-05),
 which names refused slots with their recorded detach reason and no new capture,
 and [unpublished mechanism approval count](#unpublished-mechanism-approval-count-ruling-jk-22a-2026-11-05),
-which gaps shed approval ids by count only.**
+which gaps shed approval ids by count only,
+and [legacy collection gaps](#legacy-collection-gaps-v060),
+which names the `legacy_collection` counts-and-reasons projection.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1565,3 +1567,15 @@ new capture, no path/PID/error publication. Allowlist-v1 bytes are unchanged.
 | Discovery transport gap (`discovery transport unavailable`) | A live `discovery_dequeue` failure after a prefix was already pulled off the ring. The exact prefix is applied before the gap is recorded; the failure itself is a transport error, never a record. One internal record per failing tick (deduplicated). | Public `evidence.skipped[]` records with `name: "discovery subject"`, `reason: "discovery transport unavailable"`. No record content, address, or error chain is published. Forces `PARTIAL` via `skipped`. | Ring destruction (producers detached) ends the capture through the existing terminal path, which still publishes the retained prefix before detach. Required evidence: prefix-retained and healthy-twin at the live-drain seam. |
 
 | Pause unavailable gap (`pause_unavailable`) | A `--pause always` arm or service failure that is not lifecycle (child alive, ring present): the observer could not pause, so it collected unpaused. Decided by the pause coordinator's own arm/service result against the owned child; no target memory or key material is read for the gap itself. One count per degraded attempt. | Public `evidence.pause_unavailable` count (integer, 0 when never degraded) plus `evidence.pause: "partial"`. No PID, timing, or error chain is published. Forces `PARTIAL` via the new `pause_unavailable` cause. | Lifecycle failures (child gone, ring destroyed) still abort with cleanup, never a silent unpaused run. `--pause auto` behavior is unchanged (`pause_partial`, no `pause_unavailable`). Required evidence: always-degrade and healthy-twin at the pause seam. |
+
+## Legacy collection gaps (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0 under the owner never-stop rule
+(2026-11-05): a legacy aggregate read that cannot read one slot's counters
+or one kernel-evidence cell reports zeros as unknown with named gaps instead
+of blanking the capture. No new capture exists; the gaps project read-failure
+facts the observer already holds. Allowlist-v1 bytes are unchanged.**
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Legacy gap object (`evidence.legacy_collection`) | A pure projection of the legacy read's per-slot and per-cell failure flags: the STATS slots whose map read failed, whether any RV-table entry read failed, and the EVIDENCE/control cells whose map read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted aggregate reads; a missing STATS/RV/EVIDENCE map remains fatal (the data source itself is gone), and missing control maps (Inventory flavors) contribute nothing without a gap bit. The key stays absent (never null) when the legacy read was exact. | Public profile/metrics JSON only: `unread_stats` (saturating u64 count of slots that read zero as unknown), `rv_failed` (whether the RV table read failed), and `unknown_evidence` (finite names of the unread cells, in bit order: the nine EVIDENCE names plus `owner`, `cookie`, `root`). Counts and reason names only; no per-slot index, offset, timing, RV value or control word reaches output. Zeros in the rows are unknown, not exact, whenever this object is present, and the report reads PARTIAL with cause `legacy_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and an empty name list is never emitted. Required evidence: per-slot zero-with-gap and per-cell unknown twins at the legacy collection seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |

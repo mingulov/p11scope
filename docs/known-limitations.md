@@ -130,7 +130,11 @@ banks grow with
 the host possible-CPU count and refuse with `counter-memory-limit`
 past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
-saturation is reported in the collection health. Per-call
+saturation is reported in the collection health. A legacy aggregate read
+that cannot read one slot's counters reports zero for that slot as unknown
+with a `legacy_collection` gap, and one unread kernel-evidence cell reads 0
+as unknown with its name; the rest stays exact and the report reads PARTIAL.
+Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build). A recognized forwarding layer (such as
 p11-kit's proxy closure array, about 6,530 endpoints per copy) is

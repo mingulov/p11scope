@@ -745,15 +745,14 @@ pub fn run(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
-    // The opt-in gates before any load: a scan pairing refuses by
-    // name (mirroring the parse refusal for programmatic callers),
-    // and a build without the journal object refuses with the finite
-    // build reason. Never silently ignored.
+    // The opt-in gate before any load: a scan pairing refuses by
+    // name (mirroring the parse refusal for programmatic callers).
+    // A build without the journal object does NOT refuse here
+    // (F-08): `start_semantic_lane` owns that refusal, naming the
+    // finite build reason as a key-operations gap while broad S1
+    // inventory continues. Never silently ignored.
     if key_operations && capture == CaptureMode::Scan {
         anyhow::bail!("--key-operations requires --capture auto or native");
-    }
-    if key_operations {
-        crate::attach::journal::JournalSpec.prepare().map(|_| ())?;
     }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
@@ -5226,9 +5225,10 @@ fn key_operations_refusal_reason(refusal: &crate::inventory_semantics::SemanticR
 
 /// Pure verdict behind [`key_operations_refusal_reason`]: a present,
 /// flavor-clean pair names the live refusal's own code; every other
-/// parsed shape names its static cause. (The omitted build never
-/// reaches here — the gate above refused it — so it folds into the
-/// live refusal's code.)
+/// parsed shape names its static cause. (The omitted build reaches
+/// here since F-08 removed the `run` gate; the wrapper above names
+/// its build reason first, so this verdict folds it into the live
+/// refusal's code only as a backstop.)
 fn key_operations_refusal_reason_from(
     preflight: crate::attach::JournalPairPreflight,
     refusal: &crate::inventory_semantics::SemanticRefusal,

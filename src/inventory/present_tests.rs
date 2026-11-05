@@ -2075,6 +2075,148 @@ fn f7_snapshot_high_cardinality_allocation_baseline() {
 }
 
 #[test]
+fn quiet_summary_omits_gap_lines_while_json_keeps_every_gap() {
+    // JSON completeness: the concise quiet head drops every `gap [..]`
+    // detail line, but the JSON document still carries each retained
+    // gap with its exact subject, reason and budget, and the coverage
+    // count line agrees with the JSON array length.
+    let (mut harness, _caller) = single_caller_harness("present-quiet-json-gaps", 1);
+    for (subject, budget) in [
+        ("quiet coverage gap", None),
+        (
+            "quiet budget gap",
+            Some(crate::discovery::caller_registry::BudgetRefusal {
+                resource: "callers",
+                limit: 1,
+                requested: 2,
+            }),
+        ),
+    ] {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(4242),
+                subject: subject.into(),
+                reason: format!("{subject} reason"),
+                budget,
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(presentation.gaps.len(), 2, "two retained gaps");
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        !summary.lines().any(|line| line.starts_with("gap [")),
+        "the concise head carries no gap lines:\n{summary}"
+    );
+    let json = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = json["gaps"].as_array().expect("the JSON gaps array");
+    assert_eq!(gaps.len(), 2, "JSON keeps every gap: {json}");
+    for view in &presentation.gaps {
+        let row = gaps
+            .iter()
+            .find(|row| row["subject"].as_str() == Some(view.subject.as_str()))
+            .unwrap_or_else(|| panic!("missing JSON gap for {}: {json}", view.subject));
+        assert_eq!(row["reason"].as_str(), Some(view.reason.as_str()));
+        match &view.budget {
+            None => assert!(row["budget"].is_null(), "{row}"),
+            Some(refusal) => {
+                assert_eq!(row["budget"]["resource"].as_str(), Some(refusal.resource));
+                assert_eq!(
+                    row["budget"]["limit"].as_u64(),
+                    Some(refusal.limit as u64),
+                    "{row}"
+                );
+                assert_eq!(
+                    row["budget"]["requested"].as_u64(),
+                    Some(refusal.requested as u64),
+                    "{row}"
+                );
+            }
+        }
+    }
+    let coverage = summary
+        .lines()
+        .find(|line| line.starts_with("coverage: "))
+        .expect("the quiet head keeps its coverage line");
+    assert!(
+        coverage.contains("2 gaps"),
+        "the count line agrees with JSON: {coverage}"
+    );
+}
+
+#[test]
+fn partial_results_with_gaps_exit_zero_while_a_failed_sink_exits_one() {
+    // CLI exit codes: named gaps are partial results, not failures.
+    // The same gap-bearing report exits 0 when every sink lands, and
+    // 1 only when a sink fails.
+    struct FailingStdout;
+    impl std::io::Write for FailingStdout {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "injected stdout failure",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (mut harness, _caller) = single_caller_harness("present-partial-exit", 1);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(4242),
+            subject: "partial coverage gap".into(),
+            reason: "partial coverage gap reason".into(),
+            budget: None,
+        });
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(presentation.gaps.len(), 1, "one retained gap");
+    let mut stdout = Vec::new();
+    let ok = crate::inventory::finish_output(
+        None,
+        &mut crate::inventory::EventLogState::new(None),
+        &mut crate::inventory::StreamState::new(),
+        &presentation,
+        true,
+        false,
+        &mut crate::inventory_output::WriterStdout(&mut stdout),
+        None,
+        None,
+    );
+    assert_eq!(ok.exit_code(), 0, "partial results exit 0");
+    assert!(!stdout.is_empty(), "the report actually landed");
+    let mut failed_stdout = FailingStdout;
+    let failed = crate::inventory::finish_output(
+        None,
+        &mut crate::inventory::EventLogState::new(None),
+        &mut crate::inventory::StreamState::new(),
+        &presentation,
+        true,
+        false,
+        &mut crate::inventory_output::WriterStdout(&mut failed_stdout),
+        None,
+        None,
+    );
+    assert_eq!(failed.exit_code(), 1, "a failed sink exits 1");
+    assert!(
+        failed.failures().iter().any(|line| line.contains("stdout")),
+        "the failure names its sink: {:?}",
+        failed.failures()
+    );
+}
+
+#[test]
 fn flagged_unregistered_mechanism_renders_row_without_name() {
     // Round-2 P2-b: a Detailed unregistered id (VALUE +
     // MECHANISM_UNREGISTERED) admitted by the edge renders an S1

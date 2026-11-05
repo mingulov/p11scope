@@ -136,8 +136,6 @@ pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
 pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink};
 #[cfg(test)]
-pub(crate) use cleanup_worker::drive_cleanup;
-#[cfg(test)]
 mod async_value_flags_tests;
 #[cfg(test)]
 mod instance_tests;
@@ -2032,12 +2030,7 @@ impl OwnedProducerDetach {
         let started = *started;
         let had_work = *had_work;
         let Some(receipt) = worker.try_join() else {
-            progress.poll_pending(
-                worker,
-                had_work,
-                out,
-                crate::run::capture_diagnostics_on(),
-            );
+            progress.poll_pending(worker, had_work, out, crate::run::capture_diagnostics_on());
             return Ok(ProducerDetachProgress::Pending);
         };
         *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));

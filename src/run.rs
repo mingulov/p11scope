@@ -6130,9 +6130,7 @@ fn capture_profile(
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     // Findings always warn; a clean or unavailable detector is diagnostics.
-    if capture_diagnostics_on()
-        || scheduling.longrun_has_findings(loop_event_loss.is_some())
-    {
+    if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
         let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
     }
     // K0: snapshot the exec witness while the tap is still live.
@@ -7232,9 +7230,7 @@ fn capture_trace(
     );
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
     // Findings always warn; a clean or unavailable detector is diagnostics.
-    if capture_diagnostics_on()
-        || scheduling.longrun_has_findings(loop_event_loss.is_some())
-    {
+    if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
         let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
     }
     // Poll for quiescence (owner budget), servicing the drains between
@@ -7822,12 +7818,7 @@ fn emit_trace_terminal_accounted<W: Write>(
         verbosity,
     );
     for line in &tail {
-        emit_trace_line(
-            line,
-            stdout,
-            stdout_open,
-            &mut None::<std::io::Sink>,
-        )?;
+        emit_trace_line(line, stdout, stdout_open, &mut None::<std::io::Sink>)?;
     }
     stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
     flush_stdout(stdout, stdout_open)?;

@@ -2827,9 +2827,7 @@ fn semantic_state_counter(ev: &Evidence, cause: &str) -> Option<u64> {
 /// into "other gaps" in concise text and renders as its own field name
 /// in verbose, so a new gate always surfaces.
 fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec<String> {
-    let count = |n: u64, one: &str, many: &str| {
-        format!("{n} {}", if n == 1 { one } else { many })
-    };
+    let count = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut fragments = Vec::new();
     let mut state_gaps = 0u64;
     let mut state_causes: Vec<&str> = Vec::new();
@@ -2872,7 +2870,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
                 for (n, one, many) in [
-                    (refused, "provider file not watched", "provider files not watched"),
+                    (
+                        refused,
+                        "provider file not watched",
+                        "provider files not watched",
+                    ),
                     (
                         partially_covered,
                         "provider file partially covered",
@@ -2915,7 +2917,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     )));
                 }
                 if functions > 0 {
-                    fragments.push(tag(count(functions, "function skipped", "functions skipped")));
+                    fragments.push(tag(count(
+                        functions,
+                        "function skipped",
+                        "functions skipped",
+                    )));
                 }
                 // One histogram line per named limit present, in canonical
                 // order; the labels are the finite public reasons, never
@@ -3027,9 +3033,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "discovery record truncated",
                 "discovery records truncated",
             ),
-            "task_uprobe_link_losses" => {
-                count(ev.task_uprobe_link_losses, "probe link lost", "probe links lost")
-            }
+            "task_uprobe_link_losses" => count(
+                ev.task_uprobe_link_losses,
+                "probe link lost",
+                "probe links lost",
+            ),
             "pause_partial" => count(
                 ev.pause_partial,
                 "load only partly paused",
@@ -3236,7 +3244,9 @@ fn missed_provider_load(ev: &Evidence) -> bool {
 
 /// The totals line shared by the profile summary and the trace tail.
 pub(crate) fn totals_line(calls: u64, errors: u64, open: u64) -> String {
-    format!("{calls} completed calls; {errors} returned errors; {open} entries without an observed return.")
+    format!(
+        "{calls} completed calls; {errors} returned errors; {open} entries without an observed return."
+    )
 }
 
 /// The one coverage line shared by the profile summary and the trace
@@ -3252,9 +3262,7 @@ pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
         let mut line = "coverage: partial — the command loaded its provider before probes \
              attached; rerun with --pause auto"
             .to_string();
-        if verbose
-            && let Some(reasons) = verdict_reason_body(ev, true)
-        {
+        if verbose && let Some(reasons) = verdict_reason_body(ev, true) {
             line.push_str("; ");
             line.push_str(&escape_controls(&reasons));
         }
@@ -4237,14 +4245,7 @@ pub(crate) mod tests {
             assert_eq!(
                 fields,
                 [
-                    "C_Sign",
-                    "unknown",
-                    "25",
-                    "3",
-                    expected,
-                    expected,
-                    expected,
-                    "2"
+                    "C_Sign", "unknown", "25", "3", expected, expected, expected, "2"
                 ],
                 "{mode:?}"
             );
@@ -5669,11 +5670,7 @@ pub(crate) mod tests {
             .filter(|line| line.contains("C_Initialize"))
             .collect();
         assert_eq!(init_lines.len(), 5, "{out}");
-        for marker in [
-            "[init: ok]",
-            "[init: already_initialized]",
-            "[init: mixed]",
-        ] {
+        for marker in ["[init: ok]", "[init: already_initialized]", "[init: mixed]"] {
             assert!(
                 init_lines.iter().any(|line| line.contains(marker)),
                 "missing {marker} in:\n{out}"
@@ -6335,9 +6332,7 @@ pub(crate) mod tests {
             let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
-                format!(
-                    " Unknown executable (PID 100, TID 1) unknown#{ordinal} → {rv} 100ns"
-                ),
+                format!(" Unknown executable (PID 100, TID 1) unknown#{ordinal} → {rv} 100ns"),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }
@@ -6873,10 +6868,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Quiet,
         ] {
             let out = scope_summary_with_verbosity("pid", &reports_fixture(), &partial, verbosity);
-            assert!(
-                out.contains("coverage: partial — "),
-                "{verbosity:?}: {out}"
-            );
+            assert!(out.contains("coverage: partial — "), "{verbosity:?}: {out}");
             assert!(!out.contains("Coverage PARTIAL"), "{verbosity:?}: {out}");
             assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
         }
@@ -6888,8 +6880,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
             crate::cli::TextVerbosity::Quiet,
         ] {
-            let out =
-                scope_summary_with_verbosity("pid", &reports_fixture(), &complete, verbosity);
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &complete, verbosity);
             assert!(out.contains("coverage: complete"), "{verbosity:?}: {out}");
             assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
         }
@@ -6927,7 +6918,13 @@ pub(crate) mod tests {
             }
         }
         // (mutation for one, mutation for two, singular, plural)
-        let arms: Vec<(fn(&mut Evidence), fn(&mut Evidence), &str, &str)> = vec![
+        type CountArm = (
+            fn(&mut Evidence),
+            fn(&mut Evidence),
+            &'static str,
+            &'static str,
+        );
+        let arms: Vec<CountArm> = vec![
             (
                 |ev| ev.attach_failures.push("slot 3: EPERM".into()),
                 |ev| {
@@ -7137,8 +7134,10 @@ pub(crate) mod tests {
             (
                 |ev| ev.discovery.modules_skipped = vec![refused("/opt/a.so", "capacity")],
                 |ev| {
-                    ev.discovery.modules_skipped =
-                        vec![refused("/opt/a.so", "capacity"), refused("/opt/b.so", "capacity")];
+                    ev.discovery.modules_skipped = vec![
+                        refused("/opt/a.so", "capacity"),
+                        refused("/opt/b.so", "capacity"),
+                    ];
                 },
                 "1 provider file not watched",
                 "2 provider files not watched",
@@ -7189,10 +7188,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Concise,
         );
-        assert!(
-            out.contains("1 discovery step unavailable"),
-            "{out}"
-        );
+        assert!(out.contains("1 discovery step unavailable"), "{out}");
         assert!(!out.contains("functions skipped"), "{out}");
         assert!(!out.contains("function skipped"), "{out}");
         // Mixed: both fragments, each counted.
@@ -7215,7 +7211,10 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
         );
         assert!(out.contains("C_Sign (function entry unavailable)"), "{out}");
-        assert!(out.contains("discovery subject (discovery unavailable)"), "{out}");
+        assert!(
+            out.contains("discovery subject (discovery unavailable)"),
+            "{out}"
+        );
     }
 
     /// CLI text: loader and live-window gaps read as plain words,
@@ -7375,14 +7374,12 @@ pub(crate) mod tests {
                 out.contains(&format!("coverage: partial — {REMEDY}")),
                 "{verbosity:?}: {out}"
             );
-            assert!(!out.contains("no provider files found"), "{verbosity:?}: {out}");
+            assert!(
+                !out.contains("no provider files found"),
+                "{verbosity:?}: {out}"
+            );
         }
-        let out = scope_summary_with_verbosity(
-            "pid",
-            &[],
-            &ev,
-            crate::cli::TextVerbosity::Verbose,
-        );
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(out.contains(REMEDY), "{out}");
         assert!(out.contains("unprotected_live_windows"), "{out}");
         // No missed load: a bare command keeps the generic reasons.
@@ -7394,12 +7391,7 @@ pub(crate) mod tests {
         ev.unprotected_live_windows = 1;
         ev.skipped = vec![subject()];
         ev.verdict();
-        let out = scope_summary_with_verbosity(
-            "pid",
-            &[],
-            &ev,
-            crate::cli::TextVerbosity::Concise,
-        );
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
         assert!(!out.contains(REMEDY), "{out}");
         assert!(out.contains("no provider files found"), "{out}");
         // Pause protection was used: no remedy either.
@@ -7414,12 +7406,7 @@ pub(crate) mod tests {
         ev.unprotected_live_windows = 1;
         ev.discovery_truncated = 1;
         ev.verdict();
-        let out = scope_summary_with_verbosity(
-            "pid",
-            &[],
-            &ev,
-            crate::cli::TextVerbosity::Concise,
-        );
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
         assert!(!out.contains(REMEDY), "{out}");
         // Not an owned run: no remedy.
         let mut ev = evidence();
@@ -7429,12 +7416,7 @@ pub(crate) mod tests {
         ev.unprotected_live_windows = 1;
         ev.discovery_truncated = 1;
         ev.verdict();
-        let out = scope_summary_with_verbosity(
-            "pid",
-            &[],
-            &ev,
-            crate::cli::TextVerbosity::Concise,
-        );
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
         assert!(!out.contains(REMEDY), "{out}");
     }
 
@@ -7472,7 +7454,8 @@ pub(crate) mod tests {
         );
         assert!(out.contains("FUNCTION"), "{out}");
         assert_eq!(
-            out.matches("log2-bucket approximation, lower bound").count(),
+            out.matches("log2-bucket approximation, lower bound")
+                .count(),
             1,
             "{out}"
         );
@@ -7654,10 +7637,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Quiet,
         ] {
             let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
-            assert!(
-                out.contains("coverage: complete"),
-                "{verbosity:?}: {out}"
-            );
+            assert!(out.contains("coverage: complete"), "{verbosity:?}: {out}");
         }
     }
 
@@ -8004,10 +7984,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(
-            text.contains("1 provider file partially covered"),
-            "{text}"
-        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
             text.contains("/opt/grown.so: partially covered — "),
             "{text}"
@@ -8085,10 +8062,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(
-            text.contains("1 provider file partially covered"),
-            "{text}"
-        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
             text.contains("/opt/p11-kit-client.so: partially covered — "),
             "{text}"
@@ -8159,10 +8133,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(
-            text.contains("1 provider file partially covered"),
-            "{text}"
-        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
             text.contains("/opt/mixed.so: partially covered — "),
             "{text}"
@@ -9022,9 +8993,7 @@ pub(crate) mod tests {
                 e.vendor_interfaces = 1
             }),
             ("1 call record lost", |e| e.event_loss = 1),
-            ("1 call start not recorded", |e| {
-                e.start_insert_failures = 1
-            }),
+            ("1 call start not recorded", |e| e.start_insert_failures = 1),
             ("1 return without a recorded start", |e| {
                 e.unmatched_returns = 1
             }),

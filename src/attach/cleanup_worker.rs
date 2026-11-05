@@ -1548,9 +1548,7 @@ pub(crate) fn drive_cleanup_with_progress(
     show_progress: bool,
 ) -> CleanupExit {
     worker.begin_terminal();
-    if show_progress
-        && let Some((singles, estimate_secs)) = worker.stop_estimate()
-    {
+    if show_progress && let Some((singles, estimate_secs)) = worker.stop_estimate() {
         write_stop_estimate_line(out, singles, estimate_secs);
     }
     let mut first_poll = true;
@@ -2467,8 +2465,9 @@ mod tests {
             "got: {text}"
         );
         assert!(
-            !text.lines().any(|line| line.contains("links released")
-                && !line.contains("cleanup completed")),
+            !text
+                .lines()
+                .any(|line| line.contains("links released") && !line.contains("cleanup completed")),
             "no progress line by default, got: {text}"
         );
     }

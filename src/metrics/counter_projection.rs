@@ -277,18 +277,6 @@ impl CaptureSnapshot {
             },
         ))
     }
-
-    fn require_terminal(self) -> anyhow::Result<Self> {
-        if !self.new_acquisition || self.counter().is_some_and(|snapshot| !snapshot.is_fresh()) {
-            anyhow::bail!(
-                "terminal counter collection unavailable ({})",
-                self.counter()
-                    .and_then(CounterSnapshot::failure)
-                    .map_or("new_observation_required", CounterFailure::name)
-            );
-        }
-        Ok(self)
-    }
 }
 
 /// The one collection owner shared by live snapshots and final publication.
@@ -500,12 +488,12 @@ impl CaptureCollection {
         generation: NonZeroU64,
         kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
-        // Always acquire, observe and project again. An Ok read with a folded
-        // row issue, health refusal or collector failure is not a settled read.
+        // Always acquire, observe and project again. A failed terminal read
+        // publishes the last good snapshot as stale with its failure name;
+        // only a capture that never acquired a snapshot fails.
         self.fresh_with(
             plan, pins, profile, binding, acquire, legacy, generation, kernel,
-        )?
-        .require_terminal()
+        )
     }
 }
 
@@ -1763,6 +1751,83 @@ pub(super) mod tests {
             evidence.verdict();
             assert_eq!(evidence.completeness, "PARTIAL");
         }
+    }
+
+    #[test]
+    fn terminal_failure_publishes_last_good_stale_with_gap() {
+        use p11scope_ebpf_common::CounterMode;
+        // Never-acquired terminal still fails: no snapshot exists to publish.
+        {
+            let mut fresh = ConsumerFixture::new();
+            let error = fresh
+                .terminal(CounterMode::Counts, 1, 5, Some(ConsumerFault::ReadRvs))
+                .expect_err("a terminal without any prior snapshot must fail");
+            assert!(
+                format!("{error:#}").contains("counter collection unavailable"),
+                "{error:#}"
+            );
+        }
+        // A terminal read failure after a good snapshot publishes the last
+        // good rows as stale with a named failure and a PARTIAL gap.
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let terminal = fixture
+            .terminal(CounterMode::Counts, 1, 9, Some(ConsumerFault::ReadRvs))
+            .expect("terminal must publish the last good snapshot as stale");
+        assert_eq!(terminal.reports()[0].calls, 5);
+        assert!(terminal.has_counter_gap());
+        let metadata = terminal.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "stale");
+        assert_eq!(metadata["failure"], "read_rvs");
+        assert_eq!(metadata["mode"], "counts");
+        assert_eq!(metadata["generation"], 1);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "COMPLETE");
+        crate::render::apply_counter_snapshot(&mut evidence, &terminal);
+        assert_eq!(evidence.completeness, "PARTIAL");
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"counter_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn terminal_success_after_good_snapshot_stays_fresh() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let terminal = fixture
+            .terminal(CounterMode::Counts, 1, 8, None)
+            .expect("a clean terminal read stays fresh");
+        assert_eq!(terminal.reports()[0].calls, 8);
+        assert!(!terminal.has_counter_gap());
+        assert!(ConsumerFixture::terminal_eligible(&terminal));
+        let metadata = terminal.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "fresh");
+        assert!(metadata["failure"].is_null());
+        assert_eq!(metadata["mode"], "counts");
+        assert_eq!(metadata["generation"], 1);
+        assert_eq!(metadata["health"]["saturated"], false);
+        assert_eq!(metadata["health"]["contended"], false);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &terminal);
+        assert_eq!(evidence.completeness, "COMPLETE");
+        assert!(
+            !evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"counter_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
     }
 
     #[test]

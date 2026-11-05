@@ -100,7 +100,7 @@ fn profile_counter_cached_ticks_make_zero_native_calls() {
 }
 
 #[test]
-fn profile_counter_terminal_requires_a_new_successful_observation() {
+fn profile_counter_terminal_publishes_last_good_on_failure() {
     use metrics::ConsumerFault;
     use p11scope_ebpf_common::CounterMode;
     for (fault, cause) in [
@@ -128,10 +128,15 @@ fn profile_counter_terminal_requires_a_new_successful_observation() {
         assert_eq!(metadata["failure"], cause);
         assert!(metadata["health"].is_null());
         assert!(!metrics::ConsumerFixture::terminal_eligible(&stale));
-        let error = fixture
+        let terminal = fixture
             .terminal(CounterMode::Counts, 1, 9, Some(fault))
-            .unwrap_err();
-        assert!(error.to_string().contains(cause), "{error:#}");
+            .expect("terminal publishes the last good snapshot as stale");
+        assert_eq!(terminal.reports()[0].calls, 5);
+        assert!(terminal.has_counter_gap());
+        let metadata = terminal.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "stale");
+        assert_eq!(metadata["failure"], cause);
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&terminal));
         assert_eq!(fixture.reads(), (3, 0));
     }
 }

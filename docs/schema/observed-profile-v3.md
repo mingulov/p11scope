@@ -56,8 +56,9 @@ and a finite failure cause; observed saturation or contention remains explicit
 as `saturated` or `contended`. A generation change sets sticky `discontinuity`.
 Either failure or discontinuity adds `counter_collection` to the observation
 gap causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
-An unavailable initial read cannot produce zero measurements, and a terminal
-report requires a new successful collection and projection. This metadata
+An unavailable initial read cannot produce zero measurements. A failed
+terminal read publishes the last good snapshot as stale with `PARTIAL`;
+only a capture that never acquired a snapshot fails. This metadata
 does not select a backend or add capture fields.
 
 When a metrics+counter capture carries an endpoint selection (`--select-endpoint`),

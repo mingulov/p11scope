@@ -1456,14 +1456,16 @@ impl DetachPollPrinter {
 
     /// Print the one-shot estimate (first pending poll, when above
     /// the floor) and the ~1/s progress line for a still-pending
-    /// detach.
+    /// detach. Diagnostics: default stderr keeps the final
+    /// completed/incomplete line only.
     pub(crate) fn poll_pending(
         &mut self,
         worker: &CleanupWorker,
         had_work: bool,
         out: &mut dyn Write,
+        show_progress: bool,
     ) {
-        if !had_work {
+        if !had_work || !show_progress {
             return;
         }
         if !self.estimate_printed {
@@ -1525,13 +1527,28 @@ fn sleep_interruptibly(total: Duration, worker: &CleanupWorker, second_signal: &
 /// remaining closes at exit. Sleeps are sliced so expiry is observed
 /// within ~10 ms even under the 1 s production cadence.
 pub(crate) fn drive_cleanup(
-    mut worker: CleanupWorker,
+    worker: CleanupWorker,
     second_signal: impl Fn() -> bool,
     out: &mut dyn Write,
     poll_interval: Duration,
 ) -> CleanupExit {
+    drive_cleanup_with_progress(worker, second_signal, out, poll_interval, true)
+}
+
+/// [`drive_cleanup`] with the progress and estimate lines gated:
+/// default stderr keeps the final completed/incomplete line only,
+/// and verbose text or the diagnostics switch restores the rest.
+pub(crate) fn drive_cleanup_with_progress(
+    mut worker: CleanupWorker,
+    second_signal: impl Fn() -> bool,
+    out: &mut dyn Write,
+    poll_interval: Duration,
+    show_progress: bool,
+) -> CleanupExit {
     worker.begin_terminal();
-    if let Some((singles, estimate_secs)) = worker.stop_estimate() {
+    if show_progress
+        && let Some((singles, estimate_secs)) = worker.stop_estimate()
+    {
         write_stop_estimate_line(out, singles, estimate_secs);
     }
     let mut first_poll = true;
@@ -1560,7 +1577,9 @@ pub(crate) fn drive_cleanup(
         }
         if second_signal() {
             let progress = worker.progress();
-            write_progress_line(out, &progress);
+            if show_progress {
+                write_progress_line(out, &progress);
+            }
             let _ = writeln!(out, "p11scope: cleanup incomplete");
             return CleanupExit::Interrupted(progress);
         }
@@ -1575,7 +1594,9 @@ pub(crate) fn drive_cleanup(
                 &second_signal,
             );
         } else {
-            write_progress_line(out, &worker.progress());
+            if show_progress {
+                write_progress_line(out, &worker.progress());
+            }
             sleep_interruptibly(poll_interval, &worker, &second_signal);
         }
     }
@@ -2406,6 +2427,47 @@ mod tests {
         assert!(
             (2..=6).contains(&progress_lines),
             "about one line per 100 ms over ~450 ms, got {progress_lines} in: {text}"
+        );
+    }
+
+    /// CLI text: default stderr keeps the final completed line only;
+    /// progress and estimate lines stay behind the diagnostics switch.
+    #[test]
+    fn gated_drive_keeps_only_the_final_cleanup_line() {
+        let worker = CleanupWorker::pre_start_with(
+            legacy_test_closer(Box::new(|_link, _| {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })),
+            scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
+        );
+        worker.submit(
+            vec![
+                multi(ProducerProgram::UProbe("p11_entry")),
+                multi(ProducerProgram::UProbe("p11_return")),
+                multi(ProducerProgram::RawTracePoint("sched_process_exit")),
+            ],
+            Arc::default(),
+            DetachOrder,
+        );
+        let mut out = Vec::new();
+        let exit = drive_cleanup_with_progress(
+            worker,
+            || false,
+            &mut out,
+            Duration::from_millis(100),
+            false,
+        );
+        assert!(matches!(exit, CleanupExit::Completed(_)));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup completed, 3/3 links released"),
+            "got: {text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.contains("links released")
+                && !line.contains("cleanup completed")),
+            "no progress line by default, got: {text}"
         );
     }
 

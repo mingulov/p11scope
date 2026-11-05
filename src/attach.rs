@@ -1969,11 +1969,12 @@ impl OwnedProducerDetach {
         // notice to captures which owned no native producers.
         let mut quiet = std::io::sink();
         let output: &mut dyn std::io::Write = if had_work { out } else { &mut quiet };
-        let exit = drive_cleanup(
+        let exit = cleanup_worker::drive_cleanup_with_progress(
             worker,
             second_signal,
             output,
             std::time::Duration::from_secs(1),
+            crate::run::capture_diagnostics_on(),
         );
         *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
         let complete =
@@ -2029,7 +2030,12 @@ impl OwnedProducerDetach {
         let started = *started;
         let had_work = *had_work;
         let Some(receipt) = worker.try_join() else {
-            progress.poll_pending(worker, had_work, out);
+            progress.poll_pending(
+                worker,
+                had_work,
+                out,
+                crate::run::capture_diagnostics_on(),
+            );
             return Ok(ProducerDetachProgress::Pending);
         };
         *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));

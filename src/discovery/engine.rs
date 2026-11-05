@@ -5403,6 +5403,8 @@ impl DiscoveryCounters {
     }
 
     /// What discovery ended up with, on stderr, before the capture starts.
+    /// The unreadable-scan warning always prints; the statistics line is
+    /// diagnostics, behind verbose text or the opt-in switch.
     fn report(&self, plan: &plan::AttachPlan) {
         if let Some(reason) = self.scan_unavailable {
             eprintln!(
@@ -5410,15 +5412,17 @@ impl DiscoveryCounters {
                  --manifest offsets are attached uncorroborated"
             );
         }
-        eprintln!(
-            "p11scope: discovery: {} module(s), {} attach slot(s), scan {}ms, \
-             conflicts {}, uncorroborated {}",
-            plan.modules.len(),
-            plan.slots.len(),
-            self.scan_ms,
-            self.conflicts,
-            self.uncorroborated,
-        );
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: discovery: {} module(s), {} attach slot(s), scan {}ms, \
+                 conflicts {}, uncorroborated {}",
+                plan.modules.len(),
+                plan.slots.len(),
+                self.scan_ms,
+                self.conflicts,
+                self.uncorroborated,
+            );
+        }
     }
 }
 
@@ -7155,17 +7159,23 @@ fn discover_plan(
     // Task 3.2 (S1): one categorical summary per noise class instead of one
     // line per skipped view. Cleared here so live accumulation starts fresh
     // and a later rebuild cannot re-merge initial noise.
-    discovered.counters.noise.report();
+    if crate::run::capture_diagnostics_on() {
+        discovered.counters.noise.report();
+    }
     discovered.counters.noise.clear();
     discovered.base_counters.noise.clear();
     for input in discovered.scan_inputs.values_mut() {
         input.counters.noise.clear();
     }
-    for refused in &discovered.plan.modules_skipped {
-        eprintln!(
-            "{}",
-            format_module_refusal(&refused.subject, &refused.reason)
-        );
+    // The concise report already names refused providers with the
+    // `--module` remedy; the per-module repeats are diagnostics.
+    if crate::run::capture_diagnostics_on() {
+        for refused in &discovered.plan.modules_skipped {
+            eprintln!(
+                "{}",
+                format_module_refusal(&refused.subject, &refused.reason)
+            );
+        }
     }
     discovered.counters.report(&discovered.plan);
     Ok(discovered)
@@ -8867,7 +8877,9 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
     // Stale removals happen during attach preparation, after the initial
     // report: flush their summaries now so the operator sees them before the
     // capture starts, and live accumulation starts fresh.
-    discovered.counters.noise.report();
+    if crate::run::capture_diagnostics_on() {
+        discovered.counters.noise.report();
+    }
     discovered.counters.noise.clear();
     discovered.base_counters.noise.clear();
     for input in discovered.scan_inputs.values_mut() {
@@ -30350,8 +30362,11 @@ impl Engine {
     /// Task 3.2 (S1): flush live-accumulated discovery noise as per-class
     /// summaries. Called once at capture end; initial noise was already
     /// reported and cleared by `discover_plan`, so this covers live only.
+    /// Diagnostics: default stderr keeps readiness and warnings only.
     pub fn report_discovery_noise(&mut self) {
-        self.counters.noise.report();
+        if crate::run::capture_diagnostics_on() {
+            self.counters.noise.report();
+        }
         self.counters.noise.clear();
     }
 

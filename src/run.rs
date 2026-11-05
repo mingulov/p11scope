@@ -5239,8 +5239,28 @@ fn observe_capture_cancel(
 /// The one readiness line, printed on stderr once probes are attached and the
 /// capture loop starts. The live frame is TTY-only, so scripts and supervisors
 /// wait for this line instead of guessing when calls start being observed.
-pub(crate) fn capture_ready_line(attached_probes: usize) -> String {
-    format!("p11scope: capturing: {attached_probes} probe(s) attached; stop with Ctrl-C")
+/// Extra capture diagnostics on stderr: verbose text or the explicit
+/// opt-in switch. Default stderr keeps the readiness line and real
+/// warnings only; progress, statistics and all-clear lines stay behind
+/// this gate.
+pub(crate) fn capture_diagnostics_on() -> bool {
+    crate::cli::text_is_verbose()
+        || std::env::var("P11SCOPE_CAPTURE_DIAGNOSTICS").as_deref() == Ok("1")
+}
+
+pub(crate) fn capture_ready_line(attached_probes: usize, owned: bool) -> String {
+    if attached_probes == 0 {
+        return if owned {
+            "p11scope: capturing: waiting for the command to load a provider; stop with Ctrl-C"
+                .to_string()
+        } else {
+            "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C".to_string()
+        };
+    }
+    format!(
+        "p11scope: capturing: {attached_probes} probe{} attached; stop with Ctrl-C",
+        if attached_probes == 1 { "" } else { "s" },
+    )
 }
 
 fn loader_readiness_line(active_hooks: usize) -> String {
@@ -5254,8 +5274,11 @@ pub(crate) fn attach_fallback_line(fallback: Option<&str>) -> Option<String> {
     fallback.map(|reason| format!("p11scope: attach backend: per-offset links ({reason})"))
 }
 
-fn target_exit_marker(ticks: u64) -> String {
-    format!("p11scope: capture ended: target exited after {ticks} ticks")
+/// A non-owned target's exit ends the capture: one plain line naming
+/// it. Owned runs name the child's status instead, so they never
+/// print this marker.
+fn target_exit_marker() -> String {
+    "p11scope: capture ended: target exited".to_string()
 }
 
 /// The plain-words stderr line emitted beside the target-exit marker when
@@ -5532,7 +5555,7 @@ pub(crate) fn stop_quiescence_for(state: StopState) -> render::StopQuiescence {
 /// stalls here for the full budget with no other symptom).
 fn quiescence_unproven_line(waited: Duration, in_flight: u64) -> String {
     format!(
-        "p11scope: terminal quiescence: QuiescenceUnproven after {waited:?}, {in_flight} calls still in flight"
+        "p11scope: terminal quiescence unproven after {waited:?}, {in_flight} calls still in flight"
     )
 }
 
@@ -5782,8 +5805,13 @@ fn capture_profile(
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         emit_capture_diagnostic(&line);
     }
-    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
-    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
+    if capture_diagnostics_on() {
+        emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    }
+    emit_capture_diagnostic(&capture_ready_line(
+        session.attached_probes(),
+        owned.is_some(),
+    ));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
@@ -6063,7 +6091,10 @@ fn capture_profile(
         );
     };
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        // Owned runs name the child's status instead of this marker.
+        if owned.is_none() {
+            let _ = crate::sink::try_stderr_line(&target_exit_marker());
+        }
         if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
         {
             let _ = crate::sink::try_stderr_line(&line);
@@ -6098,7 +6129,12 @@ fn capture_profile(
     );
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
-    let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // Findings always warn; a clean or unavailable detector is diagnostics.
+    if capture_diagnostics_on()
+        || scheduling.longrun_has_findings(loop_event_loss.is_some())
+    {
+        let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    }
     // K0: snapshot the exec witness while the tap is still live.
     // Quiescence invalidates the PID lifecycle tap (and the later
     // terminal drain would too), so a snapshot past this point always
@@ -6907,8 +6943,13 @@ fn capture_trace(
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         emit_capture_diagnostic(&line);
     }
-    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
-    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
+    if capture_diagnostics_on() {
+        emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    }
+    emit_capture_diagnostic(&capture_ready_line(
+        session.attached_probes(),
+        owned.is_some(),
+    ));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -7157,7 +7198,10 @@ fn capture_trace(
         STOP_QUIESCE_BUDGET.saturating_sub(stop_started.elapsed()),
     );
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        // Owned runs name the child's status instead of this marker.
+        if owned.is_none() {
+            let _ = crate::sink::try_stderr_line(&target_exit_marker());
+        }
         if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
         {
             let _ = crate::sink::try_stderr_line(&line);
@@ -7187,7 +7231,12 @@ fn capture_trace(
         loop_end_reason,
     );
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
-    let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // Findings always warn; a clean or unavailable detector is diagnostics.
+    if capture_diagnostics_on()
+        || scheduling.longrun_has_findings(loop_event_loss.is_some())
+    {
+        let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    }
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -8202,6 +8251,14 @@ impl SchedulingAccumulator {
             || "p11scope: longrun: unavailable (no completed tick or complete loss samples)".into(),
             |report| report.report_line(),
         )
+    }
+
+    /// True when the long-run detector has findings worth warning
+    /// about. A clean or unavailable detector stays behind the
+    /// diagnostics gate; findings always print.
+    fn longrun_has_findings(&self, end_loss_available: bool) -> bool {
+        self.longrun_report(end_loss_available)
+            .is_some_and(|report| !report.is_clean())
     }
 
     pub(crate) fn note_live_drain(&mut self, outcome: &ReadyOutcome) {
@@ -16354,6 +16411,24 @@ mod tests {
         }
     }
 
+    /// CLI text: only a detector with findings warns on default
+    /// stderr; a clean or unavailable detector stays diagnostics.
+    #[test]
+    fn longrun_findings_gate_the_stderr_warning() {
+        let quiet = SchedulingAccumulator::default();
+        assert!(!quiet.longrun_has_findings(true));
+        let mut clean = SchedulingAccumulator::default();
+        clean.note_longrun_first_loss(Some(0), 0, true);
+        clean.note_longrun_tick(1, Duration::from_millis(50));
+        clean.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(!clean.longrun_has_findings(true));
+        let mut loud = SchedulingAccumulator::default();
+        loud.note_longrun_first_loss(Some(0), 0, true);
+        loud.note_longrun_tick(1, Duration::from_millis(1_895) + Duration::from_nanos(1));
+        loud.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(loud.longrun_has_findings(true));
+    }
+
     #[test]
     fn capture_longrun_gap_and_loss_stop_at_capture_end() {
         let mut acc = SchedulingAccumulator::default();
@@ -17612,12 +17687,26 @@ mod tests {
     #[test]
     fn capture_ready_line_names_probes_and_how_to_stop() {
         assert_eq!(
-            capture_ready_line(136),
-            "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"
+            capture_ready_line(136, false),
+            "p11scope: capturing: 136 probes attached; stop with Ctrl-C"
         );
         assert_eq!(
-            capture_ready_line(0),
-            "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"
+            capture_ready_line(1, false),
+            "p11scope: capturing: 1 probe attached; stop with Ctrl-C"
+        );
+    }
+
+    /// CLI text: with nothing attached yet, the readiness line says
+    /// what the capture waits for instead of reading as a failure.
+    #[test]
+    fn capture_ready_line_waits_for_the_provider_when_nothing_attached() {
+        assert_eq!(
+            capture_ready_line(0, true),
+            "p11scope: capturing: waiting for the command to load a provider; stop with Ctrl-C"
+        );
+        assert_eq!(
+            capture_ready_line(0, false),
+            "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C"
         );
     }
 
@@ -17634,10 +17723,10 @@ mod tests {
     }
 
     #[test]
-    fn target_exit_marker_names_the_tick_count() {
+    fn target_exit_marker_says_the_target_exited() {
         assert_eq!(
-            target_exit_marker(12),
-            "p11scope: capture ended: target exited after 12 ticks"
+            target_exit_marker(),
+            "p11scope: capture ended: target exited"
         );
     }
 
@@ -18522,7 +18611,7 @@ mod tests {
     fn quiescence_unproven_line_names_waited_and_in_flight() {
         let line = quiescence_unproven_line(Duration::from_secs(5), 3);
         assert!(
-            line.contains("QuiescenceUnproven"),
+            line.contains("quiescence unproven"),
             "the state must be named: {line}"
         );
         assert!(line.contains("5s"), "the waited budget: {line}");

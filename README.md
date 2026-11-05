@@ -18,8 +18,9 @@ snapshots support offline comparison; detailed profiles support investigation.
 > counts (`inventory --key-operations`), a counter capture can promote
 > one endpoint to full detail (`--select-endpoint`), repeatable
 > `--exclude-module` skips named providers, more provider tables prove
-> complete instead of reading PARTIAL, and live capture resolves newer
-> kernels (7.3, 7.4-rc1). Read the
+> complete instead of reading PARTIAL, text output is concise by default
+> with `-v` for details, and live capture resolves 7.3 while the
+> Detailed object loads on 7.4-rc1. Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on a
 > capture. `--system` selects whole-machine scope;
@@ -66,8 +67,9 @@ sudo p11scope inventory --system --duration 30s
 sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 ```
 
-Inventory has 4,096 physical endpoint IDs by default, configurable from 1 to
-8,192 with `--max-endpoints`. An endpoint is a provider object plus function
+Inventory holds up to 131,072 physical endpoint IDs with
+`--max-endpoints`; `inventory --system` on hosts with uprobe_multi defaults
+to 32,768. An endpoint is a provider object plus function
 offset, not a process. Detailed per-call capture has a separate 512-slot limit
 in release builds. These are different modes and budgets; unloading does not
 refund Inventory IDs during a capture.
@@ -481,29 +483,35 @@ report format.
 - `inspect` shows every provider-shaped module mapped by the target; an
   optional `--module` only narrows that set. A target whose memory maps it
   cannot read is an error (exit 1), never an empty module list. On the
-  measured p11-kit stack, p11-kit's fixed closure array exceeds the 512-slot
-  ceiling and is refused whole, while the later-fitting SoftHSM2 backend
-  attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
-  layer was captured.
+  measured p11-kit stack, the one-shot `inspect` verdict refuses p11-kit's
+  fixed closure array whole — it exceeds the 512-slot ceiling — while the
+  later-fitting SoftHSM2 backend attaches; the report is explicitly
+  `PARTIAL`, not a claim that the proxy layer was captured. A live capture
+  instead admits the forwarding layer by what it publishes (below), so the
+  layer itself is never refused outright.
 - Detailed per-call capture has 512 attach slots in release builds; this is
-  separate from Inventory's 4,096 default / 8,192 maximum physical endpoints
-  and the explicit aggregate counter modes. Detailed `--pid`, `run`, and any capture aimed with
-  `--module` admit providers in discovery order. A recognized proxy closure
-  array is decided after every provider: whole when it fits (late-start,
-  reserve-capped), otherwise a reserve-capped leading-templates prefix with
-  a named partial gap only when the capture's first plan held the closure
-  beside a non-closure provider, or when its opened file matches an
-  operator-named `--module` path, and its published tables only when
-  unnamed (mapped mid-capture, or alone in the first plan) — refused
-  whole when none of those admit. The prefix leaves at least the reserve (128 of 512 slots) free, so one
-  later standard function list (at most 104 entries) always fits; a second
-  later provider may not fit and is then refused by name with the
-  `--exclude-module` remedy. A `--cgroup` or `--system`
-  capture without `--module` admits each provider whole or not at all, by
-  value — `--manifest` providers first, then providers whose function table
-  is corroborated, then heuristic finds, proxy closure arrays last (closures:
-  whole, or their published tables when the heuristic set is refused — never
-  a heuristic prefix). Heuristic finds and closure arrays may not use the last
+  separate from Inventory's endpoint budget (32,768 by default on
+  `inventory --system` with uprobe_multi, up to 131,072 with
+  `--max-endpoints`) and the explicit aggregate counter modes. Detailed
+  `--pid`, `run`, and any capture aimed with `--module` admit providers in
+  discovery order. A recognized forwarding layer (such as the p11-kit proxy
+  closure array) is decided after every provider and admitted by what it
+  publishes: only tables the application actually received attach, taking
+  no heuristic slots, so the layer can never crowd out a real provider.
+  Calls it forwards are counted at the attached backend providers, named
+  with counts on the gap line; calls the layer answers itself are not
+  counted. An operator-named layer (`--module <path>`) is the sole
+  exception: it keeps a reserve-capped leading-templates prefix, because
+  a remote client's tables are handed out before any export probe can
+  observe the return. The prefix leaves at least the reserve (128 of 512
+  slots) free, so one later standard function list (at most 104 entries)
+  always fits. A `--cgroup` or `--system`
+  capture without `--module` admits each provider by value —
+  `--manifest` providers first, then providers whose function table
+  is corroborated, then heuristic finds, forwarding layers last. An
+  ordinary provider that does not fit is admitted on the leading prefix
+  that fits with a named partial gap; operator-attested (`--manifest`)
+  modules stay whole-only. Heuristic finds may not use the last
   128 slots (25%), which stay free for corroborated providers found later in
   the capture. A refusal names what holds the slots; in such a shared capture
   it also names the reserve and suggests `--module`. The terminal report names
@@ -540,10 +548,11 @@ report format.
   default `allowlisted` policy this holds against hostile pointer placement,
   not merely trusted ABI-valid callers.
 - **Privacy-first 1.0 boundary.** The default release reports bounded function,
-  registered-mechanism, return-code, latency, and lifecycle evidence. It does
-  not correlate object handles and does not promise symbolic `CKA_CLASS` or
-  `CKA_KEY_TYPE` output. The existing unsafe diagnostic build does not enlarge
-  the default allowlist.
+  registered-mechanism, return-code, latency, and lifecycle evidence. By
+  default it does not correlate object handles (the opt-in `inventory
+  --key-operations` adds per-key rows) and does not promise symbolic
+  `CKA_CLASS` or `CKA_KEY_TYPE` output. The existing unsafe diagnostic build
+  does not enlarge the default allowlist.
 - A trace is evidence about the observed window only; the profile includes an
   explicit evidence-quality/completeness section (attach failures, aliased
   functions, event loss) — `COMPLETE`/`PARTIAL`, never silently confident.
@@ -577,8 +586,8 @@ provider file and are within the capture scope, one attachment can observe
 their calls after the probes are installed, including calls from later pods.
 Separate overlay instances and copy-up need additional identity handling;
 they do not inherit that guarantee. A process retaining a pre-copy-up mapping
-can currently be attributed to the new file and have calls missed without a
-runtime marker, on both identity backends. See the
+reads `unknown` with the `original_file_unproven` gap, and its later calls
+past the copy-up are missed, on both identity backends. See the
 [copy-up limitation and restart workaround](docs/known-limitations.md#overlay-xinocopy-up-identity-divergences-d-c7-2d-c7-3).
 
 The v0.5.0 Knative warm capture observed 1,200/1,200 calls. Its cold first

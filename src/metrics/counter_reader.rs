@@ -1227,6 +1227,152 @@ mod tests {
     }
 
     #[test]
+    fn first_read_fold_gap_keeps_rows_slot_aligned() {
+        // A first-read bank gap must not shorten the row vector: the
+        // failed non-last slot folds a zero placeholder (unknown, named
+        // by failed_slots) so the rows stay slot-aligned with later
+        // exact reads instead of latching Topology on a positional
+        // mismatch.
+        let pool = test_pool();
+        let history = plan();
+        let mut source = Scripted::sample(CounterMode::Counts, false);
+        source.stats.remove(&0);
+        let read = acquire(
+            &source,
+            NonZeroU64::new(19).unwrap(),
+            &history,
+            CounterLimits {
+                rows: 3,
+                rv_keys: 12,
+            },
+            &pool.reserver(),
+        )
+        .expect("a first-read bank gap must stay slot-aligned");
+        let view = read.view();
+        let rows = view.rows.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].view().slot, 0);
+        assert_eq!(
+            (
+                rows[0].view().entered,
+                rows[0].view().returned,
+                rows[0].view().errors
+            ),
+            (0, 0, 0),
+            "failed slot folds zero as unknown"
+        );
+        assert!(
+            rows[0].view().rv_counts.is_empty(),
+            "failed slot drops its RVs like the legacy zero-with-gap path"
+        );
+        assert_eq!(rows[1].view().slot, 1);
+        assert_eq!(rows[1].view().returned, 1);
+        assert_eq!(view.gaps.failed_slots, 1);
+        assert!(!view.gaps.health_failed);
+        assert!(!view.gaps.kernel_failed);
+    }
+
+    #[test]
+    fn first_read_fold_gap_then_exact_recovers_without_latch() {
+        // First read gaps a non-last slot, the second exact read must
+        // telescope from the partial baseline, and a third exact read
+        // must still advance (no sticky Topology latch).
+        let pool = test_pool();
+        let history = plan();
+        let limits = CounterLimits {
+            rows: 4,
+            rv_keys: 12,
+        };
+        let generation = NonZeroU64::new(19).unwrap();
+        let mut collector = CounterCollector::new(limits, pool.reserver());
+        let mut gapped = Scripted::sample(CounterMode::Counts, false);
+        gapped.stats.remove(&0);
+        let initial = acquire(&gapped, generation, &history, limits, &pool.reserver()).unwrap();
+        assert_eq!(initial.view().gaps.failed_slots, 1);
+        assert_eq!(collector.observe(Ok(initial)), CounterObservation::Initial);
+        let exact = Scripted::sample(CounterMode::Counts, true);
+        let second = acquire(&exact, generation, &history, limits, &pool.reserver()).unwrap();
+        assert!(second.view().gaps.is_clean());
+        let observed = collector.observe(Ok(second));
+        let CounterObservation::Advanced { deltas, .. } = observed else {
+            panic!("exact recovery after a first-read bank gap must telescope, got {observed:?}");
+        };
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| (delta.slot, delta.entered, delta.returned))
+                .collect::<Vec<_>>(),
+            [(0, 8, 9), (1, 1, 1)],
+            "telescoped deltas count from the zero placeholder"
+        );
+        let again = Scripted::sample(CounterMode::Counts, true);
+        let third = acquire(&again, generation, &history, limits, &pool.reserver()).unwrap();
+        assert!(
+            matches!(
+                collector.observe(Ok(third)),
+                CounterObservation::Advanced { .. }
+            ),
+            "a third exact read must still advance, not latch"
+        );
+    }
+
+    #[test]
+    fn generation_change_fold_gap_then_exact_recovers_without_latch() {
+        // Same recovery across a generation change: the new
+        // generation's first read gaps a non-last slot, the next
+        // exact read in that generation must telescope.
+        let pool = test_pool();
+        let history = plan();
+        let limits = CounterLimits {
+            rows: 4,
+            rv_keys: 12,
+        };
+        let mut collector = CounterCollector::new(limits, pool.reserver());
+        let first = Scripted::sample(CounterMode::Counts, false);
+        let initial = acquire(
+            &first,
+            NonZeroU64::new(19).unwrap(),
+            &history,
+            limits,
+            &pool.reserver(),
+        )
+        .unwrap();
+        assert_eq!(collector.observe(Ok(initial)), CounterObservation::Initial);
+        let mut gapped = Scripted::sample(CounterMode::Counts, true);
+        gapped.stats.remove(&0);
+        let changed = acquire(
+            &gapped,
+            NonZeroU64::new(20).unwrap(),
+            &history,
+            limits,
+            &pool.reserver(),
+        )
+        .unwrap();
+        assert_eq!(changed.view().gaps.failed_slots, 1);
+        assert_eq!(
+            collector.observe(Ok(changed)),
+            CounterObservation::GenerationChanged {
+                previous: 19,
+                current: 20,
+            }
+        );
+        let exact = Scripted::sample(CounterMode::Counts, true);
+        let recovered = acquire(
+            &exact,
+            NonZeroU64::new(20).unwrap(),
+            &history,
+            limits,
+            &pool.reserver(),
+        )
+        .unwrap();
+        let observed = collector.observe(Ok(recovered));
+        assert!(
+            matches!(observed, CounterObservation::Advanced { .. }),
+            "exact recovery after a generation-change bank gap must telescope, got {observed:?}"
+        );
+    }
+
+    #[test]
     fn banked_health_failure_degrades_evidence_keeps_folded_rows() {
         // Health read fails after rows folded; rows stay exact with a
         // degraded-evidence gap, instead of voiding the read.

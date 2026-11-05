@@ -20707,3 +20707,260 @@ fn key_operation_joint_resumes_at_next_clean_point() {
         observations.unattributed
     );
 }
+
+/// Late attach: an instance registered without a witnessed birth
+/// keeps its S1 counts and counts its calls as
+/// `started_before_attach`, while a Joint sibling that started
+/// cleanly attributes exactly. One capture, partial honesty.
+#[test]
+fn key_operation_late_attach_counts_and_joint_sibling_attributes() {
+    let mut guarded = GuardedScene::new();
+    let (late_key, _) = guarded.register(1);
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(2);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(51);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: 2,
+        }],
+        "the pre-attach instance's two calls count once each"
+    );
+    let joint_completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(joint_completed, 1, "the clean Joint sign attributes");
+    let late_completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.reason == "unbound")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(late_completed, 1, "the late sign keeps its S1 count");
+}
+
+/// A foreign (unbound) caller mid-capture is refused and counted;
+/// the proven caller's Joint rows are untouched.
+#[test]
+fn key_operation_foreign_caller_counts_without_ending_joint() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // One call from a caller the instance is not bound to.
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded
+        .registry
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            joint_key.clone(),
+            CallerId(99),
+            position,
+            facts,
+        ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+
+    // The proven caller continues exactly.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    let observations = guarded.registry.joint_observations(52);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert!(
+        observations.unattributed.iter().any(|row| {
+            row.reason == "foreign_or_unproven_caller" && row.count == 1
+        }),
+        "the foreign call counts once: {:?}",
+        observations.unattributed
+    );
+    let completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum::<u64>()
+        + observations
+            .key_operations
+            .iter()
+            .filter(|row| row.category == "sign")
+            .map(|row| row.completed)
+            .sum::<u64>();
+    assert_eq!(completed, 1, "only the proven sign completes");
+}
+
+/// A lost staged record disposes as counted history; the same feed
+/// above the barrier and a sibling instance keep attributing.
+#[test]
+fn key_operation_lost_record_counts_and_siblings_continue() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (sibling_key, _) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // Stage one more init, then lose it below a barrier.
+    let (facts, staged_at) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, staged_at, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let barrier = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(barrier > staged_at, "non-vacuous: barrier above the queue");
+    guarded.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(joint_key.clone()),
+        position(guarded.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 0);
+
+    // Above the barrier the feed attributes again; the sibling
+    // was never touched.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    guarded.drive_s1only(&sibling_key, &init);
+    guarded.drive_s1only(&sibling_key, &sign);
+
+    let observations = guarded.registry.joint_observations(53);
+    assert!(
+        observations
+            .unattributed
+            .iter()
+            .any(|row| row.reason == "record_lost" && row.count == 1),
+        "the disposed record counts once: {:?}",
+        observations.unattributed
+    );
+    let joint_completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(joint_completed, 2, "both Joint signs attribute");
+}
+
+/// The v3 schema file mirrors the frozen contract tables: section
+/// keys, the unattributed row keys, the reason enum, and the
+/// version constant cannot drift from the renderer.
+#[test]
+fn key_operation_schema_v3_pins_unattributed_contract() {
+    use crate::key_operation_projection::contract::{SECTION_KEYS_V3, UNATTRIBUTED_ROW_KEYS};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v3.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 3);
+    assert_eq!(
+        required("/required"),
+        sorted(SECTION_KEYS_V3.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        required("/$defs/unattributed_row/required"),
+        sorted(
+            UNATTRIBUTED_ROW_KEYS
+                .iter()
+                .map(|key| key.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(
+        required("/$defs/unattributed_row/properties/reason/enum"),
+        sorted(
+            crate::key_operation_projection::UNATTRIBUTED_REASONS
+                .iter()
+                .map(|reason| reason.to_string())
+                .collect()
+        )
+    );
+}

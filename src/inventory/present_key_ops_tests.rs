@@ -240,6 +240,29 @@ fn key_ops_line_unavailable_names_reason() {
 }
 
 #[test]
+fn key_ops_line_counts_not_attributed_beside_exact_rows() {
+    let mut observations = populated(9);
+    observations.status = ObsStatus::Partial;
+    observations.reason = "authority_lost";
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 4, 0, 0, "operations"));
+    observations.add_unattributed("record_lost", 2);
+    observations.add_unattributed("proof_refused_fallback", 3);
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let line = key_ops_line(&snapshot);
+    assert!(
+        line.contains("sign 4 completed, 0 failed, 0 active operations"),
+        "exact rows stay: {line}"
+    );
+    assert!(
+        line.ends_with("; not attributed: record_lost 2, proof_refused_fallback 3"),
+        "counts sit beside the rows in frozen order: {line}"
+    );
+}
+
+#[test]
 fn key_ops_line_journal_unavailable_names_tracking_off() {
     let presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));

@@ -1262,14 +1262,14 @@ class AsyncStreamTwins(unittest.TestCase):
             oracle.compare_stream(stream, collision, joint, "joint")
         with self.subTest("unknown row version refused"):
             stream = healthy_stream(collision, joint)
-            stream[0]["event"]["version"] = 3
+            stream[0]["event"]["version"] = 99
             with self.assertRaisesRegex(oracle.LedgerError, "version"):
                 oracle.compare_stream(stream, collision, joint, "joint")
         with self.subTest("unknown marker version refused"):
             stream = healthy_stream(collision, joint)
             marker = next(line for line in stream
                           if line["kind"] == "pass_committed")
-            marker["event"]["object_version"] = 3
+            marker["event"]["object_version"] = 99
             with self.assertRaisesRegex(oracle.LedgerError, "version"):
                 oracle.compare_stream(stream, collision, joint, "joint")
 
@@ -1665,7 +1665,7 @@ class AsyncVersionDispatchTwins(unittest.TestCase):
     def test_cli_unknown_snapshot_version_refused_before_rows(self):
         require_oracle(self)
         oracle = ORACLE
-        for version in (0, 3, 99, True, "2"):
+        for version in (0, 99, True, "2"):
             with self.subTest(version=version):
                 _collision, joint, single = paired(oracle, "poll_msg")
                 joint["version"] = version

@@ -65,6 +65,7 @@ MAX_WORD = (1 << 64) - 1
 INVENTORY_SCHEMA = "p11scope/inventory/v1"
 OBSERVATIONS_VERSION = 1
 OBSERVATIONS_VERSION_V2 = 2
+OBSERVATIONS_VERSION_V3 = 3
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -125,6 +126,12 @@ GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction"
 
 SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects",
                 "key_operations", "unknown_key_operations", "gaps", "budgets"}
+SECTION_KEYS_V3 = SECTION_KEYS | {"unattributed"}
+UNATTRIBUTED_REASONS = ("started_before_attach", "record_lost",
+                        "foreign_or_unproven_caller", "session_state_lost",
+                        "watchdog_no_progress", "unmodelled_call_shape",
+                        "proof_refused_fallback")
+UNATTRIBUTED_ROW_KEYS = {"reason", "count"}
 SESSION_ROW_KEYS = {"session", "origin", "status"}
 OBJECT_ROW_KEYS = {"object", "session", "origin", "creation", "birth", "lifetime",
                    "lifetime_reason", "attribution", "attribution_reason", "requested",
@@ -434,15 +441,37 @@ def _check_budgets(budgets, key_len, object_len, unknown_len):
     _require(budgets["refusal_reason"] == "none", "unexpected budget refusal reason")
 
 
+def _check_unattributed(rows):
+    """Validate v3 not-attributed counters: frozen order, counts only."""
+    _require(type(rows) is list and 1 <= len(rows) <= len(UNATTRIBUTED_REASONS),
+             "invalid unattributed rows")
+    checked = []
+    order = []
+    for row in rows:
+        _keys(row, UNATTRIBUTED_ROW_KEYS)
+        reason = _label(row["reason"], UNATTRIBUTED_REASONS, "unattributed reason")
+        _require(_u64(row["count"]) and row["count"] >= 1,
+                 "invalid unattributed count")
+        order.append(UNATTRIBUTED_REASONS.index(reason))
+        checked.append((reason, row["count"]))
+    _require(order == sorted(order) and len(set(order)) == len(order),
+             "unattributed rows out of frozen order")
+    return checked
+
+
 def check_section(section):
     """Validate the section shape and return the checked facts."""
-    _keys(section, SECTION_KEYS)
-    version = section["version"]
+    version = section.get("version") if type(section) is dict else None
+    _keys(section, SECTION_KEYS_V3 if version == OBSERVATIONS_VERSION_V3
+          else SECTION_KEYS)
     _require(type(version) is int
-             and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2),
+             and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
+                             OBSERVATIONS_VERSION_V3),
              "unsupported observations version")
-    roles = ROLES_V2 if version == OBSERVATIONS_VERSION_V2 else ROLES
-    creations = CREATIONS_V2 if version == OBSERVATIONS_VERSION_V2 else CREATIONS
+    roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
+    creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
+    unattributed = (_check_unattributed(section["unattributed"])
+                    if version == OBSERVATIONS_VERSION_V3 else [])
     _require(_u64(section["revision"]), "invalid observations revision")
     status = _label(section["status"], STATUSES, "status")
     reason = _label(section["reason"], REASONS, "reason")
@@ -469,7 +498,7 @@ def check_section(section):
     gaps = _check_gaps(section["gaps"])
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
-            "unknown": unknown, "gaps": gaps}
+            "unknown": unknown, "gaps": gaps, "unattributed": unattributed}
 
 
 def _check_mechanism_row(row):

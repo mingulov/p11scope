@@ -68,7 +68,7 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2)
+SNAPSHOT_VERSIONS = (1, 2, 3)
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -555,7 +555,7 @@ def _snapshot_roles(document, tag):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              f"{tag}: snapshot version mismatch")
-    return ROLES_V2 if version == 2 else ROLES
+    return ROLES_V2 if version >= 2 else ROLES
 
 
 def _snapshot_creations(document, tag):
@@ -563,12 +563,12 @@ def _snapshot_creations(document, tag):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              f"{tag}: snapshot version mismatch")
-    return CREATIONS_V2 if version == 2 else CREATIONS
+    return CREATIONS_V2 if version >= 2 else CREATIONS
 
 
 def _row_vocabularies(version):
     """Role and creation vocabularies for one row-event version."""
-    if version == 2:
+    if version >= 2:
         return ROLES_V2, CREATIONS_V2
     return ROLES, CREATIONS
 
@@ -586,11 +586,44 @@ def _check_row_budget(node, where):
     _require(_integer(node["refused"]), f"{where}: budget refused out of range")
 
 
+UNATTRIBUTED_REASONS = ("started_before_attach", "record_lost",
+                        "foreign_or_unproven_caller", "session_state_lost",
+                        "watchdog_no_progress", "unmodelled_call_shape",
+                        "proof_refused_fallback")
+
+
+def _check_unattributed(document, tag):
+    """Validate v3 not-attributed counters: present iff version 3."""
+    if document["version"] != 3:
+        _require("unattributed" not in document,
+                 f"{tag}: unattributed counters before section version 3")
+        return
+    rows = document["unattributed"]
+    _require(type(rows) is list and 1 <= len(rows) <= len(UNATTRIBUTED_REASONS),
+             f"{tag}: snapshot unattributed must be a nonempty bounded list")
+    order = []
+    for position, row in enumerate(rows):
+        where = f"{tag}: snapshot unattributed {position}"
+        _require(type(row) is dict, f"{where} must be an object")
+        _keys(row, {"reason", "count"})
+        _require(row["reason"] in UNATTRIBUTED_REASONS,
+                 f"{where}: reason invalid")
+        _require(_integer(row["count"]) and row["count"] >= 1,
+                 f"{where}: count out of range")
+        order.append(UNATTRIBUTED_REASONS.index(row["reason"]))
+    _require(order == sorted(order) and len(set(order)) == len(order),
+             f"{tag}: snapshot unattributed rows out of frozen order")
+
+
 def validate_snapshot(document, tag):
     """Validate the frozen H9 subset; refuse anything but populated output."""
-    _keys(document, {"version", "revision", "status", "reason", "sessions",
-                     "objects", "key_operations", "unknown_key_operations",
-                     "gaps", "budgets"})
+    keys = {"version", "revision", "status", "reason", "sessions",
+            "objects", "key_operations", "unknown_key_operations",
+            "gaps", "budgets"}
+    if type(document) is dict and document.get("version") == 3:
+        keys |= {"unattributed"}
+    _keys(document, keys)
+    _check_unattributed(document, tag)
     roles = _snapshot_roles(document, tag)
     creations = _snapshot_creations(document, tag)
     _require(_integer(document["revision"]), f"{tag}: snapshot revision out of range")

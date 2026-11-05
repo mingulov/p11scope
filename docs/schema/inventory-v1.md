@@ -860,19 +860,27 @@ rows, object views with requested/established metadata, proved-key
 operation aggregates and unknown-key summaries. The frozen consumer
 contracts are
 [inventory-v1-object-observations.schema.json](inventory-v1-object-observations.schema.json)
-(section version 1) and
+(section version 1),
 [inventory-v1-object-observations-v2.schema.json](inventory-v1-object-observations-v2.schema.json)
-(section version 2); consumers must reject unknown section versions,
+(section version 2) and
+[inventory-v1-object-observations-v3.schema.json](inventory-v1-object-observations-v3.schema.json)
+(section version 3); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` is 1 or 2, following the content: 2 iff a KEM creation
+- `version` follows the content: 3 iff an `unattributed` counter is
+  present, else 2 iff a KEM creation
   (`encapsulate`, `decapsulate`) or role (`encapsulation_key`,
   `decapsulation_key`) label is present, otherwise byte-stable 1.
-  Version 1 is frozen and never carries KEM labels. `revision` is the
+  Versions 1 and 2 are frozen; version 1 never carries KEM labels and
+  neither carries `unattributed`. A feed that fell back or lost
+  authority publishes its retained rows as `partial` with the reason
+  named and its unproved calls counted in `unattributed[]`
+  (`{reason, count}`, finite reasons, frozen order); the section is
+  `unavailable` only when no Joint evidence exists at all. `revision` is the
   publication revision. `status` is
   `populated`, `partial`, `stale` or `unavailable`; `reason` is `none`
   only when populated. A stale publication's rows are historical, not

@@ -1224,6 +1224,40 @@ summed into a global operation denominator. Approval does not enable
 delivery. While H9 delivery is gated, production captures carry
 `object_observations` only as an explicit `unavailable` marker.
 
+## Not-attributed key-operation counters (owner ruling JK-22, 2026-11-05)
+
+**Status: APPROVED by owner ruling JK-22 (2026-11-05).** This section
+scopes section version 3 of
+[docs/schema/inventory-v1-object-observations-v3.schema.json](../schema/inventory-v1-object-observations-v3.schema.json):
+the `object_observations.unattributed` counters and their aggregate
+rendering on the text `key operations:` line. It grants no read: every
+count derives from counters the observer already retains for its own
+accounting (staged-call disposal, fallback replay, unsealable-shape
+refusal, direct reduction without a witnessed birth, and pre-application
+caller refusal). No target memory, argument, template, handle, label,
+PIN or payload is read or published for these rows; `CKA_ID`, object
+handles and labels remain excluded exactly as above.
+
+Each row is exactly one finite reason name and one saturating count of
+calls that carry no per-key row because no key could be proved:
+
+| Reason | What the count means |
+| --- | --- |
+| `started_before_attach` | Direct reductions on a feed registered without a witnessed birth (attach after start, or the birth race). |
+| `record_lost` | Staged calls disposed once as history after bounded loss. |
+| `foreign_or_unproven_caller` | Calls refused before application for an unproven or unbound caller. |
+| `session_state_lost` | Reserved: calls whose session state was lost before a clean point. |
+| `watchdog_no_progress` | Reserved: calls left unsealed across a named no-progress interval. |
+| `unmodelled_call_shape` | Affecting calls the frozen endpoint table cannot seal, reduced S1-direct. Proved-irrelevant info calls are not key operations and never count. |
+| `proof_refused_fallback` | Staged calls a proof-only or ordered fallback replayed S1-direct without object proof. |
+
+Attributed rows beside these counters stay exact: the certainty bar for
+attributing an operation to a key is unchanged, and no counter is ever
+converted into a guessed key row. The key is present exactly when the
+section version is 3, which is exactly when at least one count is
+nonzero; fully attributed publications stay byte-stable at versions 1
+and 2. Profile, trace and metrics never carry these counters.
+
 ## DR04 caller metadata (2026-10-18)
 
 **Status: opt-in implementation contract; installed qualification remains

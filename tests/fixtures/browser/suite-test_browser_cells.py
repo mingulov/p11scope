@@ -217,6 +217,41 @@ class NssSeedCells(unittest.TestCase):
             '[{"pattern": "https://127.0.0.1:*/*", "filter": {}}]')
         self.assertEqual(from_json, ["https://127.0.0.1:*/*"])
 
+    def test_chromium_launch_installs_policy_not_dead_switch(self):
+        """The launch installs the CfT managed policy (and registers
+        its removal at exit) instead of passing the removed
+        `--auto-select-certificate-for-urls` switch."""
+        work = Path(tempfile.mkdtemp(prefix="g33-pol-"))
+        self.addCleanup(shutil.rmtree, work, True)
+        installed = {}
+
+        def fake_install(patterns, name, staging):
+            installed["patterns"] = list(patterns)
+            installed["name"] = name
+            return profiles.CHROME_POLICY_DIR / f"{name}.json"
+
+        class FakeChromium:
+            def launch_persistent_context(self, profile, **kwargs):
+                installed["launch_kwargs"] = kwargs
+                return object()
+
+        class FakePw:
+            chromium = FakeChromium()
+
+        orig = profiles.install_chrome_auto_select_policy
+        profiles.install_chrome_auto_select_policy = fake_install
+        try:
+            cells.launch_browser_context(
+                FakePw(), "chromium", work / "cell",
+                flow_url="https://127.0.0.1:8443/", auto_select_cert=True)
+        finally:
+            profiles.install_chrome_auto_select_policy = orig
+        self.assertIn("https://127.0.0.1:*/*", installed["patterns"])
+        args = installed["launch_kwargs"]["args"]
+        self.assertFalse(
+            any(a.startswith("--auto-select-certificate") for a in args),
+            f"dead switch still passed: {args}")
+
 
 class BrowserCells(unittest.TestCase):
     maxDiff = 4096

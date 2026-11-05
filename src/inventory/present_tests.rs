@@ -2577,3 +2577,68 @@ fn concise_groups_edges_per_provider_without_ids() {
     assert!(verbose.contains("application "), "{verbose}");
     assert!(verbose.contains("incarnation"), "{verbose}");
 }
+
+/// Item 31: the limits line counts edges, like the header and JSON —
+/// never "links".
+#[test]
+fn concise_limits_line_counts_edges_not_links() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    assert!(limits.contains("edge"), "{limits}");
+    assert!(!limits.contains("link"), "{limits}");
+}
+
+/// Item 37: deleted-mapping gaps fold to one plain trailing line in
+/// concise text, never leading the gaps; verbose keeps each record.
+#[test]
+fn concise_deleted_gaps_fold_last_in_plain_words() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(11),
+        subject: "/usr/lib/libpcre2-8.so (deleted)".into(),
+        reason: "deleted mapping".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(12),
+        subject: "/usr/lib/libfoo.so (deleted)".into(),
+        reason: "deleted mapping".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "fixture scope".into(),
+        reason: "fixture reason".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let gaps = out
+        .lines()
+        .find(|line| line.starts_with("gaps:"))
+        .unwrap_or_else(|| panic!("no gaps line: {out}"));
+    assert!(gaps.contains("fixture reason"), "{gaps}");
+    // Deleted mappings fold to one plain trailing group.
+    let deleted = gaps.find("deleted").expect("deleted group missing: {gaps}");
+    let fixture = gaps.find("fixture reason").unwrap();
+    assert!(fixture < deleted, "deleted mappings must not lead: {gaps}");
+    assert!(!gaps.contains("libpcre2"), "{gaps}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains("libpcre2-8.so (deleted)"), "{verbose}");
+}

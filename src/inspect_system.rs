@@ -8719,6 +8719,29 @@ mod tests {
         );
     }
 
+    /// Item 31: concise object headers name the provider file without an
+    /// index; verbose keeps `object[N]` for cross-references.
+    #[test]
+    fn concise_object_header_has_no_index() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        let concise =
+            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(!concise.contains("object[0]"), "{concise}");
+        assert!(concise.contains("/opt/provider.so"), "{concise}");
+        let verbose =
+            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("object[0]"), "{verbose}");
+    }
+
     /// Item 12: concise admitted text says what profile/run would watch;
     /// inspect itself watches nothing.
     #[test]

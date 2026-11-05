@@ -2086,8 +2086,48 @@ impl SemanticCapture {
             return Err(Refusal::StreamCut);
         }
         let admission = crate::attach::BirthAdmissionBinding::from_admitted(admitted);
-        let evidence =
-            crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?;
+        // DEMO-4 late attach: an exec-marker birth falls back to
+        // attach-observed at the same cut only when native truth
+        // shows the task predates this closure — no marker row at
+        // all, or a row the exec hook never stamped (generation 0,
+        // unpublished marker). The attach birth proves custody,
+        // image and closure only; pre-cut history stays
+        // first-observed / not attributed. A task stamped under
+        // this (or a later) closure keeps the closed exec refusal:
+        // its stronger exec/absence proof may still land on a
+        // later candidate, and an early attach birth must not
+        // preempt it. Absence births never take this fallback.
+        let mut birth = birth;
+        let evidence = match crate::attach::observe_retained_birth(
+            rows, binding, attachment, &admission, birth,
+        ) {
+            Ok(evidence) => evidence,
+            Err(refusal)
+                if birth == BirthKind::ExecMarker
+                    && matches!(
+                        refusal,
+                        Refusal::RowUnreadable
+                            | Refusal::MarkerNotReady
+                            | Refusal::GenerationMismatch
+                    ) =>
+            {
+                let predates_closure = match rows.read_marker_row() {
+                    Err(_) => true,
+                    Ok(record) => {
+                        record.exec_attach_gen == 0
+                            && p11scope_ebpf_common::journal_marker::read_word(
+                                record.journal_bootstrap,
+                            ) == p11scope_ebpf_common::journal_marker::MarkerRead::Unpublished
+                    }
+                };
+                if !predates_closure {
+                    return Err(refusal);
+                }
+                birth = BirthKind::AttachObserved;
+                crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?
+            }
+            Err(refusal) => return Err(refusal),
+        };
         let authorization = ValidatedH0Birth {
             proof: *proof,
             birth,

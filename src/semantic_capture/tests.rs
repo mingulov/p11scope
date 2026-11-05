@@ -2296,8 +2296,9 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
     );
     // This already-present provider has no committed absence or later
     // appearance. The native probe can return freshness evidence only.
+    // Generation 0: the task predates the closure.
     let publisher = NativePublisher::build();
-    let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+    let (row, control, _) = publisher.publish_stamped(&["0", "0", "0", "0", "1"], 0);
     let mut rows = NativeBirthRows { row, control };
     let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
     crate::attach::observe_retained_birth(
@@ -2328,12 +2329,16 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
         &harness.adapter,
         &mut rows,
     );
-    assert!(
-        matches!(
-            birth,
-            Err(crate::attach::BirthObservationRefusal::MarkerNotReady)
-        ),
-        "native freshness and a quiet stream cut cannot replace a committed absence and actual new appearance"
+    // DEMO-4 contract change: freshness still cannot authorize an
+    // absence (or exec) birth — the already-present provider instead
+    // births as attach-observed, which claims nothing before its
+    // cut. (Previously this refused MarkerNotReady and the feed
+    // stayed S1Only for the whole capture.)
+    let birth = birth.expect("attach-observed birth for the already-present provider");
+    assert_eq!(
+        birth.receipt().birth(),
+        BirthKind::AttachObserved,
+        "native freshness and a quiet stream cut authorize no absence or exec claim"
     );
     harness.push_ordinary(ImageIdentity::default());
     let mut quiet = harness.collect();
@@ -2369,7 +2374,9 @@ fn joint_attach_birth_for_already_present_provider() {
     quiet.classify_ordinary(&admitted).unwrap();
     let (_, proof) = harness.ingest(quiet, &admitted);
     let publisher = NativePublisher::build();
-    let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+    // Generation 0: the exec hook never stamped this task — it
+    // predates the closure (the already-running browser).
+    let (row, control, _) = publisher.publish_stamped(&["0", "0", "0", "0", "1"], 0);
     let mut rows = NativeBirthRows { row, control };
     let candidate = report
         .take_current()

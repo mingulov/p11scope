@@ -3361,6 +3361,13 @@ impl JournalAuditReceipt {
 pub(crate) enum BirthKind {
     ExecMarker,
     AbsenceAppearance,
+    /// Late attach (DEMO-4): the image already existed (and may
+    /// already have affected provider state) when the observer
+    /// attached. The birth proves custody, image and closure at
+    /// the attach cut only; it claims nothing about history at or
+    /// below the cut, which the object model treats as
+    /// first-observed / not attributed.
+    AttachObserved,
 }
 
 /// Finite birth-attestation refusal.
@@ -3390,6 +3397,10 @@ pub(crate) enum BirthRefusal {
     /// claimed-complete interval includes loss, so the birth refuses
     /// even when its key did not exist at the void.
     BelowVoidFence,
+    /// Attach-observed birth whose retained chain broke after the
+    /// attach cut (an audit failure above the cut and above the
+    /// void fence): history the birth would certify is not clean.
+    AttachHistoryBroken,
 }
 
 /// Session-observed native evidence behind a birth claim: the image
@@ -3505,7 +3516,7 @@ impl SessionBirthEvidence {
     ) -> Self {
         let marker_word = match birth {
             BirthKind::ExecMarker => p11scope_ebpf_common::journal_marker::ready_word(image.1),
-            BirthKind::AbsenceAppearance => 0,
+            BirthKind::AbsenceAppearance | BirthKind::AttachObserved => 0,
         };
         Self {
             image,
@@ -4194,6 +4205,15 @@ impl JournalAdapter {
                     == p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
             }
             BirthKind::AbsenceAppearance => evidence.marker_word == 0,
+            // Attach claims no exec publication: the unmarked word
+            // or this image's own READY word are the only states
+            // consistent with it. DIRTY, invalid, or another exec's
+            // READY refuse — the marker proves a different story.
+            BirthKind::AttachObserved => {
+                evidence.marker_word == 0
+                    || p11scope_ebpf_common::journal_marker::read_word(evidence.marker_word)
+                        == p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
+            }
         };
         if !marker_ok {
             return Err(BirthRefusal::EvidenceMismatch);
@@ -4220,6 +4240,18 @@ impl JournalAdapter {
                         .is_some_and(|at| at >= sighting.first_seen && at > fenced_through)
                 {
                     return Err(BirthRefusal::AbsenceUnproven);
+                }
+            }
+            BirthKind::AttachObserved => {
+                // Pre-cut sightings and affecting history are the
+                // point of this kind (they are disclosed as
+                // first-observed / not attributed downstream); only
+                // a chain break above the cut refuses.
+                if self
+                    .last_audit_failure
+                    .is_some_and(|at| at > birth_cut && at > fenced_through)
+                {
+                    return Err(BirthRefusal::AttachHistoryBroken);
                 }
             }
         }

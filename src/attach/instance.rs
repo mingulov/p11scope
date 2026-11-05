@@ -1418,34 +1418,65 @@ pub(crate) fn observe_retained_birth(
     BirthObservationRefusal,
 > {
     use crate::semantics_objects::journal::BirthKind;
-    let record = rows
-        .read_marker_row()
-        .map_err(|_| BirthObservationRefusal::RowUnreadable)?;
+    use p11scope_ebpf_common::journal_marker::MarkerRead;
+    let record = rows.read_marker_row();
     let control = rows
         .read_admission_control()
         .map_err(|_| BirthObservationRefusal::RowUnreadable)?;
+    // Attach-observed births claim no exec publication, so a
+    // pre-existing process may have no marker row at all: its
+    // absence reads as the unmarked word. Custody and the control
+    // row still refuse closed. Every other kind keeps the
+    // readable-row-first refusal order.
+    let record = if birth == BirthKind::AttachObserved {
+        record.ok()
+    } else {
+        Some(record.map_err(|_| BirthObservationRefusal::RowUnreadable)?)
+    };
     let (image, custody) = common_retained_birth_words(&control, binding, attachment, admitted)?;
-    match birth {
-        BirthKind::ExecMarker => {
-            if p11scope_ebpf_common::journal_marker::read_word(record.journal_bootstrap)
-                != p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
-            {
-                return Err(BirthObservationRefusal::MarkerNotReady);
+    let marker_word = if birth == BirthKind::AttachObserved {
+        match record {
+            Some(record) => {
+                // A row stamped by a *later* closure than the
+                // sealed one is native truth from the future: it
+                // cannot witness this closure's birth. Older (or
+                // zero) stamps are the ordinary pre-existing case.
+                if record.exec_attach_gen > attachment.generation() {
+                    return Err(BirthObservationRefusal::GenerationMismatch);
+                }
+                match p11scope_ebpf_common::journal_marker::read_word(record.journal_bootstrap) {
+                    MarkerRead::Unpublished => 0,
+                    MarkerRead::Ready(exec) if exec == image.1 => record.journal_bootstrap,
+                    _ => return Err(BirthObservationRefusal::MarkerNotReady),
+                }
             }
-            if record.exec_attach_gen != attachment.generation() {
-                return Err(BirthObservationRefusal::GenerationMismatch);
+            None => 0,
+        }
+    } else {
+        let record = record.expect("non-attach kinds unwrapped the row above");
+        match birth {
+            BirthKind::ExecMarker => {
+                if p11scope_ebpf_common::journal_marker::read_word(record.journal_bootstrap)
+                    != MarkerRead::Ready(image.1)
+                {
+                    return Err(BirthObservationRefusal::MarkerNotReady);
+                }
+                if record.exec_attach_gen != attachment.generation() {
+                    return Err(BirthObservationRefusal::GenerationMismatch);
+                }
             }
+            BirthKind::AbsenceAppearance if record.journal_bootstrap != 0 => {
+                return Err(BirthObservationRefusal::MarkerPublished);
+            }
+            BirthKind::AbsenceAppearance | BirthKind::AttachObserved => {}
         }
-        BirthKind::AbsenceAppearance if record.journal_bootstrap != 0 => {
-            return Err(BirthObservationRefusal::MarkerPublished);
-        }
-        BirthKind::AbsenceAppearance => {}
-    }
+        record.journal_bootstrap
+    };
     let token = SessionGrantToken(());
     let evidence = crate::semantics_objects::journal::SessionBirthEvidence::issue(
         &token,
         image,
-        record.journal_bootstrap,
+        marker_word,
         control.failed,
         attachment.generation(),
         custody,

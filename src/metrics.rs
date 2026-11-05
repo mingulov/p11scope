@@ -252,6 +252,71 @@ fn read_legacy_evidence_cell(value: Result<u64, ()>, bit: u64) -> (u64, u64) {
     }
 }
 
+/// Compose one legacy aggregate read from scripted inputs: RV entries fold
+/// first, then per-slot STATS, and the RV failure flag rides the returned
+/// gaps together with the unread-STATS count. `read_with_gaps` is this
+/// composition over live maps; tests drive it directly.
+fn compose_legacy_read(
+    plan: &AttachPlan,
+    get_stats: impl Fn(u32) -> Result<Vec<SlotStats>, ()>,
+    entries: Vec<Result<(RvKey, u64), ()>>,
+) -> (Vec<SlotReport>, LegacySlotGaps) {
+    let (rv_map, rv_failed) = collect_legacy_rvs(entries);
+    let flat: Vec<(RvKey, u64)> = rv_map
+        .iter()
+        .flat_map(|(slot, rvs)| {
+            rvs.iter().map(|(rv, total)| {
+                (
+                    RvKey {
+                        slot: *slot,
+                        _pad: 0,
+                        rv: *rv,
+                    },
+                    *total,
+                )
+            })
+        })
+        .collect();
+    let (reports, mut gaps) = collect_legacy_reports(plan, get_stats, flat);
+    gaps.rv_failed = rv_failed;
+    (reports, gaps)
+}
+
+/// Compose kernel control state from typed control reads with gaps: a
+/// failed control read contributes nothing and sets its unknown bit, while
+/// a missing map (`Ok(None)`, Inventory flavors) contributes nothing
+/// without a gap bit. `kernel_evidence_with_gaps` is this composition over
+/// live maps; tests drive it directly.
+fn compose_legacy_controls(
+    owner: Result<Option<ThreadOwnerControl>, ()>,
+    cookie: Result<Option<ImageIdentityControl>, ()>,
+    root: Result<Option<RootAffiliationControl>, ()>,
+) -> (KernelControl, u64) {
+    let mut unknown = 0u64;
+    let owner = match owner {
+        Ok(cell) => cell,
+        Err(()) => {
+            unknown |= LEGACY_UNKNOWN_OWNER;
+            None
+        }
+    };
+    let cookie = match cookie {
+        Ok(cell) => cell,
+        Err(()) => {
+            unknown |= LEGACY_UNKNOWN_COOKIE;
+            None
+        }
+    };
+    let root = match root {
+        Ok(cell) => cell,
+        Err(()) => {
+            unknown |= LEGACY_UNKNOWN_ROOT;
+            None
+        }
+    };
+    (KernelControl::from_cells(owner, cookie, root), unknown)
+}
+
 pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
     let stats: PerCpuArray<_, SlotStats> =
         PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS map")?)?;
@@ -651,23 +716,7 @@ pub(crate) fn read_with_gaps(
             }
         }
     }
-    let (rv_map, rv_failed) = collect_legacy_rvs(entries);
-    let flat: Vec<(RvKey, u64)> = rv_map
-        .iter()
-        .flat_map(|(slot, rvs)| {
-            rvs.iter().map(|(rv, total)| {
-                (
-                    RvKey {
-                        slot: *slot,
-                        _pad: 0,
-                        rv: *rv,
-                    },
-                    *total,
-                )
-            })
-        })
-        .collect();
-    let (reports, mut gaps) = collect_legacy_reports(
+    let (reports, gaps) = compose_legacy_read(
         plan,
         |index| {
             stats
@@ -675,9 +724,8 @@ pub(crate) fn read_with_gaps(
                 .map(|per_cpu| per_cpu.iter().copied().collect::<Vec<_>>())
                 .map_err(|_| ())
         },
-        flat,
+        entries,
     );
-    gaps.rv_failed = rv_failed;
     Ok((reports, gaps))
 }
 
@@ -697,29 +745,12 @@ pub(crate) fn kernel_evidence_with_gaps(session: &Session) -> Result<KernelEvide
     };
     // Typed control reads with gaps: control_cell returns Ok(None) for map
     // absence (Inventory flavors, no gap bit) and Err for get failures (gap).
-    let mut unknown = 0u64;
-    let owner = match control_cell::<ThreadOwnerControl>(session, "OWNER_CTL") {
-        Ok(cell) => cell,
-        Err(_) => {
-            unknown |= LEGACY_UNKNOWN_OWNER;
-            None
-        }
-    };
-    let cookie = match control_cell::<ImageIdentityControl>(session, "COOKIE_CTL") {
-        Ok(cell) => cell,
-        Err(_) => {
-            unknown |= LEGACY_UNKNOWN_COOKIE;
-            None
-        }
-    };
-    let root = match control_cell::<RootAffiliationControl>(session, "ROOT_CTL") {
-        Ok(cell) => cell,
-        Err(_) => {
-            unknown |= LEGACY_UNKNOWN_ROOT;
-            None
-        }
-    };
-    let control = KernelControl::from_cells(owner, cookie, root);
+    let (control, control_unknown) = compose_legacy_controls(
+        control_cell::<ThreadOwnerControl>(session, "OWNER_CTL").map_err(|_| ()),
+        control_cell::<ImageIdentityControl>(session, "COOKIE_CTL").map_err(|_| ()),
+        control_cell::<RootAffiliationControl>(session, "ROOT_CTL").map_err(|_| ()),
+    );
+    let mut unknown = control_unknown;
     notice_kernel_control(&control);
     let (ring_loss, bit) = read(EVIDENCE_RING_LOSS, LEGACY_UNKNOWN_RING_LOSS);
     unknown |= bit;
@@ -1822,7 +1853,7 @@ mod tests {
                 2,
             )),
         ];
-        let (mut map, rv_failed) = collect_legacy_rvs(entries);
+        let (mut map, rv_failed) = collect_legacy_rvs(entries.clone());
         assert!(rv_failed);
         assert_eq!(map.get(&0).unwrap().get(&0), Some(&3));
         assert_eq!(map.get(&0).unwrap().get(&1), Some(&2));
@@ -1845,8 +1876,149 @@ mod tests {
                 .collect(),
         );
         assert_eq!(reports[0].calls, 5);
-        // The RV gap rides the collection gaps, not the STATS path.
-        let _ = (reports, gaps);
+        // The RV gap rides the composed collection gaps, not the STATS path.
+        let (composed, composed_gaps) = compose_legacy_read(&plan, |_| Ok(vec![stats]), entries);
+        assert_eq!(composed[0].calls, 5);
+        assert_eq!(composed[0].rv_counts.get(&0), Some(&3));
+        assert_eq!(composed[0].rv_counts.get(&1), Some(&2));
+        assert_eq!(composed_gaps.unread_stats, 0);
+        assert!(
+            composed_gaps.rv_failed,
+            "the composed gaps must carry the RV failure"
+        );
+        assert_eq!(
+            gaps,
+            LegacySlotGaps {
+                unread_stats: 0,
+                rv_failed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compose_legacy_read_combines_unread_stats_and_rv_failure() {
+        // An unread STATS slot and a failed RV entry in one read ride the
+        // same composed gaps: zero as unknown for the unread slot, exact
+        // readable entries, and both gap facts set together.
+        let plan = exact_plan(vec![slot(0, "C_Sign"), slot(1, "C_Verify")]);
+        let stats = SlotStats {
+            entered: 3,
+            returned: 5,
+            errors: 1,
+            ..SlotStats::ZERO
+        };
+        let entries: Vec<Result<(RvKey, u64), ()>> = vec![
+            Ok((
+                RvKey {
+                    slot: 0,
+                    _pad: 0,
+                    rv: 0,
+                },
+                5,
+            )),
+            Err(()),
+        ];
+        let (reports, gaps) = compose_legacy_read(
+            &plan,
+            |index| {
+                if index == 0 { Ok(vec![stats]) } else { Err(()) }
+            },
+            entries,
+        );
+        assert_eq!(reports.len(), 2);
+        assert_eq!((reports[0].calls, reports[0].errors), (5, 1));
+        assert_eq!(reports[0].rv_counts.get(&0), Some(&5));
+        assert_eq!(
+            (reports[1].calls, reports[1].errors),
+            (0, 0),
+            "unread slot reports zero as unknown"
+        );
+        assert!(reports[1].rv_counts.is_empty());
+        assert_eq!(gaps.unread_stats, 1);
+        assert!(
+            gaps.rv_failed,
+            "the composed gaps must carry the RV failure"
+        );
+    }
+
+    #[test]
+    fn compose_legacy_controls_marks_each_failed_cell_with_its_bit() {
+        // Each failed control read sets exactly its own unknown bit and
+        // contributes nothing; readable cells flow through, and a missing
+        // map (Inventory flavors) contributes nothing without a gap bit.
+        let owner = ThreadOwnerControl {
+            poison: 4,
+            admission_failures: 7,
+            ..Default::default()
+        };
+        let cookie = ImageIdentityControl {
+            unavailable: 3,
+            ..Default::default()
+        };
+        let root = RootAffiliationControl {
+            failure_flags: 9,
+            ..Default::default()
+        };
+        let (control, unknown) =
+            compose_legacy_controls(Ok(Some(owner)), Ok(Some(cookie)), Ok(Some(root)));
+        assert_eq!(unknown, 0);
+        assert_eq!(
+            (
+                control.owner_poison,
+                control.owner_admission_failures,
+                control.identity_unavailable,
+                control.root_failures
+            ),
+            (4, 7, 3, 9),
+            "readable control values flow through"
+        );
+        let (_, unknown) = compose_legacy_controls(Ok(None), Ok(None), Ok(None));
+        assert_eq!(unknown, 0, "missing maps contribute no gap bit");
+        for (name, owner, cookie, root, bit) in [
+            (
+                "owner",
+                Err(()),
+                Ok(Some(cookie)),
+                Ok(Some(root)),
+                LEGACY_UNKNOWN_OWNER,
+            ),
+            (
+                "cookie",
+                Ok(Some(owner)),
+                Err(()),
+                Ok(Some(root)),
+                LEGACY_UNKNOWN_COOKIE,
+            ),
+            (
+                "root",
+                Ok(Some(owner)),
+                Ok(Some(cookie)),
+                Err(()),
+                LEGACY_UNKNOWN_ROOT,
+            ),
+        ] {
+            let (control, unknown) = compose_legacy_controls(owner, cookie, root);
+            assert_eq!(unknown, bit, "{name} failure sets exactly its bit");
+            assert_eq!(
+                (
+                    control.owner_poison,
+                    control.owner_admission_failures,
+                    control.identity_unavailable,
+                    control.root_failures
+                ),
+                match name {
+                    "owner" => (0, 0, 3, 9),
+                    "cookie" => (4, 7, 0, 9),
+                    _ => (4, 7, 3, 0),
+                },
+                "{name} failure contributes nothing else"
+            );
+        }
+        let (_, unknown) = compose_legacy_controls(Err(()), Err(()), Err(()));
+        assert_eq!(
+            unknown,
+            LEGACY_UNKNOWN_OWNER | LEGACY_UNKNOWN_COOKIE | LEGACY_UNKNOWN_ROOT
+        );
     }
 
     #[test]

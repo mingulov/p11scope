@@ -184,27 +184,26 @@ An optional `--module` only narrows that set. On the measured p11-kit stack,
 the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
 it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
 attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
-layer was captured. A live Detailed capture admits a late-start closure (one
-mapped before the capture's first plan beside a non-closure provider) as a
-reserve-capped leading-templates prefix with a named partial gap when no
-provider was refused or omitted; a closure alone in the first plan, or first
-mapped mid-capture, admits only its published tables, unless its opened file
-matches an operator-named `--module` path, which admits the reserve-capped
-prefix after the named non-closure modules admitted in the same discovery
-pass (a prefix held from an earlier pass can still crowd a later-named
-provider). The terminal report names each refused or partially covered module
-with its reason: `run` and `profile` print a `Module gaps` section with the
-first five and an "and K more" line, and `inventory` prints the admission
-reason under each refused module. A capture whose only mapped provider is
-the proxy layer (a process that has not loaded the providers below it yet)
-starts with the proxy layer named as a `PARTIAL` gap — with no provider beside
-it in the first plan there is no prefix, and nothing of it is published yet —
-and attaches each provider below it whole as the process loads it. Naming the
-proxy layer with `--module` admits its reserve-capped prefix but narrows
-discovery to the named modules, so a provider below it is captured only when
-also named. A prefix leaves at least the reserve (128 of 512 slots) free, so
-one later standard function list (at most 104 entries) always fits; a second
-later provider may be refused by name.
+layer was captured. A live Detailed capture admits a forwarding layer (such
+as the p11-kit proxy) only through its published tables — the tables a live
+`C_GetFunctionList` / `C_GetInterface(List)` return actually handed to the
+application — in every scope and arrival order. Unpublished templates take
+no slots, so the layer can never crowd out a real provider and is never
+refused outright. Calls it forwards are counted at the attached backend
+providers, named with counts on the gap line; calls the layer answers
+itself are not counted. The terminal report names each refused or
+partially covered module with its reason: `run` and `profile` print a
+`Module gaps` section with the first five and an "and K more" line, and
+`inventory` prints the admission reason under each refused module. A
+capture whose only mapped provider is the forwarding layer (a process that
+has not loaded the providers below it yet) starts with the layer named as
+a `PARTIAL` gap — nothing of it is published yet — and attaches each
+provider below it whole as the process loads it. Naming the layer with
+`--module` narrows discovery to the named modules, so a provider below it
+is captured only when also named; an operator-named layer keeps a
+reserve-capped leading-templates prefix instead of published-only
+admission, because a remote client's tables are handed out before any
+export probe can observe the return.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
@@ -975,8 +974,11 @@ Limits that matter in pods:
   preparation gate alone does not activate positive Inventory instance delivery.
   `--key-operations` (default off) opts in to per-key tracking through a linked
   journal session; it requires `--capture auto` or `native` and a build with
-  the journal object. A refused journal start keeps the S1 capture with a
-  finite reason.
+  the journal object. No manifest is needed for per-key rows. A refused
+  journal start keeps the S1 capture with a finite reason. Attaching to an
+  already-running process works: rows cover operations that start after the
+  attach, earlier operations are counted in named gaps, and no restart is
+  needed.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.
   Retired images say `Application executed a new image`, and exited
@@ -988,6 +990,8 @@ Limits that matter in pods:
   application app-first-driver [c0 pid 4242 incarnation 0] -> module app-p1.so [m0]: Module mapped; activity not captured; coverage unknown (scan only)
   ```
 
+  <!-- EXCERPT: p11scope inventory --pid <fixture-pid> --capture scan -->
+
   The header also carries a key-operation summary line. Once key
   operations populate (opt in with `--key-operations`), it counts
   completions per operation category, e.g.
@@ -995,7 +999,9 @@ Limits that matter in pods:
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.
-  A linked capture whose key-operation tracking never starts reads
+  Operations the observer cannot attribute with certainty are counted
+  in named `not attributed` reasons instead of ending the view. A
+  linked capture whose key-operation tracking never starts reads
   `key operations: unavailable (bootstrap_unavailable)`. Without the
   opt-in, or on a build without the journal object, the line reads
   `key operations: not reported (per-key tracking is off)`.
@@ -1016,9 +1022,16 @@ Limits that matter in pods:
   document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
-  report requires a file). `--quiet` prints only the summary head
-  (totals plus application/module edges) and silences scan progress;
-  `--json`, `-o`, and logs are unchanged. `--dashboard` runs the live dashboard on
+  report requires a file). Text output is concise by default: the main
+  results, one coverage line, and the hint `run with -v for details`.
+  `-v`/`--verbose` shows the full detail, `--quiet` prints only the
+  summary head (totals plus application/module edges) and silences scan
+  progress, and `--json`, `-o`, and logs are unchanged and always
+  complete.
+
+  <!-- EXCERPT: p11scope inventory --system --duration 30s -->
+
+  `--dashboard` runs the live dashboard on
   stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
   `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and
@@ -1216,16 +1229,19 @@ Limits that matter in pods:
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in
   `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
-  selects the capture-lifetime physical endpoint budget (1..=8192; 4096
-  when absent), before output files or native maps are opened. The same
+  selects the capture-lifetime physical endpoint budget (up to 131,072;
+  `inventory --system` on hosts with uprobe_multi defaults to 32,768),
+  before output files or native maps are opened. The same
   limit applies to scan, native and auto fallback, including the dashboard.
   IDs are append-only: unloading a provider does not refund capacity, and
   whole-module growth that does not fit is refused while retained endpoints
   and historical observations remain. The JSON row `budgets.inventory_endpoints`
   reports this physical limit; `budgets.endpoints` is the separate summed
   per-module census limit. Pair and discovery-work limits stay independent.
-  The 8192 upper bound is a candidate policy limit, not a measured native
-  release envelope; see [known limitations](known-limitations.md).
+  The 131,072 ceiling rests on attach/detach and per-endpoint memory
+  measurements; the freeze campaign confirms the system-scale cells at the
+  new budget, and never ships below 8,192; see
+  [known limitations](known-limitations.md).
   A target no scan inventoried is a
   hard error (one stderr line, exit 1), never an empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a

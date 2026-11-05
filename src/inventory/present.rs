@@ -1667,6 +1667,18 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                 let _ = writeln!(out, "  (+{more} more admission reasons)");
             }
         }
+        // A module with unidentified use names its folded lower bound in
+        // plain words, on its own detail line: every decided-unbound row
+        // counts once with the entries it held at drop.
+        if let Some(unbound) = &module.unbound_use {
+            let _ = writeln!(
+                out,
+                "  unidentified use: at least {} entries observed ({} caller image{})",
+                unbound.entries,
+                unbound.rows,
+                if unbound.rows == 1 { "" } else { "s" }
+            );
+        }
     }
     for edge in &presentation.edges {
         // "Active now" keeps the historical observation-window meaning:

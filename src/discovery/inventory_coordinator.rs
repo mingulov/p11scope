@@ -7762,7 +7762,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// remembers the held absolute, so a later row rebinds past it
     /// instead of attributing pre-drop calls to a new owner (round 4,
     /// rebind).
-    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) {
+    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) -> u64 {
         let key = PairKey::of(row);
         let (base, base_since) = self
             .pair_counts
@@ -7790,6 +7790,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
+        base
     }
 
     /// Stages one decided row against the modules its witness endpoint is
@@ -7814,11 +7815,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
-                self.drop_pair_count(&row, diagnostic_binding_reason(reason));
+                // The dropped absolute folds into the single module's
+                // lower bound: the pair never publishes, but its held
+                // entries are a positive module-level fact.
+                let folded = self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
-                    .note_unbound_witness(modules, row.recorded_at_ns, reason)
+                    .note_unbound_witness(modules, row.recorded_at_ns, reason, folded)
             }
         }
         Ok(())
@@ -17334,6 +17338,48 @@ exit 0
             !native.scene.coverage(caller).is_witnessed(),
             "another caller never inherits it"
         );
+    }
+
+    #[test]
+    fn an_unbound_row_folds_its_held_count_into_module_level_use() {
+        let (mut native, _) = NativeScene::new();
+        // Same exited tgid as the named-gap twin: the row stays unbound
+        // (no_live_caller) and its pair count drops.
+        let mut row = native.row(41, 1, 9, 100, 1);
+        row.entry_count = 744;
+        native.witness(vec![row]);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.reasons.get("no_live_caller"), Some(&1));
+        assert_eq!(
+            unbound.entries, 744,
+            "the dropped absolute folds to the module"
+        );
+    }
+
+    #[test]
+    fn a_refresh_read_after_the_drop_never_folds() {
+        let (mut native, _) = NativeScene::new();
+        let mut row = native.row(41, 1, 9, 100, 1);
+        row.entry_count = 10;
+        native.witness(vec![row]);
+        // A refresh read after the decision: the pair is dropped, so the
+        // advance never merges and the folded bound stands.
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 999)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(native.module_unbound().unwrap().entries, 10);
+    }
+
+    #[test]
+    fn a_refresh_read_before_the_decision_folds_the_max() {
+        let (mut native, _) = NativeScene::new();
+        // The refresh lands first: the held count advances to 999 before
+        // any row stages, so the drop folds the max, not first sight.
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 999)]);
+        let mut row = native.row(41, 1, 9, 100, 1);
+        row.entry_count = 10;
+        native.witness(vec![row]);
+        assert_eq!(native.module_unbound().unwrap().entries, 999);
     }
 
     #[test]

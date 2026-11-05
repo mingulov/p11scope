@@ -2322,6 +2322,12 @@ pub(crate) struct UnboundUse {
     ///
     /// [`UnboundReason::code`]: crate::discovery::native_binding::UnboundReason::code
     pub reasons: BTreeMap<&'static str, u64>,
+    /// Folded entry-count lower bound over the single-module rows: each
+    /// staged row's held count at drop, saturating. Lower bound — a
+    /// refresh read after the drop never merges — and exactly-once per
+    /// staged decision, like `rows`. Shared-endpoint and unresolved rows
+    /// fold nothing: their counts name no single module.
+    pub entries: u64,
 }
 
 /// Reason code for a witness bound to a caller incarnation whose edge to
@@ -2655,6 +2661,7 @@ enum Mutation {
         modules: Vec<ModuleKey>,
         first_ns: u64,
         reason: UnboundReason,
+        entries: u64,
     },
     NoteUnresolvedWitness,
     NoteUseBeforeAdmission {
@@ -3569,17 +3576,21 @@ impl CallerRegistry {
     /// module-level use, with the reason and a named gap, when `modules` is
     /// a single module; an `ambiguous shared endpoint` gap and no use when
     /// several modules share the endpoint. No tgid is recorded: the row's
-    /// process is exactly what could not be identified.
+    /// process is exactly what could not be identified. `entries` is the
+    /// row's held entry count at drop; it folds into the single module's
+    /// lower bound and is ignored for shared or unresolved rows.
     pub(crate) fn note_unbound_witness(
         &mut self,
         modules: Vec<ModuleKey>,
         first_ns: u64,
         reason: UnboundReason,
+        entries: u64,
     ) {
         self.staged.push(Mutation::NoteUnboundWitness {
             modules,
             first_ns,
             reason,
+            entries,
         });
     }
 
@@ -4428,9 +4439,17 @@ impl CallerRegistry {
                 modules,
                 first_ns,
                 reason,
+                entries,
             } => match modules.as_slice() {
                 [key] => {
-                    self.apply_unbound_use(key, first_ns, reason.code(), reason.text(), true);
+                    self.apply_unbound_use(
+                        key,
+                        first_ns,
+                        reason.code(),
+                        reason.text(),
+                        true,
+                        entries,
+                    );
                 }
                 [] => self.witness_placement.unresolved += 1,
                 shared => self.apply_shared_endpoint(shared, reason.text()),
@@ -4958,6 +4977,9 @@ impl CallerRegistry {
                     NO_MAPPING_EDGE,
                     "the bound caller has no mapping edge to the module",
                     false,
+                    // Bound rows keep their counts in the pending-count
+                    // pipeline; only unbound rows fold here.
+                    0,
                 );
             }
             RowPlacement::Unresolved => self.witness_placement.unresolved += 1,
@@ -5173,6 +5195,7 @@ impl CallerRegistry {
         code: &'static str,
         text: &str,
         unidentified: bool,
+        entries: u64,
     ) {
         let Some(id) = self.modules_by_key.get(key).copied() else {
             self.witness_placement.unresolved += 1;
@@ -5194,9 +5217,11 @@ impl CallerRegistry {
             first_ns,
             rows: 0,
             reasons: BTreeMap::new(),
+            entries: 0,
         });
         unbound.first_ns = unbound.first_ns.min(first_ns);
         unbound.rows = unbound.rows.saturating_add(1);
+        unbound.entries = unbound.entries.saturating_add(entries);
         let count = unbound.reasons.entry(code).or_default();
         *count = count.saturating_add(1);
         if unidentified {
@@ -8027,8 +8052,8 @@ pub(crate) mod tests {
         registry.note_bound_witness(CallerId(1), shared.clone(), 210);
         // Caller 2 maps neither: ambiguous, never module-level.
         registry.note_bound_witness(CallerId(2), shared.clone(), 220);
-        registry.note_unbound_witness(shared, 230, UnboundReason::NoLiveCaller);
-        registry.note_unbound_witness(vec![ka.clone()], 240, UnboundReason::NoLiveCaller);
+        registry.note_unbound_witness(shared, 230, UnboundReason::NoLiveCaller, 0);
+        registry.note_unbound_witness(vec![ka.clone()], 240, UnboundReason::NoLiveCaller, 0);
         registry.note_unresolved_witness();
         registry.publish();
 
@@ -8054,6 +8079,36 @@ pub(crate) mod tests {
             .filter(|gap| gap.subject == WITNESS_SHARED_ENDPOINT)
             .count();
         assert_eq!(shared_gaps, 2, "once per sharing module");
+    }
+
+    /// A shared-endpoint unbound row folds no entries anywhere: its count
+    /// names no single module, so the ambiguous placement keeps it out of
+    /// every module's lower bound.
+    #[test]
+    fn a_shared_unbound_row_folds_no_entries_into_any_module() {
+        let mut registry = registry();
+        let a = module_info("/lib/a.so", 11, AdmissionState::Admitted);
+        let b = module_info("/lib/b.so", 12, AdmissionState::Admitted);
+        let (ka, kb) = (a.key.clone(), b.key.clone());
+        registry.note_mapping(CallerId(0), 50, a, 100);
+        registry.note_mapping(CallerId(0), 50, b, 100);
+        registry.publish();
+        registry.note_unbound_witness(
+            vec![ka.clone(), kb.clone()],
+            230,
+            UnboundReason::NoLiveCaller,
+            744,
+        );
+        registry.publish();
+        assert_eq!(registry.witness_placement().ambiguous, 1);
+        for key in [&ka, &kb] {
+            let id = registry.module_id_for(key).unwrap();
+            assert!(
+                registry.module(id).unwrap().unbound_use.is_none(),
+                "ambiguous rows fold nothing"
+            );
+        }
+        assert_eq!(unbound_rows(&registry), 0);
     }
 
     #[test]
@@ -8165,9 +8220,9 @@ pub(crate) mod tests {
             "the caller is identified: {gaps:?}"
         );
 
-        registry.note_unbound_witness(vec![ka.clone()], 210, UnboundReason::NoLiveCaller);
+        registry.note_unbound_witness(vec![ka.clone()], 210, UnboundReason::NoLiveCaller, 0);
         let ghost = ModuleKey::physical(8, 1, 77, Some("sha0077".into()), "/lib/ghost.so");
-        registry.note_unbound_witness(vec![ghost], 220, UnboundReason::NoLiveCaller);
+        registry.note_unbound_witness(vec![ghost], 220, UnboundReason::NoLiveCaller, 0);
         registry.publish();
         assert!(
             registry

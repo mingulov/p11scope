@@ -8140,6 +8140,7 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "first_ns": unbound.first_ns,
             "rows": unbound.rows,
             "reasons": unbound.reasons,
+            "entries": unbound.entries,
         })),
     })
 }
@@ -11487,6 +11488,7 @@ mod tests {
             vec![key],
             110,
             crate::discovery::native_binding::UnboundReason::BeforeAdmission,
+            0,
         );
         let mut census = crate::discovery::native_binding::BindingCensus {
             rows: 3,
@@ -11503,7 +11505,7 @@ mod tests {
         let document = render_json(&coordinator, "pid:7", 90, 130, 2);
         assert_eq!(
             document["modules"][0]["unbound_use"],
-            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}})
+            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0})
         );
         assert_eq!(
             document["observation"]["native_witnesses"],
@@ -11555,6 +11557,7 @@ mod tests {
             vec![key],
             110,
             crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
         );
         coordinator.commit_batch(false).unwrap();
         let document = render_json(&coordinator, "pid:7", 90, 130, 2);
@@ -11595,6 +11598,7 @@ mod tests {
             vec![key],
             110,
             crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
         );
         coordinator.commit_batch(false).unwrap();
         let text = render_text(&coordinator, "pid:7", 90, 130, 2);
@@ -11927,6 +11931,7 @@ mod tests {
             first_ns: 1,
             rows: pairs.iter().map(|(_, n)| n).sum(),
             reasons: pairs.iter().copied().collect(),
+            entries: 0,
         };
         let mut state = StreamState::new();
         let first = [(ModuleId(3), unbound(&[("no_live_caller", 2)]))];

@@ -235,19 +235,24 @@ non-null values needs a new allowlist row.
   `lifecycle` is `mapped`, `unloaded` (a complete rescan proved it
   gone; sticky in `unloaded_observed` even across a reload), or
   `unknown` (no live mapping evidence remains).
-  `unbound_use` is `null`, or `{first_ns, rows, reasons}`: native
-  witness rows of this module that no caller edge carries — positive,
-  monotonic module-level use, never attributed to a caller by pid.
-  Only a row whose witness endpoint belongs to this one admitted module
-  counts here; each row counts on at most one module. `first_ns` is the
-  earliest row's first-association instant, `rows` the row count, and
-  `reasons` counts rows per reason code: a binder reason (see
+  `unbound_use` is `null`, or `{first_ns, rows, reasons, entries}`:
+  native witness rows of this module that no caller edge carries —
+  positive, monotonic module-level use, never attributed to a caller by
+  pid. Only a row whose witness endpoint belongs to this one admitted
+  module counts here; each row counts on at most one module. `first_ns`
+  is the earliest row's first-association instant, `rows` the row count,
+  and `reasons` counts rows per reason code: a binder reason (see
   `observation.native_witnesses`) or `no_mapping_edge` (the row bound to
   an identified caller incarnation that has no mapping edge to this
-  module; a witness never invents a mapping). The first binder-reason
-  row of a module records one `used by an unidentified caller image`
-  gap; a `no_mapping_edge` row records instead a `native witness without
-  mapping evidence` gap naming the caller (once per caller and module).
+  module; a witness never invents a mapping). `entries` is the folded
+  entry-count lower bound over the single-module rows: each staged
+  row's held count at drop, saturating (a refresh read after the drop
+  never merges, so a still-running producer's later entries are not
+  included; a row read after its process exited carries all of them).
+  The first binder-reason row of a module records one `used by an
+  unidentified caller image` gap; a `no_mapping_edge` row records
+  instead a `native witness without mapping evidence` gap naming the
+  caller (once per caller and module).
   Witness gaps never carry a `pid`: an unbound row's tgid is exactly
   what could not be identified.
   Boundary: the key is file identity, not load-instance authority —

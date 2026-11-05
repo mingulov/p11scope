@@ -2884,14 +2884,28 @@ impl CallerRegistry {
                     ) {
                         Ok(()) => StageAction::Staged,
                         // By-design carve-out, but ordered (C4): with
-                        // queued calls the completion must not
+                        // queued calls an affecting completion must not
                         // overtake its original — fall back in order
-                        // first, then reduce direct below.
+                        // first, then reduce direct below. A
+                        // proved-irrelevant call (the frozen endpoint
+                        // table: info and session-state reads) touches
+                        // nothing the proof relies on and completes no
+                        // operation, so it can neither overtake nor
+                        // orphan a queued call: it reduces direct and
+                        // the feed stays Joint, queued calls still
+                        // waiting for their seals. Anything else
+                        // unsealable (negative-only, unlisted, unknown)
+                        // stays fail-closed on the ordered fallback.
                         Err(StagingRefusal::Unsealable) => {
-                            if state.feed.staged_len() > 0 {
-                                StageAction::FallbackUncounted
-                            } else {
+                            let irrelevant = crate::kinds::function_id(&input.facts.function)
+                                .and_then(crate::semantics_objects::journal::endpoint_class)
+                                == Some(
+                                    crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant,
+                                );
+                            if irrelevant || state.feed.staged_len() == 0 {
                                 StageAction::CarveOut
+                            } else {
+                                StageAction::FallbackUncounted
                             }
                         }
                         Err(StagingRefusal::Full) => StageAction::FallbackCounted,

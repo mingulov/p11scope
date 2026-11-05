@@ -20833,6 +20833,260 @@ fn key_operation_partial_publication_counts_unattributed() {
     );
 }
 
+/// F2 (round 3): staged calls left unsealed when the no-progress
+/// watchdog trips count once as `watchdog_no_progress` at
+/// publication — they are enumerable in the staging at the trip.
+/// The trip note is idempotent: a second note never recounts.
+#[test]
+fn key_operation_watchdog_unsealed_staged_calls_count() {
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Two modeled calls stage; no seal ever settles them.
+    for call in sign_flow()[1..3].iter() {
+        prepare_call(&mut scene, &mut staging, call);
+    }
+    let _ = (&mut edge, &mut sink, instance);
+    assert_eq!(staging.staged_len(), 2, "both calls stay staged");
+
+    staging.note_watchdog_trip();
+    staging.note_watchdog_trip();
+    assert_eq!(
+        staging.watchdog_unsealed(),
+        2,
+        "the trip snapshots the staged calls exactly once"
+    );
+    let observations = commit(71, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "watchdog_no_progress",
+            count: 2,
+        }],
+        "unsealed staged calls count under the watchdog reason: {:?}",
+        observations.unattributed
+    );
+    // Conservation for this feed: 2 observed key calls, 0
+    // attributed, 2 unattributed.
+    assert_eq!(staging.reduced(), 0, "nothing replayed or attributed");
+}
+
+/// Conservation across every staging-derived reason (round 3):
+/// sealed, fallback-replayed, degraded-window (both endings),
+/// history-disposed, pre-attach, unmodelled and watchdog counts
+/// partition the hand-constructed observed total exactly once.
+/// The registry-derived `foreign_or_unproven_caller` reason is
+/// covered by the registry conservation twin above.
+#[test]
+fn key_operation_unattributed_conservation_across_all_staging_reasons() {
+    let instance = RegistryInstanceId::from_raw(3);
+    let _ = instance;
+
+    // A: three calls sealed and replayed (attributed).
+    let mut scene_a = JointScene::new();
+    let bootstrap_a = scene_a.bootstrap();
+    let mut staging_a = JointStaging::select_joint(Some(&bootstrap_a));
+    let mut edge_a = EdgeSemantics::default();
+    let mut keyuse_a = KeyUseReducer::new();
+    let mut sink_a = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        drive_quantum(
+            &mut scene_a,
+            &mut staging_a,
+            &mut edge_a,
+            &mut keyuse_a,
+            &mut sink_a,
+            call,
+        );
+    }
+
+    // B: three staged calls replayed by a proof-only fallback,
+    // then two modeled directs in the degraded window.
+    let mut scene_b = JointScene::new();
+    let bootstrap_b = scene_b.bootstrap();
+    let mut staging_b = JointStaging::select_joint(Some(&bootstrap_b));
+    let mut edge_b = EdgeSemantics::default();
+    let mut keyuse_b = KeyUseReducer::new();
+    let mut sink_b = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut scene_b, &mut staging_b, call);
+    }
+    let failure_b = scene_b.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap_b,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3_b = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome_b, _) = staging_b.apply_algorithm_failure_for_test(
+        &failure_b,
+        &mut h3_b,
+        &scene_b.model,
+        scene_b.adapter.ledger_mut(),
+        &mut edge_b,
+        &mut keyuse_b,
+        RegistryInstanceId::from_raw(3),
+        &mut sink_b,
+        None,
+    );
+    assert!(matches!(
+        outcome_b,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    staging_b.note_direct_reduction("C_Sign");
+    staging_b.note_direct_reduction("C_Sign");
+    staging_b.note_direct_reduction("C_GetSlotInfo");
+
+    // C: one staged call disposed by real loss, then one modeled
+    // direct in the degraded window.
+    let mut scene_c = JointScene::new();
+    let bootstrap_c = scene_c.bootstrap();
+    let mut staging_c = JointStaging::select_joint(Some(&bootstrap_c));
+    let mut edge_c = EdgeSemantics::default();
+    let mut keyuse_c = KeyUseReducer::new();
+    let mut sink_c = Vec::new();
+    prepare_call(
+        &mut scene_c,
+        &mut staging_c,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failure_c = scene_c.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap_c,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3_c = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome_c, _) = staging_c.apply_algorithm_failure_for_test(
+        &failure_c,
+        &mut h3_c,
+        &scene_c.model,
+        scene_c.adapter.ledger_mut(),
+        &mut edge_c,
+        &mut keyuse_c,
+        RegistryInstanceId::from_raw(3),
+        &mut sink_c,
+        None,
+    );
+    assert!(matches!(
+        outcome_c,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    staging_c.note_direct_reduction("C_Sign");
+    staging_c.note_direct_reduction("C_GetTokenInfo");
+
+    // D: a feed without a witnessed birth: two key operations
+    // count started-before-attach; an info call counts nothing.
+    let mut staging_d = JointStaging::select_s1_only();
+    staging_d.note_direct_reduction("C_SignInit");
+    staging_d.note_direct_reduction("C_Sign");
+    staging_d.note_direct_reduction("C_GetMechanismInfo");
+
+    // E: one affecting unsealable call, counted unmodelled.
+    let mut scene_e = JointScene::new();
+    let bootstrap_e = scene_e.bootstrap();
+    let mut staging_e = JointStaging::select_joint(Some(&bootstrap_e));
+    let unsealable = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    let origin_e = EffectOrigin::from(&unsealable);
+    assert_eq!(
+        staging_e.stage(
+            unsealable,
+            origin_e,
+            1,
+            scene_e.adapter.ledger_mut()
+        ),
+        Err(crate::semantics_key_use::StagingRefusal::Unsealable)
+    );
+
+    // F: two staged calls left unsealed across a watchdog trip.
+    let mut scene_f = JointScene::new();
+    let bootstrap_f = scene_f.bootstrap();
+    let mut staging_f = JointStaging::select_joint(Some(&bootstrap_f));
+    for call in sign_flow()[1..3].iter() {
+        prepare_call(&mut scene_f, &mut staging_f, call);
+    }
+    staging_f.note_watchdog_trip();
+
+    let stagings: [&JointStaging; 6] = [
+        &staging_a, &staging_b, &staging_c, &staging_d, &staging_e, &staging_f,
+    ];
+    // Per-feed partition, from the retained counters themselves:
+    // sealed replay (attributed) + every unattributed bucket +
+    // staged calls no reason claims must equal the observed total.
+    let mut attributed = 0u64;
+    let mut counter_unattributed = 0u64;
+    let mut unclaimed_staged = 0u64;
+    for staging in stagings.iter() {
+        let sealed = staging
+            .reduced()
+            .saturating_sub(staging.fallback_replayed());
+        attributed += sealed;
+        counter_unattributed += staging.pre_attach_direct()
+            + staging.history_disposed()
+            + staging.degraded_loss_direct()
+            + staging.watchdog_unsealed()
+            + staging.unsealable_direct()
+            + staging.fallback_replayed()
+            + staging.degraded_fallback_direct();
+        unclaimed_staged += (staging.staged_len() as u64)
+            .saturating_sub(staging.watchdog_unsealed());
+    }
+    assert_eq!(unclaimed_staged, 0, "no staged call is left uncounted");
+    // Hand-constructed observed key calls: A3 + B(3+2) + C(1+1)
+    // + D2 + E1 + F2 = 15.
+    assert_eq!(attributed, 3, "only the sealed calls attribute");
+    assert_eq!(counter_unattributed, 12);
+    assert_eq!(
+        attributed + counter_unattributed,
+        15,
+        "conservation across all staging reasons"
+    );
+
+    let observations = commit(
+        72,
+        &stagings,
+        &scene_a.model.project(),
+        &keyuse_a,
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "started_before_attach",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "record_lost",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "watchdog_no_progress",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 1,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 5,
+            },
+        ],
+        "publication sums match the retained counters: {:?}",
+        observations.unattributed
+    );
+    let published_total: u64 = observations.unattributed.iter().map(|row| row.count).sum();
+    assert_eq!(attributed + published_total, 15);
+}
+
 /// Damage stays local and attribution resumes: after an ordered
 /// fallback ends a feed's Joint segment, the next operation init
 /// is a clean point — the feed stages again, its seals replay, and

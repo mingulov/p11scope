@@ -24,7 +24,7 @@ implementation limits are code contracts, not measurements.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -437,7 +437,7 @@ profile, trace, run, and inspect.
 
 `doctor` has no module-specific probe lane. `doctor --module` is rejected as
 unsupported instead of accepting and ignoring operator input; use
-`inspect --pid <pid> --module <provider.so>` for module-specific discovery.
+`inspect --pid <pid> --module <provider.so>` to list mapped providers.
 
 ### Pre-arming providers with `--prearm-module`
 
@@ -953,7 +953,7 @@ Limits that matter in pods:
   report's additive `selected_detail` evidence object; unrelated
   endpoints stay aggregate-only, and aggregate and detail counts are
   never summed.
-- `--track-short-lived` — profile and `run` (default off): extensive
+- `--track-short-lived` — profile (default off): extensive
   mode. The kernel records the exec-time executable identity (device +
   inode, no path, argv, or environment) in EXEC records, and each novel
   unmatched exit gains a bounded static-linkage hint (`gap_exe_hints`
@@ -971,11 +971,12 @@ Limits that matter in pods:
   conformance input, and never a negative. Multi-threaded exits
   and late watches read `unknown`, and nothing here proves a
   process did not map a watched provider.
-  Beside `--trace`, `--mode metrics`, exact `--pid` scope, or an owned
-  `run` the flag is accepted but arms nothing: no exe identity is
+  Beside `--trace`, `--mode metrics`, or exact `--pid` scope the flag is
+  accepted but arms nothing: no exe identity is
   recorded there, because nothing there classifies gaps (614b P1
   narrow authorization — the read arms only where hints publish).
-  Beside `--counter-mode` the flag is refused:
+  Beside an owned `run` the flag is refused because it would record
+  nothing there; beside `--counter-mode` it is refused because
   extensive mode arms Detailed captures only, never a counter
   object. Privacy row: `docs/privacy/allowlist-v3.md`
   (extensive-mode executable dependency hints).
@@ -1635,7 +1636,9 @@ capture refuses before loading any capture program, so doctor skips those
 loads: `BPF map create`, `uprobe attach (self)`,
 `uretprobe vs seccomp`, `host program preflight`, `inventory program preflight`,
 `lifecycle preflight` and a requested `scope preflight` read `n/a` with
-`skipped: uprobe-multi-required`, and the verdict stays `capture unavailable`.
+`skipped: this check loads capture programs, which need uprobe-multi`,
+and the verdict stays `capture unavailable`. The version hint lives in
+the `Next:` step, which only a proven pre-Multi host prints.
 A permission or policy refusal of the probe, a resource error, or an `ENOSYS`
 answer (possibly a seccomp mask) still runs them, so their rows name the cause.
 `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`,
@@ -1664,7 +1667,7 @@ If that PID filter is unavailable, `auto` can use safe target-bound Singles;
 a safe scoped startup retry can also select per-probe `perf_event` uprobes
 (`src/attach.rs`: `select_session_backend`). Other required permissions and
 scope features still apply. A host that fails Multi eligibility exits nonzero
-with `uprobe-multi-required`. Both historical matrices below were measured by
+with a one-line refusal naming the cause. Both historical matrices below were measured by
 `scripts/matrix/verify-fork-scope.sh` against a same-UID non-descendant
 with SoftHSM2 already mapped, at `kernel.perf_event_paranoid=4`,
 `kernel.yama.ptrace_scope=1`.
@@ -1811,7 +1814,7 @@ cgroup. `scripts/matrix/verify-pidns.sh` reproduces all of this without kind:
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -1822,7 +1825,7 @@ release commitment is made.
 The following permission measurements are historical diagnostics. Their old
 5.15 floor hints and exit-0 partial-capture behavior predate current host
 admission. A live attempt on a host without usable Multi now exits nonzero with
-`uprobe-multi-required` before capture or workload side effects.
+a one-line refusal naming the cause before capture or workload side effects.
 
 These earlier measurements came from a real host
 (`docs/notes/phase5-unsupported.md`; two real bugs — a swallowed OS error,

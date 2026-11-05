@@ -30,7 +30,7 @@ snapshots support offline comparison; detailed profiles support investigation.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -111,10 +111,11 @@ observations by recorded application path and module content; `--json` and
 Counts describe independent windows, and absence does not prove removal.
 See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
 
-Two newer capture flags: `--track-short-lived` (profile and run,
+Two newer capture flags: `--track-short-lived` (profile,
 default off) is extensive mode: the kernel records exec-time executable identity
 so unmatched exits gain bounded static-linkage hints, arming only on Detailed
 profile `--cgroup`/`--system` captures and refused beside `--counter-mode`
+and beside `run`
 ([options](docs/usage.md#more-capture-options)). `--prearm-module
 <provider.so>` (profile, trace, run, inventory; repeatable) pins a provider file
 before any mapping and pre-arms its proved offsets; under inventory the inputs
@@ -124,7 +125,7 @@ are pinned and retained while Detailed-subset activation still follows
 Development inventory also accepts `--cgroup /sys/fs/cgroup/owned.scope`, including
 descendants, across scan/auto/native and the existing output modes. Discovery
 retains the selected root, requires initial PID numbering with matching procfs,
-and reports bounded partial work explicitly. Quiet cgroup usage remains unknown;
+and reports bounded partial work explicitly. Idle cgroup usage remains unknown;
 endpoint membership samples do not prove continuous residency. Scoped native
 owner admission runs on `--cgroup` with `--capture auto` or `native`: while the
 native lane stays active, each completed cgroup transaction commits at most one
@@ -481,7 +482,7 @@ report format.
   still refuse capture.
   No `CAP_LEASE`, no `fs.suid_dumpable=0`, no root-owned trusted exec dir
   ([measured matrix](docs/usage.md#privileges-per-environment)).
-  Live host capability is tested, with `uprobe-multi-required` on failure;
+  Live host capability is tested, with a one-line refusal on failure;
   other unsupported configurations fail with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).

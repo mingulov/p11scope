@@ -36,9 +36,9 @@ User-facing limits live in
   the birth marker, so no special build is needed; `P11SCOPE_JOURNAL=0`
   or `P11SCOPE_BIRTH_MARKER=0` builds without them. When rows populate,
   the snapshot carries a summary such as `key operations: rev 1
-  populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active
-  operations`, and the JSON report carries the per-session, per-object
-  and per-category rows under `object_observations`. Attaching to an
+  populated; 1 session, 3 objects; sign 1 completed, 0 returned errors,
+  2 active operations`, and the JSON report carries the per-session,
+  per-object and per-category rows under `object_observations`. Attaching to an
   already-running process works: rows cover operations that start after
   the attach, earlier operations are counted in named gaps, and a key
   first seen before the attach reads `type unknown: first seen before
@@ -161,8 +161,8 @@ User-facing limits live in
 - `doctor` no longer spends minutes test-loading capture programs on
   kernels without uprobe_multi (for example Linux 6.1, where it took
   about 4 minutes). Live capture refuses there anyway, so those checks
-  now read `skipped: uprobe-multi-required` and the verdict stays
-  capture unavailable.
+  now read `skipped: this check loads capture programs, which need
+  uprobe-multi` and the verdict stays capture unavailable.
 - DONTUNMAP moves missed on kernels with the 6-argument copy_vma are now
   tracked (this affected 0.5.0 on 6.18.58 and current 6.6/6.12/7.2
   stable heads). The move hook read a fixed argument slot, so an

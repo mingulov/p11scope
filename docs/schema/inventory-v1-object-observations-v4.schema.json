@@ -82,7 +82,7 @@
     },
     "unattributed": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "maxItems": 7,
       "items": {
         "$ref": "#/$defs/unattributed_row"

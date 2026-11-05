@@ -223,7 +223,21 @@ wait_pidfile() {
 }
 
 t0=$(date +%s)
-if [ "$MODE" = first ]; then
+if [ "$MODE" = first ] && [ -n "${DEMO4_OBSERVER_DELAY:-}" ]; then
+    # Replays the busy-lane ordering of the old per-phase lock: the
+    # browser launches (no pre-attach client-certificate visit) and
+    # the observer starts DEMO4_OBSERVER_DELAY seconds later.
+    : >"$work/launch"
+    wait_pidfile || { trap - RETURN; exit 1; }
+    sleep "$DEMO4_OBSERVER_DELAY"
+    start_observer
+    if ! wait_seal; then
+        echo "FAIL observer-never-sealed mode=first-delayed"
+        kill "$observer_pid" "$driver_pid" 2>/dev/null; tail -15 "$work/inventory.err"
+        trap - RETURN; exit 1
+    fi
+    seal_wall=$(( $(date +%s)-t0 ))
+elif [ "$MODE" = first ]; then
     start_observer
     wait_observer_running \
         || { echo "FAIL observer-never-ran mode=first"; tail -15 "$work/inventory.err"; trap - RETURN; exit 1; }

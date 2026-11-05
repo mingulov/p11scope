@@ -4135,7 +4135,7 @@ pub(crate) mod tests {
                 &BTreeMap::new(),
             );
             assert!(frame.contains("last read stale"), "{frame}");
-            assert!(frame.contains("PARTIAL"), "{frame}");
+            assert!(frame.contains("coverage: partial"), "{frame}");
             let document =
                 with_counter_snapshot(json(stale.reports(), &ev, &capture_fixture()), &stale);
             assert!(document["evidence"]["counter_collection"]["health"].is_null());
@@ -5743,7 +5743,9 @@ pub(crate) mod tests {
             CapturePolicy::Allowlisted,
         );
         assert!(
-            output.contains("1 function counted but not named"),
+            output.contains(
+                "coverage: counts complete; function names follow the standard PKCS#11 table"
+            ),
             "{output}"
         );
     }
@@ -6432,7 +6434,7 @@ pub(crate) mod tests {
         let out = frame(|ev| ev.event_loss = 12, false);
         assert!(
             out.contains(
-                "→ PARTIAL: calls may be missing (observation lossy) \
+                "→ PARTIAL — calls may be missing (observation lossy) \
                  (12 call records lost (event_loss))"
             ),
             "{out}"
@@ -6440,14 +6442,18 @@ pub(crate) mod tests {
         let out = frame(|ev| ev.semantic_unverified_slots = 68, true);
         assert!(
             out.contains(
-                "→ PARTIAL: names withheld (attribution withheld) \
-                 (68 functions counted but not named (semantic_unverified_slots))"
+                "→ PARTIAL — names unconfirmed (attribution withheld) \
+                 (function names follow the standard PKCS#11 table and were not confirmed \
+                 by a manifest (add --manifest to confirm) (68 slots; semantic_unverified_slots))"
             ),
             "{out}"
         );
         let out = frame(|ev| ev.unprotected_live_windows = 1, false);
         assert!(
-            out.contains("unguarded live capture window (unprotected_live_windows)"),
+            out.contains(
+                "calls made while probes were being attached may be missing \
+                 (unprotected_live_windows)"
+            ),
             "{out}"
         );
         let out = frame(|ev| ev.pending_at_end = 2, false);
@@ -6493,9 +6499,9 @@ pub(crate) mod tests {
             out.contains("3 functions claimed by two provider files"),
             "{out}"
         );
-        assert!(out.contains("1 provider files not watched"), "{out}");
+        assert!(out.contains("1 provider file not watched"), "{out}");
         assert!(out.contains("memory scan unavailable (ptrace)"), "{out}");
-        assert!(out.contains("PARTIAL"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
     }
 
     /// CLI-1/F2: the concise profile summary keeps totals with plain
@@ -6518,11 +6524,17 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Concise,
         );
-        assert!(out.contains("Coverage PARTIAL"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
         assert!(out.contains("calls may be missing"), "{out}");
         assert!(out.contains("12 call records lost"), "{out}");
-        assert!(out.contains("names withheld"), "{out}");
-        assert!(out.contains("68 functions counted but not named"), "{out}");
+        assert!(out.contains("names unconfirmed"), "{out}");
+        assert!(
+            out.contains(
+                "function names follow the standard PKCS#11 table and were not confirmed \
+                 by a manifest (add --manifest to confirm)"
+            ),
+            "{out}"
+        );
         assert!(
             out.contains("manifest and scan disagree on 1 provider file"),
             "{out}"
@@ -6547,7 +6559,7 @@ pub(crate) mod tests {
 
     /// F2: the concise profile summary names a refused provider with
     /// its file and the `--module` remedy (not just the aggregate
-    /// "1 provider files not watched" fragment).
+    /// "1 provider file not watched" fragment).
     #[test]
     fn concise_profile_summary_names_refused_provider_with_remedy() {
         let mut ev = evidence();
@@ -6562,10 +6574,629 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Concise,
         );
-        assert!(out.contains("1 provider files not watched"), "{out}");
+        assert!(out.contains("1 provider file not watched"), "{out}");
         assert!(out.contains("/opt/refused.so"), "{out}");
         assert!(
             out.contains("capture it alone with --module /opt/refused.so"),
+            "{out}"
+        );
+    }
+
+    /// CLI text: one coverage format in capture text — `coverage: partial —
+    /// <reasons>` and `coverage: complete` — in every verbosity.
+    #[test]
+    fn coverage_line_uses_one_lowercase_format() {
+        let mut partial = evidence();
+        partial.event_loss = 12;
+        partial.verdict();
+        assert_eq!(partial.completeness, "PARTIAL");
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &partial, verbosity);
+            assert!(
+                out.contains("coverage: partial — "),
+                "{verbosity:?}: {out}"
+            );
+            assert!(!out.contains("Coverage PARTIAL"), "{verbosity:?}: {out}");
+            assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
+        }
+        let mut complete = evidence();
+        complete.verdict();
+        assert_eq!(complete.completeness, "COMPLETE");
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out =
+                scope_summary_with_verbosity("pid", &reports_fixture(), &complete, verbosity);
+            assert!(out.contains("coverage: complete"), "{verbosity:?}: {out}");
+            assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
+        }
+    }
+
+    /// CLI text: every counted coverage fragment uses the singular for
+    /// one and the plural otherwise.
+    #[test]
+    fn coverage_counts_use_singular_for_one() {
+        fn summary(mutated: fn(&mut Evidence)) -> String {
+            let mut ev = evidence();
+            // The loader aggregate is complete by default; keep every
+            // other gate clean so each arm below pins only its fragment.
+            mutated(&mut ev);
+            ev.verdict();
+            scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                crate::cli::TextVerbosity::Concise,
+            )
+        }
+        fn bad_surface() -> crate::plan::SurfaceSummary {
+            crate::plan::SurfaceSummary {
+                source: "legacy_function_list".into(),
+                walk: "partial".into(),
+                acquisition: "ok".into(),
+                functions: 68,
+            }
+        }
+        fn refused(module: &str, reason: &str) -> SkippedOut {
+            SkippedOut {
+                name: module.into(),
+                reason: reason.into(),
+            }
+        }
+        // (mutation for one, mutation for two, singular, plural)
+        let arms: Vec<(fn(&mut Evidence), fn(&mut Evidence), &str, &str)> = vec![
+            (
+                |ev| ev.attach_failures.push("slot 3: EPERM".into()),
+                |ev| {
+                    ev.attach_failures.push("slot 3: EPERM".into());
+                    ev.attach_failures.push("slot 4: EPERM".into());
+                },
+                "1 function could not be watched",
+                "2 functions could not be watched",
+            ),
+            (
+                |ev| ev.in_flight_at_end = 1,
+                |ev| ev.in_flight_at_end = 2,
+                "1 call still running at capture end",
+                "2 calls still running at capture end",
+            ),
+            (
+                |ev| ev.surfaces = vec![ok_surface(), bad_surface()],
+                |ev| ev.surfaces = vec![bad_surface(), bad_surface()],
+                "1 provider table incompletely read",
+                "2 provider tables incompletely read",
+            ),
+            (
+                |ev| ev.vendor_interfaces = 1,
+                |ev| ev.vendor_interfaces = 2,
+                "1 vendor-specific interface not decoded",
+                "2 vendor-specific interfaces not decoded",
+            ),
+            (
+                |ev| ev.event_loss = 1,
+                |ev| ev.event_loss = 2,
+                "1 call record lost",
+                "2 call records lost",
+            ),
+            (
+                |ev| ev.start_insert_failures = 1,
+                |ev| ev.start_insert_failures = 2,
+                "1 call start not recorded",
+                "2 call starts not recorded",
+            ),
+            (
+                |ev| ev.unmatched_returns = 1,
+                |ev| ev.unmatched_returns = 2,
+                "1 return without a recorded start",
+                "2 returns without a recorded start",
+            ),
+            (
+                |ev| ev.rv_update_failures = 1,
+                |ev| ev.rv_update_failures = 2,
+                "1 return value not recorded",
+                "2 return values not recorded",
+            ),
+            (
+                |ev| ev.cgroup_scope_failures = 1,
+                |ev| ev.cgroup_scope_failures = 2,
+                "1 cgroup membership check failed",
+                "2 cgroup membership checks failed",
+            ),
+            (
+                |ev| ev.abi_refusals = 1,
+                |ev| ev.abi_refusals = 2,
+                "1 unexpected probe hit refused",
+                "2 unexpected probe hits refused",
+            ),
+            (
+                |ev| ev.malformed_records = 1,
+                |ev| ev.malformed_records = 2,
+                "1 unreadable kernel record",
+                "2 unreadable kernel records",
+            ),
+            (
+                |ev| ev.discovery_ring_loss = 1,
+                |ev| ev.discovery_ring_loss = 2,
+                "1 discovery record lost",
+                "2 discovery records lost",
+            ),
+            (
+                |ev| ev.discovery_state_failures = 1,
+                |ev| ev.discovery_state_failures = 2,
+                "1 discovery update failed",
+                "2 discovery updates failed",
+            ),
+            (
+                |ev| ev.discovery_read_failures = 1,
+                |ev| ev.discovery_read_failures = 2,
+                "1 discovery read failed",
+                "2 discovery reads failed",
+            ),
+            (
+                |ev| ev.discovery_truncated = 1,
+                |ev| ev.discovery_truncated = 2,
+                "1 discovery record truncated",
+                "2 discovery records truncated",
+            ),
+            (
+                |ev| ev.task_uprobe_link_losses = 1,
+                |ev| ev.task_uprobe_link_losses = 2,
+                "1 probe link lost",
+                "2 probe links lost",
+            ),
+            (
+                |ev| ev.pause_partial = 1,
+                |ev| ev.pause_partial = 2,
+                "1 load only partly paused",
+                "2 loads only partly paused",
+            ),
+            (
+                |ev| ev.pause_unavailable = 1,
+                |ev| ev.pause_unavailable = 2,
+                "1 load could not be paused (collected unpaused)",
+                "2 loads could not be paused (collected unpaused)",
+            ),
+            (
+                |ev| ev.multi_rebuild_gaps = 1,
+                |ev| ev.multi_rebuild_gaps = 2,
+                "1 probe re-attach gap",
+                "2 probe re-attach gaps",
+            ),
+            (
+                |ev| ev.aliased = vec![vec!["C_Sign".into(), "C_Encrypt".into()]],
+                |ev| {
+                    ev.aliased = vec![
+                        vec!["C_Sign".into(), "C_Encrypt".into()],
+                        vec!["C_Digest".into(), "C_DigestUpdate".into()],
+                    ];
+                },
+                "1 function sharing an address",
+                "2 functions sharing an address",
+            ),
+            (
+                |ev| ev.discovery.module_ambiguous = 1,
+                |ev| ev.discovery.module_ambiguous = 2,
+                "1 function claimed by two provider files",
+                "2 functions claimed by two provider files",
+            ),
+            (
+                |ev| ev.module_unresolved_slots = 1,
+                |ev| ev.module_unresolved_slots = 2,
+                "1 function with no proven provider file",
+                "2 functions with no proven provider file",
+            ),
+            (
+                |ev| ev.unregistered_mechanisms = 1,
+                |ev| ev.unregistered_mechanisms = 2,
+                "1 unregistered mechanism",
+                "2 unregistered mechanisms",
+            ),
+            (
+                |ev| ev.unpublished_mechanisms = 1,
+                |ev| ev.unpublished_mechanisms = 2,
+                "1 vendor mechanism not listed by name",
+                "2 vendor mechanisms not listed by name",
+            ),
+            (
+                |ev| ev.discovery.uncorroborated = 1,
+                |ev| ev.discovery.uncorroborated = 2,
+                "1 provider file not confirmed from a second source",
+                "2 provider files not confirmed from a second source",
+            ),
+            (
+                |ev| ev.semantic_capture_failures = 1,
+                |ev| ev.semantic_capture_failures = 2,
+                "1 mechanism detail not recorded",
+                "2 mechanism details not recorded",
+            ),
+            (
+                |ev| ev.template_tail_failures = 1,
+                |ev| ev.template_tail_failures = 2,
+                "1 attribute-list read not recorded",
+                "2 attribute-list reads not recorded",
+            ),
+            (
+                |ev| ev.semantic_history_drops = 1,
+                |ev| ev.semantic_history_drops = 2,
+                "1 mechanism history dropped",
+                "2 mechanism histories dropped",
+            ),
+            (
+                |ev| ev.shape_decode_total_failures = 1,
+                |ev| ev.shape_decode_total_failures = 2,
+                "1 mechanism never decoded",
+                "2 mechanisms never decoded",
+            ),
+            (
+                |ev| ev.pending_at_end = 1,
+                |ev| ev.pending_at_end = 2,
+                "1 session-tracking gap",
+                "2 session-tracking gaps",
+            ),
+            (
+                |ev| ev.pid_descendant_gaps = 1,
+                |ev| ev.pid_descendant_gaps = 2,
+                "1 short-lived process gap",
+                "2 short-lived process gaps",
+            ),
+            (
+                |ev| {
+                    ev.stdout_data_sink = true;
+                    ev.scheduling.sink_dropped_bytes = 1;
+                },
+                |ev| {
+                    ev.stdout_data_sink = true;
+                    ev.scheduling.sink_dropped_bytes = 2;
+                },
+                "1 output byte dropped",
+                "2 output bytes dropped",
+            ),
+            (
+                |ev| ev.discovery.modules_skipped = vec![refused("/opt/a.so", "capacity")],
+                |ev| {
+                    ev.discovery.modules_skipped =
+                        vec![refused("/opt/a.so", "capacity"), refused("/opt/b.so", "capacity")];
+                },
+                "1 provider file not watched",
+                "2 provider files not watched",
+            ),
+            (
+                |ev| {
+                    ev.discovery.modules_skipped =
+                        vec![refused("/opt/a.so", "admitted module needs 5 more slots")];
+                },
+                |ev| {
+                    ev.discovery.modules_skipped = vec![
+                        refused("/opt/a.so", "admitted module needs 5 more slots"),
+                        refused("/opt/b.so", "admitted module needs 5 more slots"),
+                    ];
+                },
+                "1 provider file partially covered",
+                "2 provider files partially covered",
+            ),
+        ];
+        for (one, two, singular, plural) in arms {
+            let out = summary(one);
+            assert!(out.contains(singular), "missing {singular:?}: {out}");
+            let out = summary(two);
+            assert!(out.contains(plural), "missing {plural:?}: {out}");
+        }
+    }
+
+    /// CLI text: discovery-subject skips are unavailable discovery
+    /// steps, not skipped functions; verbose lists each item with its
+    /// reason.
+    #[test]
+    fn skipped_discovery_subjects_render_as_unavailable_steps() {
+        let subject = || SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        };
+        let function = || SkippedOut {
+            name: "C_Sign".into(),
+            reason: "function entry unavailable".into(),
+        };
+        // Subjects alone: no "functions skipped" at all.
+        let mut ev = evidence();
+        ev.skipped = vec![subject()];
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains("1 discovery step unavailable"),
+            "{out}"
+        );
+        assert!(!out.contains("functions skipped"), "{out}");
+        assert!(!out.contains("function skipped"), "{out}");
+        // Mixed: both fragments, each counted.
+        let mut ev = evidence();
+        ev.skipped = vec![subject(), subject(), function()];
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("2 discovery steps unavailable"), "{out}");
+        assert!(out.contains("1 function skipped"), "{out}");
+        // Verbose lists the items with their reasons.
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("C_Sign (function entry unavailable)"), "{out}");
+        assert!(out.contains("discovery subject (discovery unavailable)"), "{out}");
+    }
+
+    /// CLI text: loader and live-window gaps read as plain words,
+    /// never as internal mechanism names.
+    #[test]
+    fn loader_gaps_use_plain_words() {
+        let summary = |mutated: fn(&mut Evidence)| {
+            let mut ev = evidence();
+            mutated(&mut ev);
+            ev.verdict();
+            scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                crate::cli::TextVerbosity::Concise,
+            )
+        };
+        let out = summary(|ev| ev.unprotected_live_windows = 1);
+        assert!(
+            out.contains("calls made while probes were being attached may be missing"),
+            "{out}"
+        );
+        assert!(!out.contains("unguarded live capture window"), "{out}");
+        let out = summary(|ev| ev.loader_discovery.initial_set_capture.none = 1);
+        assert!(
+            out.contains("library-load tracking could not be confirmed"),
+            "{out}"
+        );
+        assert!(!out.contains("live loader timing unproven"), "{out}");
+        let out = summary(|ev| {
+            ev.loader_discovery.initial_set_capture.none = 1;
+            ev.loader_discovery.strategies.debug_state_every_hit = 2;
+        });
+        assert!(
+            out.contains("library-load tracking missed loads it should have seen"),
+            "{out}"
+        );
+        assert!(!out.contains("uprobe miss suspected"), "{out}");
+        let out = summary(|ev| {
+            ev.loader_discovery.initial_set_capture.none = 1;
+            ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        });
+        assert!(
+            out.contains("library-load tracking received nothing from the kernel"),
+            "{out}"
+        );
+        assert!(!out.contains("delivery failure suspected"), "{out}");
+    }
+
+    /// CLI text: when names are the only gap, counts are complete and
+    /// the names follow the standard table unconfirmed — never
+    /// "withheld" above a table that names them.
+    #[test]
+    fn attribution_only_coverage_names_unconfirmed_standard_names() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains(
+                "coverage: counts complete; function names follow the standard PKCS#11 table \
+                 and were not confirmed by a manifest (add --manifest to confirm)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("names withheld"), "{out}");
+        assert!(!out.contains("counted but not named"), "{out}");
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("counts complete"), "{out}");
+        assert!(out.contains("semantic_unverified_slots"), "{out}");
+        assert!(out.contains("68"), "{out}");
+        // Beside a concrete gap the group keeps its label, reworded.
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("names unconfirmed"), "{out}");
+        assert!(!out.contains("names withheld"), "{out}");
+    }
+
+    /// CLI text: the frame header states the scope once, and the
+    /// privacy mode only under -v.
+    #[test]
+    fn frame_header_states_scope_once_without_default_privacy() {
+        let mut ev = evidence();
+        ev.verdict();
+        let frame = |verbosity| {
+            live_scoped_with_verbosity(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &BTreeMap::new(),
+                verbosity,
+            )
+        };
+        let out = frame(crate::cli::TextVerbosity::Concise);
+        assert!(
+            out.contains("p11scope — PID scope — up 00:00:00 — mode profile — /opt/p11.so\n"),
+            "{out}"
+        );
+        assert!(!out.contains("privacy="), "{out}");
+        assert!(!out.contains("Scope: PID scope"), "{out}");
+        let out = frame(crate::cli::TextVerbosity::Verbose);
+        assert!(out.contains("privacy=allowlisted"), "{out}");
+        assert!(!out.contains("Scope: PID scope"), "{out}");
+        let out = frame(crate::cli::TextVerbosity::Quiet);
+        assert!(!out.contains("privacy="), "{out}");
+    }
+
+    /// CLI text: an owned run that never paused while its command ran
+    /// ahead names the missed load and the `--pause auto` remedy; a
+    /// command with no missed load keeps the generic reasons.
+    #[test]
+    fn owned_run_without_pause_names_the_missed_provider_load() {
+        const REMEDY: &str = "the command loaded its provider before probes attached; \
+                              rerun with --pause auto";
+        let subject = || SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        };
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.skipped = vec![subject(), subject()];
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &[], &ev, verbosity);
+            assert!(
+                out.contains(&format!("coverage: partial — {REMEDY}")),
+                "{verbosity:?}: {out}"
+            );
+            assert!(!out.contains("no provider files found"), "{verbosity:?}: {out}");
+        }
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &[],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains(REMEDY), "{out}");
+        assert!(out.contains("unprotected_live_windows"), "{out}");
+        // No missed load: a bare command keeps the generic reasons.
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.unprotected_live_windows = 1;
+        ev.skipped = vec![subject()];
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &[],
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains(REMEDY), "{out}");
+        assert!(out.contains("no provider files found"), "{out}");
+        // Pause protection was used: no remedy either.
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.pause = "sigstop";
+        ev.pause_attempts = 1;
+        ev.pause_confirmed = 1;
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &[],
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains(REMEDY), "{out}");
+        // Not an owned run: no remedy.
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &[],
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains(REMEDY), "{out}");
+    }
+
+    /// CLI text: one latency legend, and no function table at all
+    /// when nothing was called.
+    #[test]
+    fn empty_capture_omits_table_and_keeps_one_legend() {
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains("FUNCTION"), "{out}");
+        assert!(!out.contains("CALLS = completed calls"), "{out}");
+        assert!(!out.contains("Latency units"), "{out}");
+        assert!(!out.contains("log2-bucket approximation"), "{out}");
+        let out = live_scoped_with_verbosity(
+            &reports_fixture(),
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("FUNCTION"), "{out}");
+        assert_eq!(
+            out.matches("log2-bucket approximation, lower bound").count(),
+            1,
             "{out}"
         );
     }
@@ -6595,7 +7226,7 @@ pub(crate) mod tests {
             // One coverage verdict, not two worded differently.
             let coverage_lines = out
                 .lines()
-                .filter(|line| line.to_lowercase().starts_with("coverage "))
+                .filter(|line| line.to_lowercase().starts_with("coverage:"))
                 .count();
             assert_eq!(coverage_lines, 1, "{verbosity:?}: {out}");
         }
@@ -6626,11 +7257,14 @@ pub(crate) mod tests {
         );
         assert!(out.contains("12 call records lost (event_loss)"), "{out}");
         assert!(
-            out.contains("names withheld (attribution withheld)"),
+            out.contains("names unconfirmed (attribution withheld)"),
             "{out}"
         );
         assert!(
-            out.contains("68 functions counted but not named (semantic_unverified_slots)"),
+            out.contains(
+                "function names follow the standard PKCS#11 table and were not confirmed \
+                 by a manifest (add --manifest to confirm) (68 slots; semantic_unverified_slots)"
+            ),
             "{out}"
         );
         assert!(out.contains("(discovery_conflicts)"), "{out}");
@@ -6651,14 +7285,14 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Quiet,
         );
         assert!(out.contains("1 completed calls;"), "{out}");
-        assert!(out.contains("Coverage PARTIAL"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("Attribution:"), "{out}");
         assert!(!out.contains("Module gaps"), "{out}");
     }
 
-    /// CLI-1: a COMPLETE verdict says nothing known was lost.
+    /// CLI-1: a COMPLETE verdict reads `coverage: complete`.
     #[test]
-    fn complete_coverage_names_nothing_lost() {
+    fn complete_coverage_reads_complete() {
         let mut ev = evidence();
         ev.verdict();
         assert_eq!(ev.completeness, "COMPLETE");
@@ -6669,7 +7303,7 @@ pub(crate) mod tests {
         ] {
             let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
             assert!(
-                out.contains("Coverage COMPLETE (nothing known was lost)"),
+                out.contains("coverage: complete"),
                 "{verbosity:?}: {out}"
             );
         }
@@ -6699,7 +7333,7 @@ pub(crate) mod tests {
         assert!(out.contains("C_Sign"), "{out}");
         assert!(out.contains("MECHANISM"), "{out}");
         assert!(out.contains("CKM_SHA256"), "{out}");
-        assert!(out.contains("Coverage PARTIAL"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("Evidence:"), "{out}");
         assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
     }
@@ -6744,7 +7378,7 @@ pub(crate) mod tests {
         );
         assert!(out.contains("p11scope — PID scope"), "{out}");
         assert!(out.contains("10 completed calls;"), "{out}");
-        assert!(out.contains("Coverage PARTIAL"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("FUNCTION"), "{out}");
         assert!(!out.contains("Evidence:"), "{out}");
         assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
@@ -6785,8 +7419,8 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(out.contains("1 provider files not watched"), "{out}");
-        assert!(out.contains("1 provider files partially covered"), "{out}");
+        assert!(out.contains("1 provider file not watched"), "{out}");
+        assert!(out.contains("1 provider file partially covered"), "{out}");
         assert!(!out.contains("2 provider files not watched"), "{out}");
 
         let value = versioned_evidence(&ev);
@@ -6815,7 +7449,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(text.contains("1 provider files not watched"), "{text}");
+        assert!(text.contains("1 provider file not watched"), "{text}");
         assert!(text.contains("Module gaps (showing 1 of 1):"), "{text}");
         assert!(
             text.contains("/opt/p11-kit-trust.so: not attached — "),
@@ -6889,14 +7523,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// PID scope covers one process: the aggregate note stays silent while
-    /// the scope line still names it.
+    /// PID scope covers one process: the aggregate note stays silent,
+    /// and the header already named the scope, so no scope line repeats it.
     #[test]
     fn scope_summary_for_pid_scope_omits_the_aggregate_note() {
         let mut ev = evidence();
         ev.verdict();
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("Scope: PID scope"), "{text}");
+        assert!(!text.contains("Scope:"), "{text}");
         assert!(!text.contains("not per application"), "{text}");
     }
 
@@ -7019,7 +7653,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
         );
         assert!(
-            text.contains("1 provider files partially covered"),
+            text.contains("1 provider file partially covered"),
             "{text}"
         );
         assert!(
@@ -7100,7 +7734,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
         );
         assert!(
-            text.contains("1 provider files partially covered"),
+            text.contains("1 provider file partially covered"),
             "{text}"
         );
         assert!(
@@ -7174,7 +7808,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Verbose,
         );
         assert!(
-            text.contains("1 provider files partially covered"),
+            text.contains("1 provider file partially covered"),
             "{text}"
         );
         assert!(
@@ -7204,7 +7838,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Verbose,
         );
-        assert!(text.contains("1 provider files not watched"), "{text}");
+        assert!(text.contains("1 provider file not watched"), "{text}");
         assert!(!text.contains("partially covered"), "{text}");
         assert!(text.contains("/opt/crowded.so: not attached — "), "{text}");
         assert!(!text.contains("partially covered"), "{text}");
@@ -7763,8 +8397,8 @@ pub(crate) mod tests {
         );
         assert!(
             out.contains(
-                "Mechanisms: none attributed — 212 functions counted but not named; \
-                 add --manifest for each mapped provider file (see Coverage)."
+                "Mechanisms: none attributed — 212 functions named from the standard table, \
+                 unconfirmed; add --manifest for each mapped provider file (see Coverage)."
             ),
             "{out}"
         );
@@ -7805,7 +8439,13 @@ pub(crate) mod tests {
             out.contains("Mechanisms: none recorded for the observed calls."),
             "{out}"
         );
-        assert!(!out.contains("--manifest"), "{out}");
+        // The note itself offers no manifest remedy; the coverage line
+        // above it still names the unconfirmed names.
+        let note = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {out}");
+        assert!(!note.contains("--manifest"), "{out}");
     }
 
     /// Empty mechanisms with fully attested slots: none of the observed
@@ -7904,7 +8544,7 @@ pub(crate) mod tests {
             out.contains("2 unreadable kernel records"),
             "malformed_records must appear in the coverage line"
         );
-        assert!(out.contains("PARTIAL"));
+        assert!(out.contains("coverage: partial"));
     }
 
     #[test]
@@ -7961,7 +8601,7 @@ pub(crate) mod tests {
             out.find("2 call records lost").unwrap(),
             out.find("3 unreadable kernel records").unwrap(),
             out.find("provider file changed during capture").unwrap(),
-            out.find("names withheld (").unwrap(),
+            out.find("names unconfirmed (").unwrap(),
             out.find("manifest and scan disagree on 1 provider file")
                 .unwrap(),
         ];
@@ -8005,61 +8645,67 @@ pub(crate) mod tests {
             ("manifest and scan disagree on 1 provider file", |e| {
                 e.discovery.conflicts = 1
             }),
-            ("1 provider files not confirmed from a second source", |e| {
+            ("1 provider file not confirmed from a second source", |e| {
                 e.discovery.uncorroborated = 1;
             }),
-            ("1 functions claimed by two provider files", |e| {
+            ("1 function claimed by two provider files", |e| {
                 e.discovery.module_ambiguous = 1;
             }),
-            ("1 provider files not watched", |e| {
+            ("1 provider file not watched", |e| {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/x.so".into(),
                     reason: "capacity".into(),
                 });
             }),
-            ("1 provider files partially covered", |e| {
+            ("1 provider file partially covered", |e| {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/grown.so".into(),
                     reason: GROWTH_OMISSION_RECORD.into(),
                 });
             }),
-            ("1 provider tables incompletely read", |e| {
+            ("1 provider table incompletely read", |e| {
                 e.surfaces[0].walk = "known_prefix".into();
             }),
-            ("1 vendor-specific interfaces not decoded", |e| {
+            ("1 vendor-specific interface not decoded", |e| {
                 e.vendor_interfaces = 1
             }),
-            ("1 call records lost", |e| e.event_loss = 1),
-            ("1 call starts not recorded", |e| {
+            ("1 call record lost", |e| e.event_loss = 1),
+            ("1 call start not recorded", |e| {
                 e.start_insert_failures = 1
             }),
-            ("1 returns without a recorded start", |e| {
+            ("1 return without a recorded start", |e| {
                 e.unmatched_returns = 1
             }),
-            ("1 return values not recorded", |e| e.rv_update_failures = 1),
-            ("1 cgroup membership checks failed", |e| {
+            ("1 return value not recorded", |e| e.rv_update_failures = 1),
+            ("1 cgroup membership check failed", |e| {
                 e.cgroup_scope_failures = 1
             }),
-            ("1 mechanism details not recorded", |e| {
+            ("1 mechanism detail not recorded", |e| {
                 e.semantic_capture_failures = 1;
             }),
-            ("1 unregistered mechanisms", |e| {
+            ("1 unregistered mechanism", |e| {
                 e.unregistered_mechanisms = 1;
             }),
-            ("1 attribute-list reads not recorded", |e| {
+            ("1 attribute-list read not recorded", |e| {
                 e.template_tail_failures = 1;
             }),
-            ("1 function counted but not named", |e| {
-                e.semantic_unverified_slots = 1;
-            }),
-            ("2 functions counted but not named", |e| {
-                e.semantic_unverified_slots = 2;
-            }),
-            ("1 unreadable kernel records", |e| e.malformed_records = 1),
+            (
+                "coverage: counts complete; function names follow the standard PKCS#11 table",
+                |e| {
+                    e.semantic_unverified_slots = 1;
+                },
+            ),
+            (
+                "coverage: counts complete; function names follow the standard PKCS#11 table",
+                |e| {
+                    e.semantic_unverified_slots = 2;
+                },
+            ),
+            ("1 unreadable kernel record", |e| e.malformed_records = 1),
             ("attribute lists cut short", |e| {
                 e.templates_truncated = true
             }),
-            ("1 mechanisms never decoded", |e| {
+            ("1 mechanism never decoded", |e| {
                 e.shape_decode_total_failures = 1;
             }),
             ("provider file changed during capture", |e| {
@@ -8122,8 +8768,12 @@ pub(crate) mod tests {
                 CapturePolicy::Allowlisted,
             );
             assert!(
-                out.contains("1 session-tracking gaps"),
+                out.contains("1 session-tracking gap"),
                 "state summand lost from the aggregate: {out}"
+            );
+            assert!(
+                !out.contains("1 session-tracking gaps"),
+                "singular count must use the singular: {out}"
             );
         }
         for (fragment, mutate) in info_cases {
@@ -8179,7 +8829,7 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(out.contains("1 provider tables incompletely read"), "{out}");
+        assert!(out.contains("1 provider table incompletely read"), "{out}");
         assert!(!out.contains("unsupported function-table"), "{out}");
     }
 
@@ -8846,13 +9496,16 @@ pub(crate) mod tests {
         ev.verdict();
 
         assert_eq!(ev.completeness, "PARTIAL");
-        let out = live(
+        let out = live_scoped_with_verbosity(
             &[],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
             "profile",
             crate::attach::CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(out.contains("privacy=allowlisted"), "{out}");
         assert!(out.contains("2 unregistered mechanisms"), "{out}");
@@ -8868,13 +9521,16 @@ pub(crate) mod tests {
             ),
             (CapturePolicy::AggregateOnly, "aggregate-only"),
         ] {
-            let out = live(
+            let out = live_scoped_with_verbosity(
                 &[],
                 &evidence(),
                 Duration::ZERO,
                 "/opt/p11.so",
                 "test",
                 policy,
+                "selected",
+                &BTreeMap::new(),
+                crate::cli::TextVerbosity::Verbose,
             );
             assert!(out.contains(&format!("privacy={label}")), "{out}");
         }
@@ -10065,7 +10721,7 @@ pub(crate) mod tests {
             );
         }
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 functions skipped"), "{text}");
+        assert!(text.contains("1 discovery step unavailable"), "{text}");
         assert!(
             text.contains(
                 "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
@@ -10152,7 +10808,7 @@ pub(crate) mod tests {
             ])
         );
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("4 functions skipped"), "{text}");
+        assert!(text.contains("4 discovery steps unavailable"), "{text}");
         for fragment in [
             "loader context capacity 256 is exhausted: 2",
             "a deferred loader memory scan exceeded the bounded loader-context ledger: 1",
@@ -10227,7 +10883,7 @@ pub(crate) mod tests {
         }
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!text.contains("PRIVATE_"), "{text}");
-        assert!(text.contains("5 functions skipped"), "{text}");
+        assert!(text.contains("5 discovery steps unavailable"), "{text}");
     }
 
     /// Twins: reasons that merely start with an allowlisted sentence but
@@ -10313,7 +10969,7 @@ pub(crate) mod tests {
         assert!(!rendered.contains("/private/"), "{rendered}");
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!text.contains("PRIVATE_"), "{text}");
-        assert!(text.contains("10 functions skipped"), "{text}");
+        assert!(text.contains("10 discovery steps unavailable"), "{text}");
     }
 
     /// With the compiled-in timing catalog empty (D3), debug-state discovery
@@ -10429,11 +11085,11 @@ pub(crate) mod tests {
     }
 
     /// The 0-hit ghost with a single initial-set context never saw its EXEC
-    /// acknowledged (a second live context would exist otherwise), so BPF
-    /// delivered no loader or lifecycle records for the run. The report names
-    /// that delivery failure instead of generic unproven timing.
+    /// acknowledged (a second live context would exist otherwise), so the
+    /// kernel delivered no loader or lifecycle records for the run. The
+    /// report names that empty tracking instead of generic unproven timing.
     #[test]
-    fn a_never_fired_single_context_loader_names_bpf_delivery_failure() {
+    fn a_never_fired_single_context_loader_names_empty_tracking() {
         let mut ghost = evidence();
         ghost.loader_discovery.strategies.debug_state_every_hit = 1;
         ghost.loader_discovery.hits = 0;
@@ -10443,19 +11099,17 @@ pub(crate) mod tests {
         ghost.verdict();
         let reasons = verdict_reasons(&ghost, false);
         assert!(
-            reasons.contains("BPF delivery failure")
-                && reasons.contains("no EXEC acknowledgment")
-                && reasons.contains("suspected"),
-            "ghost names the delivery failure, got: {reasons:?}",
+            reasons.contains("library-load tracking received nothing from the kernel"),
+            "ghost names the empty tracking, got: {reasons:?}",
         );
     }
 
     /// Zero hits with two bound contexts means the EXEC was processed (a
     /// second live context exists via acknowledgment or immediate re-arm)
-    /// but the loader uprobe itself never fired: a loader-specific miss,
+    /// but the loader tracking itself never fired: a loader-specific miss,
     /// not a silent run. The report names that.
     #[test]
-    fn a_never_fired_processed_loader_names_uprobe_miss() {
+    fn a_never_fired_processed_loader_names_missed_loads() {
         let mut miss = evidence();
         miss.loader_discovery.strategies.debug_state_every_hit = 2;
         miss.loader_discovery.hits = 0;
@@ -10474,15 +11128,13 @@ pub(crate) mod tests {
         );
         let reasons = verdict_reasons(&miss, false);
         assert!(
-            reasons.contains("uprobe miss")
-                && reasons.contains("EXEC processing")
-                && reasons.contains("suspected"),
-            "processed 0-hit loader names the uprobe miss, got: {reasons:?}",
+            reasons.contains("library-load tracking missed loads it should have seen"),
+            "processed 0-hit loader names the missed loads, got: {reasons:?}",
         );
     }
 
-    /// A loader that fired keeps the generic unproven-timing text: the
-    /// delivery-failure and uprobe-miss arms are 0-hit only.
+    /// A loader that fired keeps the generic unconfirmed-tracking text:
+    /// the empty-tracking and missed-loads arms are 0-hit only.
     #[test]
     fn a_fired_loader_keeps_generic_unproven_timing_text() {
         let mut fired = evidence();
@@ -10504,11 +11156,11 @@ pub(crate) mod tests {
         );
         let reasons = verdict_reasons(&fired, false);
         assert!(
-            reasons.contains("live loader timing unproven"),
+            reasons.contains("library-load tracking could not be confirmed"),
             "fired loader keeps generic text, got: {reasons:?}",
         );
         assert!(
-            !reasons.contains("BPF delivery failure") && !reasons.contains("uprobe miss"),
+            !reasons.contains("received nothing") && !reasons.contains("missed loads"),
             "fired loader names no 0-hit cause, got: {reasons:?}",
         );
     }

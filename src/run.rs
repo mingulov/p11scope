@@ -9380,7 +9380,7 @@ mod tests {
         );
         assert!(out.contains("p11scope — PID scope"), "{out}");
         assert!(out.contains("10 completed calls;"), "{out}");
-        assert!(out.contains("Coverage PARTIAL"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("FUNCTION"), "{out}");
         assert!(!out.contains("Evidence:"), "{out}");
         assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");

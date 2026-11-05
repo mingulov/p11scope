@@ -13942,6 +13942,52 @@ mod tests {
         assert_eq!(kind_of(&rebuilt, 10), Some(RefusalKind::GrowthOmission));
     }
 
+    /// The Detailed closure note states the Route A rule: published tables
+    /// attach, and only an operator-named layer keeps a prefix. The retired
+    /// first-plan prefix rule is gone from user output.
+    #[test]
+    fn detailed_closure_note_states_published_only_without_the_first_plan_prefix() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        let gap = refusal_of(&first, P11_KIT).expect("closure gap named");
+        assert!(
+            is_closure_awaiting_publication(&gap.reason),
+            "{}",
+            gap.reason
+        );
+        assert!(
+            gap.reason.contains("as a prefix when named by the operator"),
+            "the note states the named exception without the retired first-plan rule: {}",
+            gap.reason
+        );
+        assert!(
+            !gap.reason.contains("beside a provider"),
+            "the retired first-plan prefix rule is gone from user output: {}",
+            gap.reason
+        );
+    }
+
+    /// The whole-policy closure note states whole admission: no prefix
+    /// exists under Inventory/Counters/broad, so none is claimed.
+    #[test]
+    fn whole_policy_closure_note_states_whole_admission() {
+        let closure = provider_with_tables(92, "/opt/heuristic.so", 64, 103, false);
+        let inventory =
+            build_from_test_sources_with_policy(std::slice::from_ref(&closure), &[], inventory_policy(100));
+        assert_eq!(inventory.modules_skipped.len(), 1);
+        let refusal = &inventory.modules_skipped[0];
+        assert!(
+            refusal.reason.contains("admitted whole under this capture policy"),
+            "the whole-policy note states whole admission: {}",
+            refusal.reason
+        );
+        assert!(
+            !refusal.reason.contains("as a prefix"),
+            "no prefix exists under whole admission: {}",
+            refusal.reason
+        );
+    }
+
     /// Named exception ordering: a named closure admitted in an earlier
     /// pass (309 held) crowds a named two-table provider arriving later:
     /// its first table attaches, the second spills (known cost of the

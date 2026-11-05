@@ -841,7 +841,12 @@ Limits that matter in pods:
   world-writable unless it has the sticky bit (as `/tmp` does); otherwise
   `-o` is refused, naming the directory, its mode and a fix. A home
   directory created under Ubuntu's default umask (0775) needs
-  `chmod g-w,o-w` first.
+  `chmod g-w,o-w` first. Under `sudo`, when `SUDO_UID`/`SUDO_GID` name
+  the invoking account and the output directory belongs to that user,
+  newly created report, trace and event-log files are handed to that
+  user (still private `0600`), so the report stays readable without
+  `sudo cat`; pre-existing files keep their owner, and anywhere else
+  the files stay root-owned as before.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one

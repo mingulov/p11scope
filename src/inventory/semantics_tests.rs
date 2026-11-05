@@ -761,6 +761,78 @@ fn native_semantic_scan_subset_mints_beside_incomplete_provider() {
     );
 }
 
+/// DEMO-4 regression (fedora ff-late-2, 2026-11-05): the system
+/// p11-kit proxy is not merely incomplete, its closure demand
+/// (thousands of endpoints) exceeds the Detailed subset's slot
+/// space. A provider that can never mint must not consume the
+/// subset budget ahead of the complete provider beside it.
+#[test]
+fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    // The incomplete provider is created (and so pinned) first:
+    // live, the system p11-kit proxy holds the lower object id
+    // and wins the subset plan's budget race ahead of softokn.
+    let partial = ProviderFixture::new();
+    let complete = ProviderFixture::new();
+    let mut good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = partial.source(["C_SignInit", "C_Sign"]);
+    bad.scanned.tables[0].walk = "known_prefix";
+    // Grow both providers the way they present live (fedora
+    // SUBSETDIAG, 2026-11-05): the incomplete proxy's plan demand
+    // is capped near 410 endpoints and admitted first-come,
+    // leaving less than the complete provider's 212 in the
+    // 512-slot Detailed space, so the complete provider is
+    // refused whole. Here: bad claims 4 tables x 100 endpoints,
+    // good needs 212 in one full table.
+    fn grow(module: &mut ReconciledModule, base: u64, tables: usize, per_table: u64) {
+        let template = module.scanned.tables[0].clone();
+        let names: Vec<&'static str> = template.entries.iter().map(|entry| entry.name).collect();
+        let key = template.entries[0].object;
+        let object_path = template.entries[0].object_path.clone();
+        let first_walk = module.scanned.tables[0].walk;
+        module.scanned.tables.clear();
+        for t in 0..tables {
+            let mut table = template.clone();
+            table.walk = if t == 0 { first_walk } else { "full" };
+            table.entries.clear();
+            for j in 0..per_table {
+                table.entries.push(ScannedEntry {
+                    name: names[(j % 2) as usize],
+                    object: key,
+                    object_path: object_path.clone(),
+                    file_offset: base + (t as u64) * per_table + j,
+                });
+            }
+            module.scanned.tables.push(table);
+        }
+    }
+    grow(&mut bad, partial.offsets[0], 4, 100);
+    grow(&mut good, complete.offsets[0], 1, 212);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the huge partial provider is a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("a complete provider mints beside a huge incomplete one");
+    assert_eq!(subset.required().len(), 1, "only the complete provider");
+    assert_eq!(subset.plan().slots.len(), 212);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "the complete provider's slots carry semantics"
+    );
+}
+
 /// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live
 /// `--system` capture the creation-time `engine.modules` snapshot
 /// stays empty; current scanned tables live in the per-view scan

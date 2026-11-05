@@ -6571,12 +6571,12 @@ pub(crate) mod tests {
         ev.discovery.modules.push(trust);
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+            reason: format!(
+                "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
-                 prefix of its 64 lookalike function tables (a proxy closure array is admitted \
-                 whole, as a prefix when mapped before the capture's first plan, or as published \
-                 tables)"
-                .into(),
+                 prefix of its 64 lookalike function tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
+            ),
         });
         ev.verdict();
         let text = scope_summary("pid", &[row], &ev);
@@ -6585,6 +6585,12 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(text.contains("64 lookalike function tables"), "{text}");
+        // Planner/render junction: the gap line carries the planner's own
+        // note verbatim.
+        assert!(
+            text.contains(crate::plan::CLOSURE_ARRAY_NOTE_DETAILED),
+            "{text}"
+        );
         assert!(
             text.contains(
                 "calls it forwards are counted at the attached providers \
@@ -6789,11 +6795,12 @@ pub(crate) mod tests {
         ev.discovery.modules.clear();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
+            reason: format!(
+                "module needs 6530 more; only 512 attach slots are available; 0 are in use \
                  (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
-                 the capture's first plan, or as published tables)"
-                .into(),
+                 tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
+            ),
         });
         ev.verdict();
         let text = scope_summary("pid", &[], &ev);
@@ -6802,6 +6809,10 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(text.contains("no provider below it was captured"), "{text}");
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
+            "{text}"
+        );
     }
 
     /// A refused closure array above attached-but-quiet providers says the
@@ -6811,17 +6822,22 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+            reason: format!(
+                "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
-                 the capture's first plan, or as published tables)"
-                .into(),
+                 tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
+            ),
         });
         ev.verdict();
         let text = scope_summary("pid", &[], &ev);
         assert!(!ev.discovery.modules.is_empty());
         assert!(
             text.contains("the attached providers counted 0 calls"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
             "{text}"
         );
     }

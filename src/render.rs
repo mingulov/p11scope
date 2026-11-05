@@ -2285,6 +2285,22 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
         } else {
             "No completed calls observed; coverage incomplete.\n"
         });
+        // A quiet window over mapped providers is usually correct —
+        // the target simply made no PKCS#11 calls — but it reads as a
+        // failure. Say when providers are typically called and name
+        // the wider target a narrower scope should try.
+        if !ev.discovery.modules.is_empty() {
+            text.push_str(
+                "No PKCS#11 calls were made in this window; providers are often called only at startup. ",
+            );
+            if scope == "system" {
+                text.push_str("Attach before the targets start.\n");
+            } else {
+                text.push_str(
+                    "Attach before the target starts, or use --system when a related process may call them.\n",
+                );
+            }
+        }
     }
     text.push_str(&format!(
         "{calls} completed calls; {errors} returned errors; {open} entries without an observed return.\n"
@@ -6421,9 +6437,12 @@ pub(crate) mod tests {
         ev.verdict();
         for scope in ["pid", "cgroup", "selected"] {
             let text = scope_summary(scope, &[], &ev);
-            assert!(text.contains("No completed calls observed"), "{scope}: {text}");
             assert!(
-                text.contains("no PKCS#11 calls were made in this window"),
+                text.contains("No completed calls observed"),
+                "{scope}: {text}"
+            );
+            assert!(
+                text.contains("No PKCS#11 calls were made in this window"),
                 "{scope}: {text}"
             );
             assert!(
@@ -6434,7 +6453,7 @@ pub(crate) mod tests {
         }
         let system = scope_summary("system", &[], &ev);
         assert!(
-            system.contains("no PKCS#11 calls were made in this window"),
+            system.contains("No PKCS#11 calls were made in this window"),
             "{system}"
         );
         assert!(
@@ -6446,6 +6465,7 @@ pub(crate) mod tests {
         let busy = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!busy.contains("were made in this window"), "{busy}");
         let mut bare = evidence();
+        bare.discovery.modules = Vec::new();
         bare.verdict();
         let empty = scope_summary("pid", &[], &bare);
         assert!(!empty.contains("were made in this window"), "{empty}");

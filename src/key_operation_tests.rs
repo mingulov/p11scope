@@ -8833,7 +8833,9 @@ fn key_operation_schema_contract() {
         &fall_scene.model.project(),
         &fall_keyuse,
     );
-    assert_eq!(fell.status, ObsStatus::Unavailable);
+    // Joint never stops as a whole: the fallback's preserved rows
+    // publish as partial, its replayed calls counted unattributed.
+    assert_eq!(fell.status, ObsStatus::Partial);
     assert_eq!(fell.reason, "proof_refused_fallback");
     assert!(fell.objects.is_empty(), "fallback invents no object facts");
     assert!(
@@ -8882,7 +8884,9 @@ fn key_operation_schema_contract() {
         &loss_scene.model.project(),
         &loss_keyuse,
     );
-    assert_eq!(lost.status, ObsStatus::Unavailable);
+    // The disposed call is counted, so the section is partial with
+    // its reason named, never a whole-capture unavailability.
+    assert_eq!(lost.status, ObsStatus::Partial);
     assert_eq!(lost.reason, "authority_lost");
 
     // Full budget: the commit surface reports PARTIAL with exact
@@ -15108,10 +15112,11 @@ fn key_operation_joint_failure_delivery_retains_projection() {
     );
 
     // Capture still commits from the retained projection: the
-    // section names the loss, never bootstrap silence.
+    // section names the loss as partial with the disposed call
+    // counted, never bootstrap silence or a whole-section ending.
     let observations = guarded.registry.joint_observations(42);
     assert_eq!(observations.revision, 42);
-    assert_eq!(observations.status, ObsStatus::Unavailable);
+    assert_eq!(observations.status, ObsStatus::Partial);
     assert_eq!(observations.reason, "authority_lost");
 
     // Unknown instances ignore without effect.

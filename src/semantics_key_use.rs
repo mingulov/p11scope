@@ -216,6 +216,22 @@ pub(crate) struct JointStaging {
     redeemed: u64,
     reduced: u64,
     history_disposed: u64,
+    /// Staged calls replayed S1-direct by a fallback (ordered or
+    /// proof-only): they keep their S1 counts but no per-key row can
+    /// be proved for them, so the projection counts them as not
+    /// attributed (`proof_refused_fallback`).
+    fallback_replayed: u64,
+    /// Affecting calls the frozen endpoint table cannot seal
+    /// (negative-only or unclassified), reduced S1-direct: counted
+    /// as not attributed (`unmodelled_call_shape`).
+    /// Proved-irrelevant calls are not key operations and never
+    /// count here.
+    unsealable_direct: u64,
+    /// Direct reductions on a feed registered without a witnessed
+    /// birth (attach after start, or the birth race): counted as
+    /// not attributed (`started_before_attach`). The registry
+    /// notes each one; the feed itself never sees the call.
+    pre_attach_direct: u64,
     correlation_refusals: u64,
     /// True once real loss (not proof-only refusal) ended this
     /// feed's object authority: the projection reports
@@ -260,6 +276,9 @@ impl JointStaging {
             redeemed: 0,
             reduced: 0,
             history_disposed: 0,
+            fallback_replayed: 0,
+            unsealable_direct: 0,
+            pre_attach_direct: 0,
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
@@ -311,6 +330,29 @@ impl JointStaging {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn history_disposed(&self) -> u64 {
         self.history_disposed
+    }
+
+    /// Staged calls a fallback replayed S1-direct without proof.
+    pub(crate) fn fallback_replayed(&self) -> u64 {
+        self.fallback_replayed
+    }
+
+    /// Affecting unsealable calls reduced S1-direct.
+    pub(crate) fn unsealable_direct(&self) -> u64 {
+        self.unsealable_direct
+    }
+
+    /// Direct reductions counted against an unwitnessed birth.
+    pub(crate) fn pre_attach_direct(&self) -> u64 {
+        self.pre_attach_direct
+    }
+
+    /// Count one S1-direct reduction on this feed: without a
+    /// selected birth receipt it is a started-before-attach call.
+    pub(crate) fn note_direct_reduction(&mut self) {
+        if self.selected_receipt.is_none() {
+            self.pre_attach_direct = self.pre_attach_direct.saturating_add(1);
+        }
     }
 
     /// Seal quanta refused for correlation (multi-call seals H9 does
@@ -420,12 +462,17 @@ impl JointStaging {
         if self.mode != FeedMode::Joint {
             return Err(StagingRefusal::NotJoint);
         }
-        let sealable = crate::kinds::function_id(&facts.function)
-            .and_then(crate::semantics_objects::journal::endpoint_class)
-            .is_some_and(|class| {
-                class == crate::semantics_objects::journal::EndpointClass::ModeledAffecting
-            });
+        let class = crate::kinds::function_id(&facts.function)
+            .and_then(crate::semantics_objects::journal::endpoint_class);
+        let sealable =
+            class == Some(crate::semantics_objects::journal::EndpointClass::ModeledAffecting);
         if !sealable {
+            // Affecting shapes we cannot seal count as not
+            // attributed; proved-irrelevant calls are not key
+            // operations and count nothing.
+            if class != Some(crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant) {
+                self.unsealable_direct = self.unsealable_direct.saturating_add(1);
+            }
             return Err(StagingRefusal::Unsealable);
         }
         if position <= self.frontier
@@ -896,6 +943,7 @@ impl JointStaging {
                         refused = count;
                         replayed = true;
                         self.reduced = self.reduced.saturating_add(1);
+                        self.fallback_replayed = self.fallback_replayed.saturating_add(1);
                     }
                     Err(_) => {
                         reducer.invalidate_with_effects(&mut tee);
@@ -1283,6 +1331,7 @@ impl JointStaging {
                     Ok(head_refused) => {
                         refused = refused.saturating_add(head_refused);
                         self.reduced = self.reduced.saturating_add(1);
+                        self.fallback_replayed = self.fallback_replayed.saturating_add(1);
                         replayed += 1;
                         false
                     }

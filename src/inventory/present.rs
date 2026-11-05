@@ -1460,9 +1460,22 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                 objects,
                 if objects == 1 { "" } else { "s" },
             );
+            // Not-attributed counters sit beside the exact rows:
+            // counts per finite reason, never a guessed key.
+            let unattributed_suffix = if observations.unattributed.is_empty() {
+                String::new()
+            } else {
+                let parts: Vec<String> = observations
+                    .unattributed
+                    .iter()
+                    .map(|row| format!("{} {}", row.reason, row.count))
+                    .collect();
+                format!("; not attributed: {}", parts.join(", "))
+            };
             let tallies = key_operation_tallies(observations);
             if tallies.is_empty() {
                 line.push_str("no key operations observed");
+                line.push_str(&unattributed_suffix);
             } else {
                 let parts: Vec<String> = tallies
                     .iter()
@@ -1474,6 +1487,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                     })
                     .collect();
                 line.push_str(&parts.join("; "));
+                line.push_str(&unattributed_suffix);
             }
             let _ = writeln!(out, "{line}");
         }

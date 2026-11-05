@@ -1249,6 +1249,7 @@ fn final_sweep_under_tiny_retention_discloses_unretained_key_rows() {
         objects: Vec::new(),
         key_operations: rows,
         unknown_key_operations: Vec::new(),
+        unattributed: Vec::new(),
         gaps: Vec::new(),
         gaps_suppressed: 0,
         budgets: ObsBudgets {
@@ -1347,6 +1348,7 @@ fn key_rows_lost_to_pressure_are_repaired_by_the_dump_when_it_fits() {
                 })
                 .collect(),
             unknown_key_operations: Vec::new(),
+            unattributed: Vec::new(),
             gaps: Vec::new(),
             gaps_suppressed: 0,
             budgets: ObsBudgets {
@@ -1495,6 +1497,7 @@ fn finish_counts_the_selected_stale_publication_not_the_current() {
             objects: vec![row(object)],
             key_operations: Vec::new(),
             unknown_key_operations: Vec::new(),
+            unattributed: Vec::new(),
             gaps: Vec::new(),
             gaps_suppressed: 0,
             budgets: ObsBudgets {
@@ -1622,6 +1625,7 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
             objects: vec![row(object)],
             key_operations: Vec::new(),
             unknown_key_operations: Vec::new(),
+            unattributed: Vec::new(),
             gaps: Vec::new(),
             gaps_suppressed: 0,
             budgets: ObsBudgets {

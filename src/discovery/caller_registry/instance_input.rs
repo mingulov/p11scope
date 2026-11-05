@@ -2372,7 +2372,7 @@ impl CallerRegistry {
             .values()
             .map(|record| &record.feed)
             .collect();
-        if linked {
+        let mut observations = if linked {
             crate::key_operation_projection::producer::commit(
                 revision,
                 &stagings,
@@ -2390,7 +2390,17 @@ impl CallerRegistry {
                 &self.joint_keyuse,
                 linked,
             )
-        }
+        };
+        // Calls refused before application for an unproven or
+        // unbound caller never reach a feed: count them here as not
+        // attributed, beside the rows of every proven caller.
+        let refused = self
+            .instance_state
+            .instance_calls_refused
+            .values()
+            .fold(0u64, |total, count| total.saturating_add(*count));
+        observations.add_unattributed("foreign_or_unproven_caller", refused);
+        observations
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
         self.staged.push(Mutation::ObserveInstanceSemantic(input));
@@ -2972,6 +2982,9 @@ impl CallerRegistry {
             .semantics
             .get_mut(&id)
             .expect("retained edge");
+        // A direct reduction on a feed with no witnessed birth is a
+        // started-before-attach call: counted, never attributed.
+        state.feed.note_direct_reduction();
         let reducer = state.semantics.as_mut().expect("materialized above");
         let mut outer = NoSink;
         let mut tee = KeyUseTee::new(

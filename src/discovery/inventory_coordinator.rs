@@ -428,12 +428,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// attach, successor/name admission, or retry starts afterwards; staged
     /// facts still drain through `commit_batch`.
     stopped: bool,
-    /// Distinct pids with EXEC hooks that drained since the last
-    /// completed scan pass (`apply_catalog` clears): the post-pass
-    /// newcomers the terminal disclosure names. Arrival order, not hook
+    /// Distinct (pid, producer task ticket) EXEC hooks that drained
+    /// since the last completed scan pass (`apply_catalog` clears): the
+    /// post-pass newcomers the terminal disclosure names. The ticket is
+    /// the task identity: a re-exec keeps its ticket and counts once,
+    /// while pid reuse mints a new task and counts again; a missing
+    /// ticket (`None`) keys by pid alone. Arrival order, not hook
     /// stamps, so no clock comparison is needed. Cgroup scope never
     /// inserts (transaction coverage, not scan passes).
-    post_pass_exec_newcomers: BTreeSet<u32>,
+    post_pass_exec_newcomers: BTreeSet<(u32, Option<u64>)>,
     /// At least one scan pass completed: the terminal disclosure reads
     /// against the last completed scan, never a zero-pass run.
     completed_scan_pass: bool,
@@ -5598,7 +5601,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // scan, so the terminal disclosure counts it. Cgroup scope
             // stays out (transaction coverage, not scan passes).
             if !matches!(self.engine.scope, Scope::Cgroup { .. }) {
-                self.post_pass_exec_newcomers.insert(pid);
+                self.post_pass_exec_newcomers.insert((pid, original_ticket));
             }
             return Vec::new();
         };
@@ -8267,18 +8270,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// A bounded `pids a, b, ...` list for coverage gaps: names the
-    /// first ten pids in ascending order and counts the rest, so a fork
-    /// storm cannot flood the report while the count stays exact.
-    fn bounded_pid_list(pids: &BTreeSet<u32>) -> String {
+    /// first ten of the sorted unique `pids` and counts the rest
+    /// against the exact entry `count`, so a fork storm cannot flood
+    /// the report while the count stays exact. The count may exceed the
+    /// listed pids when one pid number carried several tasks.
+    fn bounded_pid_list(count: usize, pids: &[u32]) -> String {
         const PIDS_SHOWN: usize = 10;
-        let listed: Vec<String> = pids
-            .iter()
-            .take(PIDS_SHOWN)
-            .map(|pid| pid.to_string())
-            .collect();
+        let shown = pids.len().min(PIDS_SHOWN);
+        let listed: Vec<String> = pids[..shown].iter().map(|pid| pid.to_string()).collect();
         let mut rendered = format!("pids {}", listed.join(", "));
-        if pids.len() > PIDS_SHOWN {
-            rendered.push_str(&format!(", and {} more", pids.len() - PIDS_SHOWN));
+        if count > shown {
+            rendered.push_str(&format!(", and {} more", count - shown));
         }
         rendered
     }
@@ -8346,7 +8348,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             unscanned.insert(process.pid);
         }
         if !unscanned.is_empty() {
-            let pids = Self::bounded_pid_list(&unscanned);
+            let listed: Vec<u32> = unscanned.iter().copied().collect();
+            let pids = Self::bounded_pid_list(unscanned.len(), &listed);
             self.note_scope_gap(
                 "dropped collection coverage".into(),
                 format!(
@@ -8371,7 +8374,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Name the unscanned processes, not just their count; the
         // list is bounded so a fork storm cannot flood the report.
-        let pids = Self::bounded_pid_list(&pending);
+        let mut unique: Vec<u32> = pending.iter().map(|(pid, _)| *pid).collect();
+        unique.sort();
+        unique.dedup();
+        let pids = Self::bounded_pid_list(pending.len(), &unique);
         self.note_scope_gap(
             "discovery coverage ended before stop".into(),
             format!(

@@ -7751,7 +7751,8 @@ mod publication_progress_tests {
             driver.stop_on_emission = false;
             driver.stop_on_scan = Some(2);
             let mut lane = ScriptedLane::new(&log);
-            lane.staged_ticketed_execs.push_back(vec![(9, 101), (9, 102)]);
+            lane.staged_ticketed_execs
+                .push_back(vec![(9, 101), (9, 102)]);
             let outcome = drive(&mut driver, lane, windows());
             assert!(
                 outcome.retained.is_none(),
@@ -7786,7 +7787,8 @@ mod publication_progress_tests {
             driver.stop_on_emission = false;
             driver.stop_on_scan = Some(2);
             let mut lane = ScriptedLane::new(&log);
-            lane.staged_ticketed_execs.push_back(vec![(9, 101), (9, 101)]);
+            lane.staged_ticketed_execs
+                .push_back(vec![(9, 101), (9, 101)]);
             let outcome = drive(&mut driver, lane, windows());
             assert!(
                 outcome.retained.is_none(),

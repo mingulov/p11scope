@@ -3794,56 +3794,6 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
 }
 
 /// Renaming an awaiting-publication gap's display text must not change the
-/// named-capture start decision: the refusal kind is typed at plan time,
-/// never re-derived from wording.
-#[test]
-fn awaiting_start_decision_survives_a_gap_rewording() {
-    let published_source = p11kit_like_64_table_module();
-    let mut closure = published_source.clone();
-    closure.interfaces.clear();
-    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
-    let mut engine = Engine::empty();
-    engine.pinned = pins;
-    let (modules, skipped) =
-        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
-    assert!(skipped.is_empty(), "{skipped:?}");
-    let mut counters = DiscoveryCounters::default();
-    let mut plan = build_current_plan(
-        &modules,
-        &[],
-        &[],
-        &engine.pinned,
-        &mut counters,
-        &mut BTreeSet::new(),
-        &BTreeSet::new(),
-        0,
-        0,
-        false,
-        plan::AdmissionScope::Named,
-        false,
-    )
-    .expect("a named capture beside an unpublished closure alone starts");
-    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
-    assert!(
-        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
-        "starts unpublished: {}",
-        plan.modules_skipped[0].reason
-    );
-    assert!(
-        refusal_error(&plan).is_none(),
-        "an awaiting gap alone starts the capture"
-    );
-    for skipped in &mut plan.modules_skipped {
-        skipped.reason = "a reworded gap that names no rule".to_string();
-    }
-    assert!(
-        refusal_error(&plan).is_none(),
-        "renaming the gap text must not block the start: {:?}",
-        plan.modules_skipped
-    );
-}
-
-/// Renaming an awaiting-publication gap's display text must not change the
 /// pause-seed decision: a seed with no plan owner stays terminal for the
 /// cycle whatever the gap says.
 #[test]

@@ -13162,6 +13162,7 @@ pub(crate) mod tests {
             admission: crate::inspect_system::AdmissionRecord::Refused {
                 class: "closure-array",
                 reason: "closure arrays are not attached".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
             ..object
         };

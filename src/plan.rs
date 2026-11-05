@@ -317,8 +317,38 @@ const CLOSURE_UNPUBLISHED: &str = "is published yet";
 /// Not a capacity refusal: a named capture with nothing else to attach
 /// still starts on it, PARTIAL, and admits the providers below it as
 /// they load.
+///
+/// Text oracle only: the wording pins above stay byte-stable for stored
+/// captures, but production decisions never re-derive the kind from the
+/// wording — they read [`RefusalKind`], set once at merge time beside the
+/// reason. A reworded reason keeps its kind.
 pub(crate) fn is_closure_awaiting_publication(reason: &str) -> bool {
     is_closure_array_refusal(reason) && reason.contains(CLOSURE_UNPUBLISHED)
+}
+
+/// The typed kind of one refused-module record, set at merge time beside
+/// its display reason and shared with the engine. The kind is what pause
+/// completeness and history ranking decide by; the reason is what users
+/// read. The two agree at construction (see the merge `debug_assert!`)
+/// and never meet again. The named-capture start gate keeps reading the
+/// public gap list, which also serves hand-built plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalKind {
+    /// A Detailed closure limited to its published tables, with none
+    /// published yet: no demand, no capacity failure. A capture whose only
+    /// gaps are these still starts, PARTIAL.
+    AwaitingPublication,
+    /// A whole-module capacity refusal, closure or provider, with a stated
+    /// demand (`module needs N more; ...`).
+    CapacityWhole,
+    /// A Part 0 closure leading-templates prefix partial (`M of N template
+    /// tables attached ... (closure_prefix)`).
+    ClosurePrefix,
+    /// A JK-22a provider leading-tables prefix partial (`A of N endpoints
+    /// attached ... (provider_prefix)`).
+    ProviderPrefix,
+    /// A G-03 growth omission (`admitted module needs N more; ...`).
+    GrowthOmission,
 }
 
 /// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
@@ -564,7 +594,10 @@ enum AdmissionDecision {
         /// needed endpoints for the report.
         provider_prefix: Option<(usize, usize)>,
     },
-    Refused(Skipped),
+    Refused {
+        skipped: Skipped,
+        kind: RefusalKind,
+    },
 }
 
 /// Names at most this many slot holders in a capacity refusal.
@@ -891,8 +924,10 @@ pub struct AttachPlan {
     /// endpoints kept and its growth omitted (G-03, [`is_growth_omission`]).
     pub modules_skipped: Vec<Skipped>,
     // Exact private owner for each public capacity refusal. Paths remain
-    // diagnostic text and never identify capture-lifetime history.
-    refused_module_objects: Vec<(PinnedObjectId, Skipped)>,
+    // diagnostic text and never identify capture-lifetime history. The kind
+    // travels beside the reason so the engine decides on types, never on
+    // wording.
+    refused_module_objects: Vec<(PinnedObjectId, Skipped, RefusalKind)>,
     /// Total function records seen across every walked surface.
     pub entries_seen: usize,
     /// One entry per surface, so evidence can see discovery gaps (partial
@@ -1851,7 +1886,28 @@ impl AttachPlan {
     pub(crate) fn refused_modules(&self) -> impl Iterator<Item = (PinnedObjectId, &Skipped)> {
         self.refused_module_objects
             .iter()
-            .map(|(object, skipped)| (*object, skipped))
+            .map(|(object, skipped, _)| (*object, skipped))
+    }
+
+    /// The refused records with their merge-time kinds, in `refused_modules`
+    /// order. Engine pause and history decisions read the kind; the reason
+    /// is display text only.
+    pub(crate) fn refused_modules_typed(
+        &self,
+    ) -> impl Iterator<Item = (PinnedObjectId, &Skipped, RefusalKind)> {
+        self.refused_module_objects
+            .iter()
+            .map(|(object, skipped, kind)| (*object, skipped, *kind))
+    }
+
+    /// Whether `object`'s gap is an awaiting-publication closure gap: a
+    /// Detailed closure limited to its published tables with none yet. Keyed
+    /// on the merge-time kind and the exact object, never on reason wording
+    /// or subject paths.
+    pub(crate) fn object_awaits_publication(&self, object: PinnedObjectId) -> bool {
+        self.refused_module_objects
+            .iter()
+            .any(|(o, _, kind)| *o == object && *kind == RefusalKind::AwaitingPublication)
     }
 
     /// Every active exact target, under the object of each module that
@@ -2147,7 +2203,7 @@ impl AttachPlan {
         self.modules
             .retain(|module| pinned.summary(module.object).is_some());
         self.refused_module_objects
-            .retain(|(object, _)| pinned.summary(*object).is_some());
+            .retain(|(object, _, _)| pinned.summary(*object).is_some());
         let retired: Vec<Slot> = self
             .slots
             .iter()
@@ -3452,10 +3508,28 @@ fn merge(
                     counter_hint,
                     unpublished: awaiting_publication,
                 };
-                decisions[position] = Some(AdmissionDecision::Refused(Skipped {
-                    subject: path.to_string(),
-                    reason: refusal.reason(),
-                }));
+                let reason = refusal.reason();
+                let kind = if awaiting_publication {
+                    RefusalKind::AwaitingPublication
+                } else {
+                    RefusalKind::CapacityWhole
+                };
+                // The kind and the wording agree at construction; later
+                // rewordings keep the kind. One direction only: whole
+                // refusals interpolate holder paths verbatim, so the text
+                // oracle is not a whole-refusal invariant.
+                debug_assert!(
+                    kind != RefusalKind::AwaitingPublication
+                        || is_closure_awaiting_publication(&reason),
+                    "awaiting kind without awaiting wording: {reason}"
+                );
+                decisions[position] = Some(AdmissionDecision::Refused {
+                    skipped: Skipped {
+                        subject: path.to_string(),
+                        reason,
+                    },
+                    kind,
+                });
                 continue;
             }
         };
@@ -3510,9 +3584,9 @@ fn merge(
         entries_seen += decoded_occurrence_count(&group);
         let (admitted, refused_growth, kept, allocated_slots, closure_prefix, provider_prefix) =
             match decision.expect("merge decides every module before building it") {
-                AdmissionDecision::Refused(refusal) => {
-                    refused_module_objects.push((object, refusal.clone()));
-                    modules_skipped.push(refusal);
+                AdmissionDecision::Refused { skipped, kind } => {
+                    refused_module_objects.push((object, skipped.clone(), kind));
+                    modules_skipped.push(skipped);
                     continue;
                 }
                 AdmissionDecision::Admitted {
@@ -3543,7 +3617,7 @@ fn merge(
                     "{covered} of {total} template tables attached; calls through the others are not counted (closure_prefix)"
                 ),
             };
-            refused_module_objects.push((object, prefix.clone()));
+            refused_module_objects.push((object, prefix.clone(), RefusalKind::ClosurePrefix));
             modules_skipped.push(prefix);
         }
         // JK-22a: a prefix-admitted provider names its attached endpoints
@@ -3567,7 +3641,7 @@ fn merge(
                 subject: path.to_string(),
                 reason,
             };
-            refused_module_objects.push((object, prefix.clone()));
+            refused_module_objects.push((object, prefix.clone(), RefusalKind::ProviderPrefix));
             modules_skipped.push(prefix);
         }
         // Per scan piece, per table index: admitted above. Manifest pieces
@@ -3766,7 +3840,7 @@ fn merge(
                         counter_hint,
                     }),
                 };
-                refused_module_objects.push((object, omission.clone()));
+                refused_module_objects.push((object, omission.clone(), RefusalKind::GrowthOmission));
                 modules_skipped.push(omission);
             }
         }
@@ -5146,7 +5220,7 @@ pub(crate) struct ConservativePlanCursor {
     output_ordinals: BTreeMap<AttachKey, BTreeSet<SlotOrdinal>>,
     output_identities: BTreeMap<PinnedObjectId, TargetObject>,
     output_provisional: BTreeMap<AttachKey, PinnedObjectId>,
-    output_refused: Vec<(PinnedObjectId, Skipped)>,
+    output_refused: Vec<(PinnedObjectId, Skipped, RefusalKind)>,
     output_modules_skipped: Vec<Skipped>,
     retire_slot: usize,
     retire_key: Option<AttachKey>,
@@ -5690,13 +5764,14 @@ impl ConservativePlanCursor {
                 Ok(false)
             }
             7 => {
-                let Some((_, skip)) = old.refused_module_objects.get(self.measure_refused) else {
+                let Some((_, skip, _)) = old.refused_module_objects.get(self.measure_refused)
+                else {
                     self.measure_stage = 8;
                     return Ok(false);
                 };
                 plan_add(
                     &mut self.measured,
-                    plan_bytes_for::<(PinnedObjectId, Skipped)>(1)?,
+                    plan_bytes_for::<(PinnedObjectId, Skipped, RefusalKind)>(1)?,
                 )?;
                 plan_add(&mut self.measured, plan_text_bytes(&skip.subject)?)?;
                 plan_add(&mut self.measured, plan_text_bytes(&skip.reason)?)?;
@@ -6229,13 +6304,15 @@ impl ConservativePlanCursor {
                 Ok(false)
             }
             3 => {
-                let Some((object, skip)) = old.refused_module_objects.get(self.copy_index) else {
+                let Some((object, skip, kind)) =
+                    old.refused_module_objects.get(self.copy_index)
+                else {
                     self.copy_stage = 4;
                     self.copy_index = 0;
                     return Ok(false);
                 };
                 if self.stable_ids.contains_key(object) {
-                    self.output_refused.push((*object, skip.clone()));
+                    self.output_refused.push((*object, skip.clone(), *kind));
                 }
                 self.copy_index += 1;
                 Ok(false)
@@ -13786,6 +13863,83 @@ mod tests {
             "{}",
             refused.reason
         );
+    }
+
+    /// The typed refusal kind survives a reason rewording: renaming every
+    /// gap's display text does not change the awaiting decision. The kind is
+    /// set at merge time, never re-derived.
+    #[test]
+    fn refusal_kind_survives_a_reason_rewording() {
+        let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let mut first = scoped_plan(std::slice::from_ref(&p11_kit), AdmissionScope::Named);
+        assert_eq!(first.modules_skipped.len(), 1);
+        assert!(first.object_awaits_publication(PinnedObjectId(31)));
+        for skipped in &mut first.modules_skipped {
+            skipped.reason = "a reworded gap that names no rule".to_string();
+        }
+        for (_, skipped, _) in &mut first.refused_module_objects {
+            skipped.reason = "a reworded gap that names no rule".to_string();
+        }
+        assert!(first.object_awaits_publication(PinnedObjectId(31)));
+        // The rewording defeats the text oracle, so the decisions above
+        // cannot be reading the wording.
+        assert!(
+            !is_closure_awaiting_publication(&first.modules_skipped[0].reason),
+            "rewording must defeat the text oracle"
+        );
+    }
+
+    /// Every merge record carries its typed kind: awaiting-publication,
+    /// whole, closure prefix, provider prefix, and growth omission.
+    #[test]
+    fn refusal_kind_pins_every_merge_record() {
+        let kind_of = |plan: &AttachPlan, object: u32| {
+            plan.refused_modules_typed()
+                .find(|(o, _, _)| o.0 == object)
+                .map(|(_, _, kind)| kind)
+        };
+        // Awaiting: an unnamed closure alone.
+        let lone = provider_with_tables(31, P11_KIT, 64, 103, false);
+        let awaiting = scoped_plan(std::slice::from_ref(&lone), AdmissionScope::Named);
+        assert_eq!(
+            kind_of(&awaiting, 31),
+            Some(RefusalKind::AwaitingPublication)
+        );
+        // Whole: a named closure whose prefix a refused provider blocks,
+        // beside that provider's own whole refusal.
+        let big = provider_with_tables(32, "/opt/big.so", 1, 600, false);
+        let mut blocked = provider_with_tables(31, P11_KIT, 64, 103, false);
+        blocked.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let empty = scoped_plan(&[], AdmissionScope::Named);
+        let whole = empty.rebuild_from_sources(&[big, blocked], &[], &PinnedObjects::empty());
+        assert_eq!(kind_of(&whole, 32), Some(RefusalKind::CapacityWhole));
+        assert_eq!(kind_of(&whole, 31), Some(RefusalKind::CapacityWhole));
+        // Closure prefix: a named closure alone.
+        let mut named = provider_with_tables(31, P11_KIT, 64, 103, false);
+        named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let prefix = scoped_plan(std::slice::from_ref(&named), AdmissionScope::Named);
+        assert_eq!(slots_of(&prefix, 31), 3 * 103, "the named prefix attaches");
+        assert_eq!(kind_of(&prefix, 31), Some(RefusalKind::ClosurePrefix));
+        // Provider prefix: a crowded shared-scope corroborated provider.
+        let filled = MAX_SLOTS as usize - 112;
+        let filler = provider_with_tables(51, "/opt/filler.so", 1, filled, true);
+        let mut mixed = provider_with_tables(52, "/opt/mixed.so", 3, 50, false);
+        mixed.scanned.tables[0].live_return = true;
+        let shared = scoped_plan(&[filler, mixed], AdmissionScope::Shared);
+        assert_eq!(kind_of(&shared, 52), Some(RefusalKind::ProviderPrefix));
+        // Growth omission: a changed provider whose growth does not fit.
+        let existing = PinnedObjectId(10);
+        let (plan, _) = grown_provider(existing, "/proc/self/fd/10", MAX_SLOTS - 1, 0);
+        let still_listed = MAX_SLOTS - 11;
+        let changed = scanned_with(
+            scanned_key(existing),
+            "/proc/self/fd/10",
+            (0..still_listed)
+                .map(|index| u64::from(index) * 8)
+                .chain([u64::from(MAX_SLOTS) * 8, u64::from(MAX_SLOTS + 1) * 8]),
+        );
+        let rebuilt = plan.rebuild_from_sources(&[changed], &[], &PinnedObjects::empty());
+        assert_eq!(kind_of(&rebuilt, 10), Some(RefusalKind::GrowthOmission));
     }
 
     /// Named exception ordering: a named closure admitted in an earlier

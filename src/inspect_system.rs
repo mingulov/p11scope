@@ -912,6 +912,9 @@ pub(crate) enum AdmissionRecord {
     Refused {
         class: &'static str,
         reason: String,
+        /// The merge-time refusal kind. Display branches on this, never on
+        /// the reason wording; JSON still carries only the reason.
+        kind: crate::plan::RefusalKind,
     },
     Unresolved {
         reasons: Vec<String>,
@@ -2077,7 +2080,10 @@ fn assemble(
         policy,
         admission_scope,
     );
-    let refused: BTreeMap<PinnedObjectId, &Skipped> = plan.refused_modules().collect();
+    let refused: BTreeMap<PinnedObjectId, (&Skipped, crate::plan::RefusalKind)> = plan
+        .refused_modules_typed()
+        .map(|(object, skipped, kind)| (object, (skipped, kind)))
+        .collect();
     let admitted: BTreeMap<PinnedObjectId, usize> = plan
         .modules
         .iter()
@@ -2160,16 +2166,19 @@ fn assemble(
         // plan slots is a shape the merge never emits; it stays a
         // whole refusal rather than inventing coverage.
         let admission = match (refused.get(&object), admitted.get(&object)) {
-            (Some(skip), Some(endpoints)) if crate::plan::is_partial_coverage(&skip.reason) => {
+            (Some((skip, _)), Some(endpoints))
+                if crate::plan::is_partial_coverage(&skip.reason) =>
+            {
                 AdmissionRecord::Partial {
                     class,
                     endpoints: *endpoints,
                     reason: skip.reason.clone(),
                 }
             }
-            (Some(skip), _) => AdmissionRecord::Refused {
+            (Some((skip, kind)), _) => AdmissionRecord::Refused {
                 class,
                 reason: skip.reason.clone(),
+                kind: *kind,
             },
             (None, Some(endpoints)) => AdmissionRecord::Admitted {
                 class,
@@ -2932,7 +2941,7 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
             "scan_only": true,
             "note": SCAN_ONLY_NOTE,
         }),
-        AdmissionRecord::Refused { class, reason } => serde_json::json!({
+        AdmissionRecord::Refused { class, reason, .. } => serde_json::json!({
             "class": class,
             "reason": reason,
             "scan_only": true,
@@ -3111,8 +3120,8 @@ fn render_object(
                 crate::render::escape_controls(reason),
             );
         }
-        AdmissionRecord::Refused { class, reason } => {
-            if crate::plan::is_closure_awaiting_publication(reason) {
+        AdmissionRecord::Refused { class, reason, kind } => {
+            if *kind == crate::plan::RefusalKind::AwaitingPublication {
                 // By-design refusal: the proxy alone admits nothing until
                 // its providers publish. One plain line; JSON keeps the
                 // full planner reason.
@@ -6680,7 +6689,7 @@ mod tests {
             // the 32-endpoint heuristic module is refused whole.
             let catalog = inventory_catalog(heuristic_provider(1, 32), &[]);
             match catalog_admission(&catalog) {
-                AdmissionRecord::Refused { class, reason } => {
+                AdmissionRecord::Refused { class, reason, .. } => {
                     assert_eq!(*class, "heuristic");
                     assert!(reason.contains("reserved"), "{reason}");
                 }
@@ -7866,6 +7875,7 @@ mod tests {
                 AdmissionRecord::Refused {
                     class: "closure_array",
                     reason: "module needs 388 more; only 512 attach slots are available".into(),
+               kind: crate::plan::RefusalKind::CapacityWhole,
                 },
             ),
             object(
@@ -7929,6 +7939,7 @@ mod tests {
                 AdmissionRecord::Refused {
                     class: "closure_array",
                     reason: "module needs 388 more".into(),
+               kind: crate::plan::RefusalKind::CapacityWhole,
                 },
             ),
             object(
@@ -7985,6 +7996,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
+           kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let text = render_text(&catalog);
@@ -8028,6 +8040,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: reason.into(),
+                kind: crate::plan::RefusalKind::AwaitingPublication,
             },
         )]);
         let text = render_text(&catalog);
@@ -8066,6 +8079,7 @@ mod tests {
                      by the operator, or as published tables); the providers it forwards to \
                      attach when they load"
                     .into(),
+                kind: crate::plan::RefusalKind::AwaitingPublication,
             },
         )]);
         let text = render_text(&catalog);
@@ -8095,6 +8109,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: reason.into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let text = render_text(&catalog);
@@ -8180,6 +8195,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 6734 more".into(),
+           kind: crate::plan::RefusalKind::CapacityWhole,
             },
         );
         let mut prefix = table((3, 2), 68);

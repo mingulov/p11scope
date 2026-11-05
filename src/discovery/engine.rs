@@ -1056,7 +1056,7 @@ struct CaptureHistory {
     /// Written by `record_object_skips` on suppression and by `merge_current`;
     /// read by both through `scan_gap_key`.
     scan_gap_tombstones: BTreeSet<(String, String)>,
-    refusals: BTreeMap<plan::ModuleId, Skipped>,
+    refusals: BTreeMap<plan::ModuleId, (Skipped, plan::RefusalKind)>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
     corroboration_tombstones: BTreeSet<plan::ModuleId>,
     /// §4.12 outcomes re-derived after attach. Corroboration is a
@@ -2585,7 +2585,7 @@ impl CaptureFacts {
                 history.losses.entry(key).or_insert_with(|| skipped.clone());
             }
         }
-        for (object, refused) in plan.refused_modules() {
+        for (object, refused, refused_kind) in plan.refused_modules_typed() {
             let id = self.module_id_for_object(pinned, object)?;
             // One record per module, a high-water mark like every omission
             // above: a whole refusal stays the capture's record of it and
@@ -2607,10 +2607,10 @@ impl CaptureFacts {
             let known = history
                 .refusals
                 .entry(id)
-                .or_insert_with(|| refused.clone());
+                .or_insert_with(|| (refused.clone(), refused_kind));
             let larger_whole = matches!(
                 (
-                    plan::whole_refusal_needed_count(&known.reason),
+                    plan::whole_refusal_needed_count(&known.0.reason),
                     plan::whole_refusal_needed_count(&refused.reason),
                 ),
                 (Some(known), Some(refused)) if refused > known
@@ -2620,24 +2620,25 @@ impl CaptureFacts {
             // "not attached" while the prefix is counting calls. JK-22a: the
             // same holds for a later provider-prefix record replacing an
             // earlier whole refusal for the same provider module.
-            let prefix_replaces_whole = (plan::is_closure_array_refusal(&known.reason)
+            let prefix_replaces_whole = (plan::is_closure_array_refusal(&known.0.reason)
                 && plan::is_closure_array_prefix(&refused.reason))
-                || (plan::whole_refusal_needed_count(&known.reason).is_some()
+                || (plan::whole_refusal_needed_count(&known.0.reason).is_some()
                     && plan::is_provider_prefix(&refused.reason));
             // An awaiting-publication record ranks below any counted capacity
             // refusal for the same module: once its published set names a
             // demand, the earlier "nothing published yet" is stale. Never the
-            // reverse: the counted refusal is the high-water mark.
-            let unpublished_replaced_by_counted =
-                plan::is_closure_awaiting_publication(&known.reason)
-                    && plan::whole_refusal_needed_count(&refused.reason).is_some();
+            // reverse: the counted refusal is the high-water mark. Keyed on
+            // the merge-time kinds, never on the wording.
+            let unpublished_replaced_by_counted = known.1 == plan::RefusalKind::AwaitingPublication
+                && refused_kind == plan::RefusalKind::CapacityWhole;
             if larger_whole
                 || prefix_replaces_whole
                 || unpublished_replaced_by_counted
-                || (plan::is_growth_omission(&known.reason)
-                    && rank(&refused.reason) >= rank(&known.reason))
+                || (plan::is_growth_omission(&known.0.reason)
+                    && rank(&refused.reason) >= rank(&known.0.reason))
             {
-                known.clone_from(refused);
+                known.0.clone_from(refused);
+                known.1 = refused_kind;
             }
         }
         for fallback in current.manifest_object_fallbacks {
@@ -2679,7 +2680,11 @@ impl CaptureFacts {
             .chain(history.losses.values())
             .cloned()
             .collect();
-        plan.modules_skipped = history.refusals.values().cloned().collect();
+        plan.modules_skipped = history
+            .refusals
+            .values()
+            .map(|(skipped, _)| skipped.clone())
+            .collect();
         plan.vendor_interfaces = history.vendor_interfaces;
         if !history.interface_list.is_empty() {
             plan.interface_list.clone_from(&history.interface_list);
@@ -2738,7 +2743,11 @@ impl CaptureFacts {
             uncorroborated_candidates: history
                 .uncorroborated_candidates
                 .max(plan.uncorroborated_candidates),
-            modules_skipped: history.refusals.values().map(skipped_out).collect(),
+            modules_skipped: history
+                .refusals
+                .values()
+                .map(|(skipped, _)| skipped_out(skipped))
+                .collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
             scan_ms: history.scan_ms,
@@ -7315,6 +7324,9 @@ fn scan_gap_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skippe
 /// providers it forwards to attach as they load. A capture whose only gaps
 /// are such closures starts, PARTIAL, like one with nothing mapped yet.
 fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
+    // Reads the public gap list, not the merge-time kinds: the start gate
+    // also judges hand-built plans, which carry gaps without refused
+    // records. The pause-seed check beside it decides on types.
     let refused = plan
         .modules_skipped
         .iter()
@@ -7335,15 +7347,10 @@ fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
 /// has no plan owner until then, by construction: its gap is already named
 /// in the candidate, and its export hooks still attach below, so a later
 /// return can publish it. Its seed is terminal for this cycle, not
-/// incomplete work.
+/// incomplete work. Keyed on the merge-time refusal kind and the exact
+/// object — rewording the gap text cannot change this decision.
 fn seed_without_owner_is_terminal(candidate: &LiveCandidate, seed: &CountOnlySeedWork) -> bool {
-    candidate.modules.iter().any(|scanned| {
-        scanned.object == seed.object
-            && candidate.plan.modules_skipped.iter().any(|skipped| {
-                (skipped.subject == scanned.scanned.path || skipped.subject == seed.object_path)
-                    && plan::is_closure_awaiting_publication(&skipped.reason)
-            })
-    })
+    candidate.plan.object_awaits_publication(seed.object)
 }
 
 /// The `discovery[]` record: what was found, where it was found, and how well

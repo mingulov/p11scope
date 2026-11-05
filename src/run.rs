@@ -15813,9 +15813,8 @@ mod tests {
             // HIGH-1: without privilege the self-probe's refusal names the
             // missing privilege instead of a hazard; either is the
             // environment's own category, never a pause failure.
-            let environment = |text: &str| {
-                text.contains("refusing to attach") || text.contains("live capture ")
-            };
+            let environment =
+                |text: &str| text.contains("refusing to attach") || text.contains("live capture ");
             assert!(environment(&never), "{never}");
             assert!(
                 !never.contains("pause"),

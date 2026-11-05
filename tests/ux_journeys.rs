@@ -196,11 +196,7 @@ fn b3_bare_argv_prints_help_and_unknown_names_problem() {
     let bare = run(&[]);
     assert_eq!(bare.code, Some(0));
     assert!(bare.stderr.is_empty(), "{}", bare.stderr);
-    assert!(
-        bare.stdout.contains("Choose a task"),
-        "{}",
-        bare.stdout
-    );
+    assert!(bare.stdout.contains("Choose a task"), "{}", bare.stdout);
 
     let unknown = run(&["frobnicate"]);
     assert_eq!(unknown.code, Some(2));
@@ -320,11 +316,7 @@ fn b7_run_refuses_without_capture_lane() {
             let refused = run(args);
             assert_eq!(refused.code, Some(1), "{args:?}");
             if let Some(reason) = &host_refusal {
-                assert_eq!(
-                    refused.stderr,
-                    format!("p11scope: {reason}\n"),
-                    "{args:?}"
-                );
+                assert_eq!(refused.stderr, format!("p11scope: {reason}\n"), "{args:?}");
             }
             assert!(
                 refused.stderr.contains("live capture "),
@@ -421,11 +413,7 @@ fn j2_unprivileged_profile_names_inspect_and_next_step() {
         let denied = multi_host::refusal()
             .is_some_and(|reason| reason.starts_with("live capture needs root"));
         if denied {
-            assert!(
-                refused.stderr.contains("sudo"),
-                "{}",
-                refused.stderr
-            );
+            assert!(refused.stderr.contains("sudo"), "{}", refused.stderr);
             assert!(
                 !refused.stderr.contains("p11scope doctor"),
                 "{}",

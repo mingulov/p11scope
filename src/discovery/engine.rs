@@ -830,6 +830,28 @@ impl Engine {
         &self.view_log
     }
 
+    /// Seed one retained scan input (the per-view scan state passes
+    /// maintain), for tests of consumers that must read current
+    /// scan state rather than the creation-time module snapshot.
+    pub(crate) fn seed_scan_input_for_test(
+        &mut self,
+        modules: Vec<crate::discovery::scan::ScannedModule>,
+        pins: PinnedObjects,
+    ) {
+        let view = modules
+            .first()
+            .map(|module| module.view)
+            .expect("seeded scan input names its view");
+        self.scan_inputs.insert(
+            view,
+            ScanInput {
+                modules,
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+    }
+
     fn view_log_owner(&self, view: ProcessViewId) -> ViewLogOwner {
         if self
             .modules

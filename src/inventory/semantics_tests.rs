@@ -723,6 +723,27 @@ fn native_semantic_scan_subset_mints_without_manifest() {
     );
 }
 
+/// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live
+/// `--system` capture the creation-time `engine.modules` snapshot
+/// stays empty; current scanned tables live in the per-view scan
+/// inputs passes maintain. The scan mint must source its modules
+/// from those current scan inputs, or it silently mints nothing
+/// on every pass.
+#[test]
+fn native_semantic_scan_subset_mints_from_current_scan_inputs() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let scan = fixture.source(["C_SignInit", "C_Sign"]);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    engine.seed_scan_input_for_test(vec![scan.scanned.clone()], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("current scan inputs mint the subset live captures need");
+    assert_eq!(subset.required().len(), 1);
+    assert_eq!(subset.plan().slots.len(), 2);
+}
+
 #[test]
 fn native_semantic_names_never_attest() {
     let fixture = ProviderFixture::new();

@@ -2394,10 +2394,14 @@ impl CallerRegistry {
                     // Same reason precedence as the producer: a
                     // counted loss or fallback names itself.
                     observations.status = crate::key_operation_projection::ObsStatus::Partial;
-                    if stagings
-                        .iter()
-                        .any(|staging| staging.degraded_loss() || staging.watchdog_tripped())
-                    {
+                    // Semantic loss before any delivery disposes staged
+                    // history while the feed stays Joint: the disposed
+                    // count is itself the loss.
+                    if stagings.iter().any(|staging| {
+                        staging.degraded_loss()
+                            || staging.watchdog_tripped()
+                            || staging.history_disposed() > 0
+                    }) {
                         observations.reason = "authority_lost";
                     } else if stagings.iter().any(|staging| staging.fell_back()) {
                         observations.reason = "proof_refused_fallback";

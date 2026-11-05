@@ -4612,9 +4612,8 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // linkage, a live function-list return, or manifest
         // corroboration. Export-name agreement alone proves names,
         // not the table in use, so it stays count-only here.
-        let scan_semantic = scan_authorized
-            && authorized
-            && (score.linked || score.live_return || score.manifest);
+        let scan_semantic =
+            scan_authorized && authorized && (score.linked || score.live_return || score.manifest);
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),

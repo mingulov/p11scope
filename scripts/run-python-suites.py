@@ -76,6 +76,7 @@ RUN = [
     ("test_canary_object.py", []),
     ("test_ci_dependency_selection.py", []),
     ("test_ci_stop_races.py", []),
+    ("test_ci_test_partition.py", []),
     ("test_counter_object.py", []),
     ("test_counter_timing_object.py", []),
     ("test_counter_softhsm_parity.py", []),
@@ -169,6 +170,7 @@ RUN = [
     ("test_t7_campaign.py", []),
     ("test_uprobe_close_throughput_probe.py", []),
     ("test_vng_wrapper_exits.py", []),
+    ("test_witness_cli_vng.py", []),
 ]
 
 _ARTIFACT_CONTRACTS = "tests/artifact_contracts.rs"

@@ -212,12 +212,13 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                 self.assertIn("if: ${{ always() }}", body)
                 self.assertIn("losetup -a", body)
         overlay = job_body(self.yml, "privileged-overlay")
-        # The copy-up RED cell rides along through the expected-failure
-        # gate: it must still fail with its signature (XFAIL), so a fix
-        # or a changed failure breaks the job loudly.
-        self.assertIn("overlay_copy_up_userspace_edge_absent", overlay)
-        self.assertIn("--include-expected-failures", overlay)
-        self.assertIn("^XFAIL ", overlay)
+        # The copy-up cell is a normal overlay-campaign pass now (it
+        # rides the curated --list selectors like the K1 twins, never a
+        # hand-kept name): no expected-failure gate may remain for it.
+        self.assertNotIn("overlay_copy_up_userspace_edge_absent", overlay)
+        self.assertNotIn("--include-expected-failures", overlay)
+        self.assertNotIn("copyup-cell", overlay)
+        self.assertNotIn("^XFAIL ", overlay)
         btrfs = job_body(self.yml, "privileged-btrfs")
         self.assertIn("--teardown", btrfs)
 
@@ -517,6 +518,47 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("--require fifo-refused", self.yml)
         self.assertIn("WP-3", self.yml)
         self.assertIn("WP-7", self.yml)
+
+    def test_witness_cli_matrix_runs_host_and_the_four_pinned_guests(self):
+        job = job_body(self.yml, "witness-cli")
+        match = re.search(r"kernel:\s*\[(.*?)\]", job)
+        self.assertIsNotNone(match, "witness-cli has no kernel matrix")
+        kernels = [kernel.strip() for kernel in match.group(1).split(",")]
+        self.assertEqual(kernels,
+                         ["host", "v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1"])
+        sums = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
+        for kernel in kernels[1:]:
+            self.assertTrue((sums / f"{kernel}.sums").is_file(),
+                            f"missing sums for {kernel}")
+        self.assertIn("sha256sum --check", job)
+        self.assertIn("kernel deb set changed", job)
+
+    def test_witness_cli_builds_and_runs_the_p28_cells(self):
+        job = job_body(self.yml, "witness-cli")
+        self.assertIn("--no-run --test prearm_witness_cli", job)
+        self.assertIn("cargo", job)
+        self.assertIn('sudo -n scripts/ci/run-witness-cli.sh "$WITNESS_TESTBIN" "$out/cells"',
+                      job)
+        # One kernel-parameterized guest call with no per-kernel cell
+        # list: the twin runs everywhere including v6.6.157.
+        invocations = [line for line in job.splitlines()
+                       if "witness-cli-vng.sh" in line
+                       and not line.strip().startswith("#")]
+        self.assertEqual(
+            invocations,
+            ['            scripts/ci/witness-cli-vng.sh "$WITNESS_TESTBIN" "$out" "${{ matrix.kernel }}"'])
+        self.assertIn("scripts/ci/check-cell-results.py", job)
+        for cell in ("privileged_profile_pid_prearm_clean_exact_counts",
+                     "privileged_profile_cgroup_prearm_clean_exact_counts",
+                     "privileged_profile_system_prearm_clean_exact_counts",
+                     "privileged_profile_metrics_system_prearm_clean_exact_counts",
+                     "privileged_profile_pid_prearm_twin_exact_window",
+                     "privileged_trace_system_prearm_clean_exact_counts"):
+            with self.subTest(cell=cell):
+                self.assertIn(f"--require {cell}", job)
+        self.assertNotIn("--expected-failure", job)
+        self.assertNotIn("--allow-nonqualifying", job)
+        self.assertIn("witness-cli-${{ matrix.kernel }}", job)
 
 
 if __name__ == "__main__":

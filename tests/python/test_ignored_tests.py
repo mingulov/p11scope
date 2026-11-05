@@ -111,7 +111,6 @@ BTRFS_TMPDIR_XFAIL_EXPECTED = [
 ]
 
 XFAIL_EXPECTED = [
-    "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
     "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation",
     "inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64",
     "inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64",
@@ -123,14 +122,12 @@ XFAIL_EXPECTED = [
 # run); the owner is the source file that owns the pin. Pinned
 # literally so a weakened signature fails here, not silently.
 XFAIL_SIGNATURE_EXPECTED = [
-    "D-C7-3 stands: upper mapper re-edged to the stale anchor",
     "R57: balanced benign exit-time work needs a strong settlement receipt",
     "exactly one module for gate-k1.so",
     "exactly one module for gate-k2.so",
 ]
 
 XFAIL_OWNER_EXPECTED = [
-    "src/discovery/d4_overlay_cells.rs",
     "src/discovery/engine_tests.rs",
     "src/inventory/privileged_tests.rs",
     "src/inventory/privileged_tests.rs",
@@ -220,13 +217,15 @@ RESIDUAL_DEFAULT_EXPECTED = [
     "attach::instance_tests::privileged_instance_b17_drain_yields_identity_once_live",
 ]
 
-# The lane-B-only K1 overlay twins run in the overlay campaign (the
+# The lane-B-only overlay campaign cells run with --include-overlay (the
 # runner provisions nothing: each mounts its own loop overlays and
-# fails loud off lane B). Pinned literally so a dropped curation
+# fails loud off lane B): the K1 deep-scan twins plus the promoted
+# copy-up no-re-edge positive. Pinned literally so a dropped curation
 # fails here.
 OVERLAY_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
 ]
 
 # The R57 future positive: an unprivileged expected-RED cell that stays in
@@ -1089,7 +1088,7 @@ class IgnoredTestsTests(unittest.TestCase):
         # `grep -F ''` matches every line, so the gate refuses an
         # empty signature outright instead of XFAILing everything.
         excerpt = (XFAIL_EXCERPT_DIR
-                   / "overlay_copy_up_userspace_edge_absent.log")
+                   / "exit_loader_balanced_benign_transaction_needs_no_terminal_truncation.log")
         self.assertFalse(xfail_log_matches("", excerpt))
 
     def test_xfail_excerpts_contain_no_home_or_worktree_paths(self):
@@ -1186,7 +1185,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIsNotNone(match, "real runner has no XFAIL_SIGNATURES list")
         lines = match.group(1).splitlines()
         dropped = "\n".join(
-            line for line in lines if "D-C7-3 stands" not in line)
+            line for line in lines if "R57: balanced benign" not in line)
         self.assertLess(len(dropped.splitlines()), len(lines),
                         "fixture must drop one signature")
         broken = text[:match.start(1)] + dropped + text[match.end(1):]
@@ -1540,8 +1539,8 @@ class IgnoredTestsTests(unittest.TestCase):
         # exactly one), so the default section shows 214 + 2.
         self.assertIn("default (216)", result.stdout)
         self.assertIn("btrfs (14, --include-btrfs only)", result.stdout)
-        self.assertIn("overlay (2, --include-overlay only)", result.stdout)
-        self.assertIn("expected-failures (4, --include-expected-failures "
+        self.assertIn("overlay (3, --include-overlay only)", result.stdout)
+        self.assertIn("expected-failures (3, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
@@ -1744,8 +1743,8 @@ class IgnoredTestsTests(unittest.TestCase):
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=16",
             "BTRFS_TESTS=14",
-            "OVERLAY_TESTS=2",
-            "EXPECTED_FAILURE_TESTS=4",
+            "OVERLAY_TESTS=3",
+            "EXPECTED_FAILURE_TESTS=3",
             "SKIP_TESTS=37",
             "COUNTER_FIXTURE_TESTS=27",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",

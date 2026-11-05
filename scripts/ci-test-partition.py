@@ -72,7 +72,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WEIGHTS = ROOT / "scripts" / "ci-test-weights.json"
 SHARDED_TARGET = "artifact_contracts"
 SUBCOMMANDS = ("test", "llvm-cov")
-MAX_COVERAGE_OBJECT_BYTES = 256 * 1024 * 1024
 # Selectors the partition owns. A command that already narrows the selection
 # would be narrowed twice, and the union would no longer be the gate.
 FORBIDDEN = {
@@ -480,17 +479,393 @@ def coverage_objects(debug_dir):
         if path.is_file():
             metadata = os.stat(path)
             if metadata.st_mode & 0o111:
-                if metadata.st_size >= MAX_COVERAGE_OBJECT_BYTES:
-                    raise PartitionError(
-                        f"coverage executable reaches the 256 MiB scanner limit: "
-                        f"{path} ({metadata.st_size} bytes)"
-                    )
                 found.append(relative)
     return found
 
 
+# A test that pins its own executable is refused once instrumented
+# (the coverage libtest binary exceeds the scanner's object limit),
+# so pinnable-object fixtures use the small owned object instead. The
+# packer enforces the actual risk as a source guard: a self path
+# (`current_exe()`, `/proc/self/exe`, or a same-function binding
+# derived from one) must never reach a size-gated scanner entry — the
+# path gates, the path-forwarding helpers, the scanned-module gates,
+# or a test-binary copy. Re-exec spawns, comparisons, `real_scan_pin`
+# (std-fs synthesized, no gate) and bounded reads are not pins.
+_SELF_PIN_PATH_GATES = (
+    "open_object", "open_rooted_object", "object_facts",
+    "pin_as_manifest_object", "identity_and_key", "validated_identity",
+    "validated_identity_with_probe", "identify",
+    "stable_selection_maps_with_probe",
+)
+_SELF_PIN_STRUCT_GATES = (
+    "pin_test_module", "pin_test_modules", "pin_scanned_object",
+    "pin_scanned_objects", "pin_scanned_view_objects",
+)
+_SELF_PIN_HANDLE_INITS = ("Command::new", "File::open", "OpenOptions")
+_SELF_PIN_FN = re.compile(
+    r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?"
+    r"(?:extern\s+(?:\"[^\"]*\"\s+)?)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\(\<]"
+)
+_SELF_PIN_LET = re.compile(r"\blet\s+(mut\s+)?(.+?)\s*=\s*", re.S)
+
+# The two self-pin flows the guard reports but excuses, as
+# (file, test function). Each is benign by a mechanism its own test
+# pins; `check_self_pin_allowlist` fails a stale entry loudly.
+SELF_PIN_ALLOWLIST = frozenset({
+    ("src/discovery/engine_tests.rs",
+     "exact_loader_pin_is_view_owned_but_not_a_provider_module"),
+    ("tests/manifest_pinning.rs",
+     "a_retargeted_path_is_skipped_as_an_identity_mismatch"),
+})
+
+
+def _self_pin_stripped(text):
+    """Blank strings, chars and comments; keep newlines and offsets.
+
+    A `"/proc/self/exe"` literal survives: used as a path it is the
+    source itself, and blanking it would blind the guard.
+    """
+    out = list(text)
+    i, n = 0, len(text)
+
+    def blank(a, b):
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    def blank_string(a, b):
+        blank(a, b)
+        # Only the path spelling survives: a `current_exe()` inside a
+        # string is a message, never a path value.
+        segment = text[a:b]
+        spelling = "/proc/self/exe"
+        k = segment.find(spelling)
+        while k >= 0:
+            for t, ch in enumerate(spelling):
+                out[a + k + t] = ch
+            k = segment.find(spelling, k + 1)
+
+    while i < n:
+        ch = text[i]
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            blank(i, j)
+            i = j
+        elif ch == "r" and i + 1 < n and text[i + 1] in "#\"":
+            match = re.match(r"r(#+)?\"", text[i:])
+            if match:
+                close = "\"" + (match.group(1) or "")
+                j = text.find(close, i + match.end())
+                j = n if j < 0 else j + len(close)
+                blank_string(i, j)
+                i = j
+            else:
+                i += 1
+        elif ch in "\"'":
+            if ch == "'" and re.match(r"'[A-Za-z_][A-Za-z0-9_]*[^']",
+                                      text[i:i + 20]):
+                i += 1  # a lifetime, not a char
+                continue
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == ch:
+                    j += 1
+                    break
+                if text[j] == "\n" and ch == "'":
+                    break
+                j += 1
+            blank_string(i, j)
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _self_pin_fn_spans(text):
+    """(name, start, end, body start line) for every fn item."""
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    spans = []
+    for i, line in enumerate(lines):
+        match = _SELF_PIN_FN.match(line)
+        if not match:
+            continue
+        j, column, brace = i, match.end(), None
+        while j < len(lines):
+            for k, ch in enumerate(lines[j][column if j == i else 0:]):
+                if ch == ";":
+                    brace = None
+                    j = len(lines)
+                    break
+                if ch == "{":
+                    brace = offsets[j] + (column if j == i else 0) + k
+                    j = len(lines)
+                    break
+            else:
+                j += 1
+                continue
+            break
+        if brace is None:
+            continue
+        depth, end = 0, None
+        for k in range(brace, len(text)):
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = k + 1
+                    break
+        if end is None:
+            continue
+        spans.append((match.group(1), offsets[i] + match.start(), end,
+                      text.count("\n", 0, brace) + 1))
+    return spans
+
+
+def _self_pin_balanced(text, open_index):
+    depth = 0
+    for k in range(open_index, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:k], k
+    return None, None
+
+
+def _self_pin_stmt_end(text, i):
+    depth, k = 0, i
+    while k < len(text):
+        ch = text[k]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return k
+        k += 1
+    return -1
+
+
+def _self_pin_used(name, expr):
+    # A bare binding use, not a field (`x.name`) or a path (`name::x`).
+    return re.search(r"(?<![\w\.:])%s\b(?!\s*::)" % re.escape(name),
+                     expr) is not None
+
+
+def _self_pin_tainted(expr, tainted):
+    if "current_exe()" in expr or "/proc/self/exe" in expr:
+        return True
+    return any(_self_pin_used(name, expr) for name in tainted)
+
+
+def _self_pin_tail(init):
+    # A block's value is its tail expression; any other initializer is
+    # judged whole (conservative through closures and chains).
+    stripped = init.strip()
+    if not stripped.startswith("{"):
+        return init
+    depth, end = 0, None
+    for k, ch in enumerate(stripped):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = k
+                break
+    inner = stripped[1:end if end is not None else len(stripped)]
+    parts, depth, current = [], 0, []
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == ";" and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    tails = [part for part in (p.strip() for p in parts) if part]
+    return tails[-1] if tails else ""
+
+
+def _self_pin_lets(body):
+    """(names, init, pos) for plain, tuple and single-wrap lets."""
+    out = []
+    for match in _SELF_PIN_LET.finditer(body):
+        pattern = match.group(2).strip()
+        names = []
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\s*(?:::[^=]*)?", pattern):
+            base = re.split(r"\s*:", pattern)[0]
+            if base not in ("_", ""):
+                names = [base]
+        elif pattern.startswith("("):
+            inner, _ = _self_pin_balanced(pattern, 0)
+            if inner is not None:
+                names = [ident for ident in
+                         re.findall(r"[A-Za-z_][A-Za-z0-9_]*", inner)
+                         if ident not in ("mut", "_")]
+        else:
+            wrapped = re.match(r"(?:Some|Ok|Err)\s*\(\s*(mut\s+)?"
+                               r"([A-Za-z_][A-Za-z0-9_]*)\s*\)$", pattern)
+            if wrapped and wrapped.group(2) != "_":
+                names = [wrapped.group(2)]
+            else:
+                continue
+        if not names:
+            continue
+        end = _self_pin_stmt_end(body, match.end())
+        if end < 0:
+            continue
+        out.append((names, body[match.end():end], match.start()))
+    return out
+
+
+def _self_pin_scan_function(body):
+    lets = _self_pin_lets(body)
+    tainted = set()
+    for _ in range(10):
+        grown = False
+        for names, init, _ in lets:
+            if any(marker in init for marker in _SELF_PIN_HANDLE_INITS):
+                continue  # a child or handle, never a path
+            if _self_pin_tainted(_self_pin_tail(init), tainted):
+                for name in names:
+                    if name not in tainted:
+                        tainted.add(name)
+                        grown = True
+        for found in re.finditer(r"\b(?:std::)?fs::copy\s*\(", body):
+            args, _ = _self_pin_balanced(body, found.end() - 1)
+            if args is None:
+                continue
+            parts = args.split(",", 1)
+            if len(parts) == 2 and _self_pin_tainted(parts[0], tainted):
+                target = re.search(r"[A-Za-z_][A-Za-z0-9_]*", parts[1])
+                if target and target.group(0) not in tainted:
+                    tainted.add(target.group(0))
+                    grown = True
+        for found in re.finditer(r"\bmapped_object\s*\(", body):
+            args, _ = _self_pin_balanced(body, found.end() - 1)
+            if args is not None and _self_pin_tainted(args, tainted):
+                owners = [entry for entry in lets if entry[2] < found.start()
+                          and _self_pin_stmt_end(body, entry[2]) > found.start()]
+                for names, _, _ in owners[-1:]:
+                    for name in names:
+                        if name not in tainted:
+                            tainted.add(name)
+                            grown = True
+        for found in re.finditer(r"\bScannedModule\s*\{", body):
+            owners = [entry for entry in lets if entry[2] < found.start()
+                      and _self_pin_stmt_end(body, entry[2]) > found.start()]
+            if not owners:
+                continue
+            window = body[found.start():found.start() + 3000]
+            if _self_pin_tainted(window, tainted):
+                for name in owners[-1][0]:
+                    if name not in tainted:
+                        tainted.add(name)
+                        grown = True
+        if not grown:
+            break
+    violations = []
+    for gate in _SELF_PIN_PATH_GATES + _SELF_PIN_STRUCT_GATES:
+        # `tracker.identify(pid)` is a different function; the path
+        # gate is never a method call.
+        prefix = r"(?<![\w\.])" if gate == "identify" else r"\b"
+        for found in re.finditer(prefix + r"%s\s*\(" % re.escape(gate),
+                                 body):
+            args, _ = _self_pin_balanced(body, found.end() - 1)
+            if args is not None and _self_pin_tainted(args, tainted):
+                lineno = body.count("\n", 0, found.start()) + 1
+                violations.append((gate, lineno))
+    for found in re.finditer(r"\b(?:std::)?fs::copy\s*\(", body):
+        args, _ = _self_pin_balanced(body, found.end() - 1)
+        if args is not None and _self_pin_tainted(args.split(",", 1)[0],
+                                                  tainted):
+            lineno = body.count("\n", 0, found.start()) + 1
+            violations.append(("fs::copy", lineno))
+    return violations
+
+
+def scan_self_pins(root):
+    """Every (file, line, function, gate) where a self path reaches a pin."""
+    hits = []
+    for top in ("src", "tests", "crates"):
+        base = Path(root) / top
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.rs")):
+            if "target" in path.parts:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8")
+                if "current_exe" not in raw and "/proc/self/exe" not in raw:
+                    continue
+                text = _self_pin_stripped(raw)
+                spans = _self_pin_fn_spans(text)
+                for name, start, end, first in spans:
+                    chars = list(text[start:end])
+                    for _, inner, inner_end, _ in spans:
+                        if start < inner and inner_end <= end:
+                            for k in range(inner - start, inner_end - start):
+                                if chars[k] != "\n":
+                                    chars[k] = " "
+                    for gate, lineno in _self_pin_scan_function("".join(chars)):
+                        hits.append((path.relative_to(root).as_posix(),
+                                     first + lineno - 1, name, gate))
+            except PartitionError:
+                raise
+            except Exception as error:
+                raise PartitionError(f"cannot scan {path}: {error}")
+    return sorted(hits)
+
+
+def self_pin_violations(root=None):
+    """Non-allowlisted self-pin hits under root (default: this checkout)."""
+    root = ROOT if root is None else Path(root)
+    return [hit for hit in scan_self_pins(root)
+            if (hit[0], hit[2]) not in SELF_PIN_ALLOWLIST]
+
+
+def check_self_pin_allowlist(root=None):
+    """Every allowlist entry must still violate, or it is stale."""
+    root = ROOT if root is None else Path(root)
+    hit = {(rel, function) for rel, _, function, _ in scan_self_pins(root)}
+    stale = sorted(SELF_PIN_ALLOWLIST - hit)
+    if stale:
+        raise PartitionError(
+            "stale self-pin allowlist entries (fixed sites drop their entry): "
+            + "; ".join(f"{rel}::{function}" for rel, function in stale)
+        )
+
+
 def coverage_pack(spec, target_dir, output_dir):
     target_dir, output_dir = Path(target_dir), Path(output_dir)
+    hits = self_pin_violations()
+    if hits:
+        detail = "; ".join(f"{rel}:{line} ({function} -> {gate})"
+                           for rel, line, function, gate in hits)
+        raise PartitionError(
+            "a test pins the test binary instead of the small owned fixture: "
+            + detail
+        )
+    check_self_pin_allowlist()
     prefix = f"p11scope-{slug(spec)}-"
     profiles = sorted(p for p in target_dir.glob("*.profraw") if p.name.startswith(prefix))
     strays = sorted(p.name for p in target_dir.glob("*.profraw") if not p.name.startswith(prefix))
@@ -983,29 +1358,75 @@ def self_test():
         assert table == {"target": SHARDED_TARGET, "default_seconds": 0.1,
                          "seconds": {"slow": 12.3}}, table
 
-    # Only selected coverage executables meet the scanner's size limit.
-    # Sparse boundary fixtures exercise real stat sizes without a large archive.
+    # The packer archives whatever cargo-llvm-cov needs, however
+    # large: the retired size tripwire mistook the instrumented
+    # binary's size for self-pin failures. A sparse over-limit
+    # executable packs (the full shape matrix lives in the
+    # test_ci_test_partition.py suite).
     with tempfile.TemporaryDirectory() as temporary:
         tree = Path(temporary) / "llvm-cov-target"
         debug = tree / "debug"
         (debug / "deps").mkdir(parents=True)
-        limit = 256 * 1024 * 1024
         library = debug / "deps" / "liblarge.rlib"
         with library.open("wb") as output:
-            output.truncate(limit + 1)
+            output.truncate(256 * 1024 * 1024 + 1)
         library.chmod(0o755)
-        executable = debug / "deps" / "coverage-test"
-        with executable.open("wb") as output:
-            output.truncate(limit - 1)
-        executable.chmod(0o755)
+        fat = debug / "deps" / "coverage-test"
+        with fat.open("wb") as output:
+            output.truncate(256 * 1024 * 1024 + 1)
+        fat.chmod(0o755)
         assert coverage_objects(debug) == [Path("deps/coverage-test")]
-        with executable.open("r+b") as output:
-            output.truncate(limit)
-        _expect_error(coverage_objects, debug)
-        (tree / "p11scope-rest-1-boundary.profraw").write_bytes(b"raw")
-        destination = Path(temporary) / "packed"
-        _expect_error(coverage_pack, "rest", tree, destination)
-        assert not destination.exists(), "reject before creating coverage output"
+
+    # The self-pin guard: a direct pin, a test-binary copy and a
+    # module-struct flow flag; spawns, comparisons and bounded reads
+    # pass.
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        (root / "src").mkdir()
+        (root / "src" / "v.rs").write_text(
+            "fn t() {\n"
+            "    let exe = std::env::current_exe().unwrap();\n"
+            "    let key = object_facts(&exe).0;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "c.rs").write_text(
+            "fn t() {\n"
+            "    std::fs::copy(std::env::current_exe().unwrap(), &path).unwrap();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "s.rs").write_text(
+            "fn t() {\n"
+            "    let exe = std::env::current_exe().unwrap();\n"
+            "    let module = ScannedModule { path: exe.display().to_string() };\n"
+            "    let ok = pin_scanned_objects(pid, &[module], &mut budget).unwrap();\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src" / "b.rs").write_text(
+            "fn t() {\n"
+            "    let mut child = std::process::Command::new("
+            "std::env::current_exe().unwrap());\n"
+            "    let self_exe = std::env::current_exe().unwrap();\n"
+            "    assert_ne!(other, self_exe);\n"
+            "    let fd = std::fs::File::open(\"/proc/self/exe\").unwrap();\n"
+            "    let slot = read_map_slot(&fd);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        hits = scan_self_pins(root)
+        assert [(rel, fn) for rel, _, fn, _ in hits] == [
+            ("src/c.rs", "t"), ("src/s.rs", "t"), ("src/v.rs", "t")], hits
+        assert [gate for _, _, _, gate in hits] == [
+            "fs::copy", "pin_scanned_objects", "object_facts"], hits
+        assert self_pin_violations(root) == hits
+        try:
+            check_self_pin_allowlist(root)
+        except PartitionError:
+            pass  # the clean fixture holds no allowlisted site
+        else:
+            raise AssertionError("a clean tree must starve the allowlist")
 
     # coverage-pack / coverage-unpack round trip, fail-closed on gaps.
     with tempfile.TemporaryDirectory() as temporary:

@@ -337,8 +337,8 @@ discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap
 discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
-# loop layers per mode). The copy-up RED reproducer stays skipped below:
-# it fails by design and never qualifies.
+# loop layers per mode). The copy-up no-re-edge positive runs in the
+# overlay campaign below (lane B only), never in the default campaign.
 discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity
 # K1 sweep-side witness cell (own loop overlay per mode, capture watching
@@ -733,12 +733,13 @@ inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 # host (kernel 6.8+, where the overlay inode is stable). Each mounts
 # its own loop ext4 layers plus overlay merges and fails loud off
 # lane B, so the runner provisions nothing for them. The xino
-# backend-parity cell already runs in the default campaign and the
-# copy-up RED reproducer stays an expected failure; only the K1
-# deep-scan twins are curated here.
+# backend-parity cell already runs in the default campaign; the K1
+# deep-scan twins and the copy-up no-re-edge positive are curated
+# here.
 OVERLAY_TESTS=(
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses
+discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 )
 
 # Expected-failure campaign cells: run only with
@@ -751,25 +752,21 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_s
 # log strings that prove it, and owners name the source file that owns
 # the pin; all three stay index-aligned with the tests.
 EXPECTED_FAILURE_TESTS=(
-discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
 discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation
 inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 XFAIL_REASONS=(
-"expected failure: RED by design while the post-copy-up D-C7-3 re-edge stands (investigation target); an unexpected pass gets noticed for promotion"
 "expected failure: R57 future positive, RED until a provider-free settlement receipt lands (unprivileged, no BPF or root); an unexpected pass un-ignores the cell"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k1.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
 "expected failure: D3d forced-kernel positive gate fails at exactly-one-module for gate-k2.so on loop and physical btrfs alike (stale-vs-product verdict belongs to src/inventory/privileged_tests.rs); an unexpected pass promotes the cell to the btrfs group"
 )
 XFAIL_SIGNATURES=(
-"D-C7-3 stands: upper mapper re-edged to the stale anchor"
 "R57: balanced benign exit-time work needs a strong settlement receipt"
 "exactly one module for gate-k1.so"
 "exactly one module for gate-k2.so"
 )
 XFAIL_OWNERS=(
-"src/discovery/d4_overlay_cells.rs"
 "src/discovery/engine_tests.rs"
 "src/inventory/privileged_tests.rs"
 "src/inventory/privileged_tests.rs"

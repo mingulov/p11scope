@@ -2201,7 +2201,7 @@ mod tests {
 
     #[test]
     fn mapped_path_identity_requires_device_and_inode() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let key = identity_and_key(&exe).unwrap().0;
         assert!(validated_identity(&exe, key).unwrap().reusable);
 
@@ -2219,9 +2219,7 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode: 7,
         };
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let provider = maps::MapEntry {
             start: 0x1000,
             end: 0x2000,
@@ -2231,7 +2229,7 @@ mod tests {
             inode: module_key.inode,
             raw_path: Some(b"/definitely-not-reachable/provider.so".to_vec()),
         };
-        let module_file = identity::open_object(&std::env::current_exe().unwrap()).unwrap();
+        let module_file = identity::open_object(&small_owned_elf()).unwrap();
         let valid = vec![provider];
         let load = |exports, entries: &[maps::MapEntry]| {
             let index = validated_map_index(entries)?;
@@ -2403,6 +2401,61 @@ mod tests {
         }
     }
 
+    /// A small owned ELF for tests that need a real pinnable object.
+    /// The test binary itself pins only while thin, and pinning it trips
+    /// the coverage self-pin guard, so these tests pin this instead: a
+    /// gcc-built shared object that is never instrumented, built once per
+    /// process and shared, and asserted far below the object limit so it
+    /// stays pinnable under any test profile. Uses the process temp dir
+    /// so the repo's `TMPDIR` lane override applies.
+    fn small_owned_elf() -> PathBuf {
+        static ELF: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ELF.get_or_init(|| {
+            let dir = std::env::temp_dir()
+                .join(format!("p11scope-discover-owned-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("small-owned-elf.c");
+            let path = dir.join("small-owned-elf.so");
+            std::fs::write(
+                &source,
+                "const char p11scope_discover_small_owned_marker[] = \"SMALL-OWNED-0001\";\n\
+                 int p11scope_discover_small_owned_entry(void) { return 0; }\n",
+            )
+            .unwrap();
+            assert!(
+                std::process::Command::new("gcc")
+                    .args(["-shared", "-fPIC", "-o"])
+                    .arg(&path)
+                    .arg(&source)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "the small owned fixture must compile"
+            );
+            let len = std::fs::metadata(&path).unwrap().len();
+            assert!(
+                len < identity::MAX_OBJECT_BYTES,
+                "the small owned fixture must stay pinnable: {len} bytes"
+            );
+            path
+        })
+        .clone()
+    }
+
+    #[test]
+    fn small_owned_elf_stays_pinnable_under_the_object_limit() {
+        let path = small_owned_elf();
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len < identity::MAX_OBJECT_BYTES,
+            "the fixture must stay pinnable under any profile: {len} bytes"
+        );
+        assert_eq!(path, small_owned_elf());
+        let file = identity::open_object(&path).unwrap();
+        let inspected = identity::inspect_file(&file).unwrap();
+        assert!(inspected.identity.reusable);
+    }
+
     /// A real non-empty file for probe fixtures. Uses the process temp dir
     /// so the repo's `TMPDIR` lane override applies.
     fn probe_tempfile(name: &str) -> (PathBuf, File) {
@@ -2442,9 +2495,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_equal_keys_accept_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-equal");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_fd_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2468,9 +2519,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_match_accepts_the_maps_key() {
         let (_dir, module_file) = probe_tempfile("loaded-match");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
@@ -2493,9 +2542,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_overlay_mismatch_refuses_with_todays_message() {
         let (_dir, module_file) = probe_tempfile("loaded-mismatch");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(wrong_key()));
@@ -2518,9 +2565,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_non_overlay_mismatch_refuses_without_probing() {
         let (_dir, module_file) = probe_tempfile("loaded-non-overlay");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(false, Some(split_maps_key()));
@@ -2545,9 +2590,7 @@ mod tests {
     #[test]
     fn loaded_split_probe_error_refuses() {
         let (_dir, module_file) = probe_tempfile("loaded-error");
-        let module_identity = identity_and_key(&std::env::current_exe().unwrap())
-            .unwrap()
-            .1;
+        let module_identity = identity_and_key(&small_owned_elf()).unwrap().1;
         let entries = vec![provider_entry(split_maps_key())];
         let index = validated_map_index(&entries).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2569,7 +2612,7 @@ mod tests {
 
     #[test]
     fn validated_split_probe_equal_keys_accept_without_probing() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let file = identity::open_object(&exe).unwrap();
         let key = file_key(&file).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
@@ -2585,7 +2628,7 @@ mod tests {
 
     #[test]
     fn validated_split_probe_overlay_match_accepts_a_split_maps_key() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let file = identity::open_object(&exe).unwrap();
         let probe = FakeSelfMappingProbe::new(true, Some(split_maps_key()));
         let mut budget = UnboundedProbeBudget;
@@ -2601,7 +2644,7 @@ mod tests {
 
     #[test]
     fn validated_split_probe_mismatch_keeps_todays_message() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let file = identity::open_object(&exe).unwrap();
         for probe in [
             FakeSelfMappingProbe::new(true, Some(wrong_key())),
@@ -2623,7 +2666,10 @@ mod tests {
 
     #[test]
     fn stable_maps_live_module_accepts_without_probing() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
+        // The module must be live-mapped in this process: dlopen the
+        // fixture instead of relying on the test binary's own mapping.
+        let _live = unsafe { Library::new(&exe) }.expect("dlopen the owned fixture");
         let (key, identity) = identity_and_key(&exe).unwrap();
         let probe = FakeSelfMappingProbe::new(true, None);
         let mut budget = UnboundedProbeBudget;
@@ -2635,7 +2681,7 @@ mod tests {
 
     #[test]
     fn stable_maps_changed_key_refuses() {
-        let exe = std::env::current_exe().unwrap();
+        let exe = small_owned_elf();
         let (key, identity) = identity_and_key(&exe).unwrap();
         let wrong = ObjectKey {
             inode: key.inode.wrapping_add(1),
@@ -2656,7 +2702,7 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         let link = dir.join("provider.so");
-        let original = std::env::current_exe().unwrap();
+        let original = small_owned_elf();
         let replacement = Path::new("/bin/true");
         std::os::unix::fs::symlink(&original, &link).unwrap();
         let file = identity::open_object(&link).unwrap();
@@ -2957,7 +3003,7 @@ mod tests {
             panic!("test code must be file-backed");
         };
         let module_key = ObjectKey { device, inode };
-        let executable = std::env::current_exe().unwrap();
+        let executable = small_owned_elf();
         let identity = identity_and_key(&executable).unwrap().1;
         let mut objects = ObjectTable::new(
             executable,

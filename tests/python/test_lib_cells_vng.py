@@ -211,6 +211,10 @@ class LibCellsVngTests(unittest.TestCase):
         libtest.chmod(0o700)
         env = dict(os.environ)
         env.pop("LIB_CELLS_VNG_TEST", None)
+        # Hermetic: the guard runs after the vng prerequisite check,
+        # so a stub vng on PATH keeps this green where virtme-ng is
+        # absent. The stub never runs: the guard exits first.
+        env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
         result = subprocess.run([str(SCRIPT), str(libtest), str(scratch / "out")],
                                 capture_output=True, text=True, timeout=30,
                                 env=env)
@@ -219,12 +223,18 @@ class LibCellsVngTests(unittest.TestCase):
 
     def test_usage_errors_exit_two(self):
         out = self.work / "out"
+        # Hermetic: the kernel-name gate runs after the vng
+        # prerequisite check, so a stub vng on PATH keeps the
+        # not-a-kernel arm green where virtme-ng is absent. The stub
+        # never runs: usage gates exit first.
+        env = dict(os.environ,
+                   PATH=str(self.bin) + os.pathsep + os.environ["PATH"])
         for argv in ([], [str(self.libtest)],
                     [str(self.libtest), str(out), "not-a-kernel"]):
             with self.subTest(argv=argv):
                 result = subprocess.run([str(SCRIPT), *argv],
                                         capture_output=True, text=True,
-                                        timeout=30)
+                                        timeout=30, env=env)
                 self.assertEqual(result.returncode, 2, result.stderr)
 
 

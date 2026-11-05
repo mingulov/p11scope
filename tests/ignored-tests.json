@@ -728,7 +728,7 @@
     {
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent",
-      "reason": "RED by design: post-copy-up re-edge stands; root loop overlay mounts (lanes B only), never qualifies",
+      "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity (lanes B only); copy-up no-re-edge positive, fail-loud off lane B by design, runs in the --include-overlay campaign",
       "cell": "privileged"
     },
     {

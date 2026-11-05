@@ -29,8 +29,6 @@ OVERLAY_CELL = ("discovery::sweep_attribution::tests::d4_overlay_cells::"
                 "privileged_d4_overlay_xino_backend_parity")
 EXT4_CELL = ("discovery::sweep_attribution::tests::d4_ext4_cells::"
              "privileged_d4_ext4_inode_reuse_confirmation_parity")
-COPY_UP_RED = ("discovery::sweep_attribution::tests::d4_overlay_cells::"
-               "overlay_copy_up_userspace_edge_absent")
 RUNNER = ROOT / "scripts/qualify-release-matrix.sh"
 LIB_A = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"
 LIB_B = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"
@@ -2559,15 +2557,6 @@ class MatrixContract(unittest.TestCase):
             ],
             "ext4-inode-reuse is ready exactly on the lanes whose cell qualified",
         )
-
-    def test_d4_copy_up_red_cell_is_never_a_qualifying_cell(self):
-        cells = CHECKER_MOD["D4_CELLS"]
-        for obligation, selectors in cells.items():
-            with self.subTest(obligation=obligation):
-                self.assertNotIn(COPY_UP_RED, selectors)
-        lists = CHECK_IGNORED_MOD["runner_lists"](PRIV_RUNNER)
-        runnable = (lists["DEFAULT_TESTS"] | lists["ALTERNATIVE_TESTS"] | lists["LONG_TESTS"])
-        self.assertNotIn(COPY_UP_RED, runnable)
 
 
 OBJECT_EXTERNALS = r'''

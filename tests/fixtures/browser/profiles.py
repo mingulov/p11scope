@@ -114,6 +114,11 @@ def seed_nss_client_credential(dbdir: Path, credential, nickname: str) -> None:
              "-password", f"pass:{_NSS_P12_PASSWORD}"])
         run(["pk12util", "-i", str(bundle), "-d", dbref,
              "-W", _NSS_P12_PASSWORD, "-K", ""])
+    # The fixture credential is self-signed; without CA trust on the
+    # cert itself NSS chain validation for the client usage fails
+    # (`certutil -V -u C`: issuer not trusted) and browsers filter
+    # the cert out of client-auth selection entirely.
+    run(["certutil", "-M", "-n", nickname, "-t", "CTu,Cu,Cu", "-d", dbref])
     keys = subprocess.run(["certutil", "-K", "-d", dbref],
                           capture_output=True, text=True)
     if keys.returncode != 0 or nickname not in keys.stdout:

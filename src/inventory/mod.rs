@@ -760,6 +760,14 @@ pub fn run(
             "--identity-backend cannot be used outside system inventory (use inventory --system)"
         );
     }
+    // A named pid with no live process fails here with the one operator
+    // line, before budgets, sinks, or scans: there is nothing to observe.
+    // The inner run fns keep their own flows for unit-test seams.
+    if let crate::cli::ScopeArg::Pid(pid) = &scope
+        && crate::process::generation_gone(*pid)
+    {
+        return Err(crate::process::MissingNamedProcess { pid: *pid }.into());
+    }
     let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
     // Past the usage refusals: arm display shaping for the whole run.
     let _quiet = QuietGuard::arm(quiet);
@@ -1304,14 +1312,6 @@ fn run_with_terminal_budget(
             let _ = crate::discovery::sweep_shards::shard_threads();
         }
         InventoryRunScope::Cgroup => crate::pidns::require_inventory_cgroup_numbering(&numbering)?,
-    }
-    // A named pid with no live process fails here with the one operator
-    // line, before any sink exists: there is nothing to scan, and the
-    // native lane would refuse it below anyway.
-    if let InventoryRunScope::Pid(pid) = scope
-        && crate::process::generation_gone(pid)
-    {
-        return Err(crate::process::MissingNamedProcess { pid }.into());
     }
     if request.path.is_some() && capture == CaptureMode::Scan {
         anyhow::bail!("--diagnostics requires native capture or auto fallback");

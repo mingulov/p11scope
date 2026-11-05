@@ -6411,6 +6411,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// A quiet window over mapped providers explains itself: no
+    /// PKCS#11 activity happened, providers are often called only at
+    /// startup, and a narrower scope names the wider target to try.
+    #[test]
+    fn scope_summary_with_zero_calls_over_mapped_providers_suggests_startup_attach() {
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.verdict();
+        for scope in ["pid", "cgroup", "selected"] {
+            let text = scope_summary(scope, &[], &ev);
+            assert!(text.contains("No completed calls observed"), "{scope}: {text}");
+            assert!(
+                text.contains("no PKCS#11 calls were made in this window"),
+                "{scope}: {text}"
+            );
+            assert!(
+                text.contains("Attach before the target starts"),
+                "{scope}: {text}"
+            );
+            assert!(text.contains("--system"), "{scope}: {text}");
+        }
+        let system = scope_summary("system", &[], &ev);
+        assert!(
+            system.contains("no PKCS#11 calls were made in this window"),
+            "{system}"
+        );
+        assert!(
+            system.contains("Attach before the targets start"),
+            "{system}"
+        );
+        assert!(!system.contains("--system"), "{system}");
+        // A window with calls, or with nothing mapped, stays silent.
+        let busy = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!busy.contains("were made in this window"), "{busy}");
+        let mut bare = evidence();
+        bare.verdict();
+        let empty = scope_summary("pid", &[], &bare);
+        assert!(!empty.contains("were made in this window"), "{empty}");
+    }
+
     /// No unverified slots, or every mapped provider attested (partial
     /// manifest coverage): the machine fragment alone stands, with no
     /// provider-manifest note.

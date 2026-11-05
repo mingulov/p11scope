@@ -137,9 +137,11 @@ attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia
 attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_lp64
 # W3-2 kernel-identity gates: WRONLY EPERM, the section 6.5 functional
 # probe (hardlink-match vs copy-NONE plus the stale-generation phase),
-# the whole-system shape cell, and the anchor-handle validator.
+# its nested-pidns twin (kind observers run nested), the whole-system
+# shape cell, and the anchor-handle validator.
 attach::identity_iter::tests::anchor_maps_validate_real_handles
 attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none
+attach::identity_iter::tests::functional_probe_passes_in_nested_pid_namespace
 attach::identity_iter::tests::whole_system_run_covers_all_children
 attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
 # 5.15 identity-denial cell: real BTF named-fix refusal through the

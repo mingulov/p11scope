@@ -87,6 +87,9 @@ _Static_assert(__builtin_offsetof(struct p11_anchor_entry, gen) == 8, "entry gen
  * The anchor run is always per-pid on the observer: the anchor program
  * installs only for the task whose tgid matches `observer_tgid` and skips
  * every other task, so a wrong-scope walk cannot install foreign inodes.
+ * A zero `observer_tgid` skips the match: the run is pidfd-bound so the
+ * iterator already walks exactly one task, and a nested observer cannot
+ * name its own initial-namespace tgid (tgids are never zero).
  * A nonzero `target_tid` selects a member run over exactly the
  * (`target_tgid`, `target_tid`) task, bypassing the scope bitmap; every
  * other run sees both target fields zeroed. */

@@ -117,11 +117,20 @@ class WitnessCliScriptTests(unittest.TestCase):
         testbin.write_text("#!/bin/sh\nexit 0\n")
         testbin.chmod(0o700)
         self.testbin = testbin
+        # Hermetic vng cache for the stubbed runs below (all use v6.6.157):
+        # the script stages the booted kernel's config, so the tests must
+        # not depend on the ambient $HOME cache (absent on CI script runners).
+        default_cache = self.work / "vng-cache-default"
+        config_path = default_cache / "v6.6.157/amd64/boot/config-6.6.157-test"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("CONFIG_LTO_NONE=y\n")
+        self.default_cache = default_cache
 
     def run_script(self, *args, mode="all-pass"):
         env = dict(os.environ, FAKE_VNG_MODE=mode,
                    FAKE_CELLS_FILE=str(self.cells_file),
-                   WITNESS_CLI_VNG_TEST="1")
+                   WITNESS_CLI_VNG_TEST="1",
+                   WITNESS_VNG_CACHE=str(self.default_cache))
         env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
         out = self.work / "out"
         command = [str(SCRIPT), str(self.testbin), str(out), *args]

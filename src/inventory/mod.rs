@@ -24962,6 +24962,33 @@ mod seal_readiness_tests {
         );
     }
 
+    /// DEMO-4 regression (fedora cr-late-3/cr-first-1, 2026-11-05):
+    /// the scan subset minted but the live start refused
+    /// (`semantic_attachment_refused`, a transient multi-provider
+    /// moment on a busy host). The fallback shell seated and
+    /// cleared `scan_seal_pending`, so one refused start disabled
+    /// the no-manifest seal for the whole run. A startup-failed
+    /// shell must keep the pending flag so the next pass retries;
+    /// only a lane that did not fail startup seats.
+    #[test]
+    fn scan_seal_refused_start_keeps_pending_for_retry() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("if self.semantic.is_none() && self.scan_seal_pending {")
+            .expect("the deferred scan-seal attempt block");
+        let attempt: String = source[start..].chars().take(2400).collect();
+        let failed_guard = attempt
+            .find("lane.startup_failed()")
+            .expect("the attempt keys seating on the startup-failed flag");
+        let clears = attempt
+            .find("self.scan_seal_pending = false")
+            .expect("the attempt clears pending when it seats");
+        assert!(
+            failed_guard < clears,
+            "pending clears only behind the startup-failed guard:\n{attempt}"
+        );
+    }
+
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(
             Scope::Pid(std::process::id()),

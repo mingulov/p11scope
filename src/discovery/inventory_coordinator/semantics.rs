@@ -267,11 +267,19 @@ impl SemanticInputs {
     /// from the engine's scan-discovered providers and build the
     /// subset with scan authorization. Only meaningful when no
     /// manifest was requested; the driver owns that gate.
-    pub(crate) fn prepare_scan(&mut self, engine: &Engine) -> SubsetPreparation {
+    /// `scan_sources` carries the latest catalog lowering's
+    /// reconciled modules and aggregate pins (the current scanned
+    /// tables in a live capture); without them the mint falls back
+    /// to the engine's own scan snapshot.
+    pub(crate) fn prepare_scan(
+        &mut self,
+        engine: &Engine,
+        scan_sources: Option<(Vec<ReconciledModule>, PinnedObjects)>,
+    ) -> SubsetPreparation {
         let retained = self.retained_or_load(engine);
         build_subset_from_accepted(
             engine,
-            accept_retained_inputs(engine, retained, true),
+            accept_retained_inputs(engine, retained, true, scan_sources),
             None,
             true,
         )
@@ -338,7 +346,7 @@ pub(crate) fn prepare_attested_subset(engine: &Engine, paths: &[PathBuf]) -> Sub
 fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPreparation {
     build_subset_from_accepted(
         engine,
-        accept_retained_inputs(engine, inputs, false),
+        accept_retained_inputs(engine, inputs, false, None),
         None,
         false,
     )
@@ -348,7 +356,7 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
 /// [`prepare_attested_subset`] with no operator inputs.
 #[cfg(test)]
 pub(crate) fn prepare_scan_attested_subset(engine: &Engine) -> SubsetPreparation {
-    SemanticInputs::new(Vec::new()).prepare_scan(engine)
+    SemanticInputs::new(Vec::new()).prepare_scan(engine, None)
 }
 
 /// Manifests accepted against the retained scan, before claims: the
@@ -371,6 +379,7 @@ fn accept_retained_inputs(
     engine: &Engine,
     inputs: &RetainedInputs,
     seed_scan: bool,
+    scan_sources: Option<(Vec<ReconciledModule>, PinnedObjects)>,
 ) -> AcceptedRetainedInputs {
     // This Inventory owner does not admit live Detailed selection claims.
     // Enabling that Engine path also requires incorporating its retained
@@ -449,7 +458,14 @@ fn accept_retained_inputs(
     // as in unit fixtures).
     let mut scan_modules = None;
     if seed_scan && !inputs.requested {
-        let (modules, scan_pins) = engine.scan_reconciled_snapshot();
+        // Current scanned tables come from the latest catalog
+        // lowering when the coordinator stashed them (live
+        // captures); otherwise fall back to the engine's own scan
+        // snapshot and creation-time modules.
+        let (modules, scan_pins) = match scan_sources {
+            Some(sources) => sources,
+            None => engine.scan_reconciled_snapshot(),
+        };
         if modules.is_empty() {
             for module in &engine.modules {
                 if pins.file_for(module.object).is_some() {
@@ -1976,6 +1992,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             &self.engine,
             self.semantic_inputs.retained_or_load(&self.engine),
             false,
+            None,
         );
         let object = provider_object_for_key(&accepted.pins, &key)
             .ok_or(PromotionRefusal::ManifestUnavailable)?;

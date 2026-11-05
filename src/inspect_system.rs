@@ -1120,10 +1120,14 @@ pub(crate) struct Catalog {
 /// The one scan-only lowering behind a catalog's admission verdicts: the
 /// aggregate pins every reconciled module was bound against and the plan
 /// built over them under the caller's policy. Plan object IDs index these
-/// pins and nothing else.
+/// pins and nothing else. `modules` retains the reconciled scan
+/// modules the plan was built from (DEMO-4): the coordinator stashes
+/// them at absorb time so the no-manifest scan seal can mint over
+/// current scanned tables instead of a creation-time snapshot.
 pub(crate) struct CatalogLowering {
     pub plan: plan::AttachPlan,
     pub pins: PinnedObjects,
+    pub modules: Vec<ReconciledModule>,
 }
 
 /// Collect the machine, lower scan-only admission under `policy`, assemble
@@ -2493,6 +2497,7 @@ fn assemble(
         lowering: Some(CatalogLowering {
             plan,
             pins: aggregate,
+            modules: inputs,
         }),
         scan_status: if complete { "complete" } else { "partial" },
         enumerated: collection.enumerated.len(),

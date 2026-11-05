@@ -1034,7 +1034,11 @@ impl Scene {
         };
         crate::inspect_system::Catalog {
             scan_status: "complete",
-            lowering: Some(crate::inspect_system::CatalogLowering { plan, pins }),
+            lowering: Some(crate::inspect_system::CatalogLowering {
+                plan,
+                pins,
+                modules: Vec::new(),
+            }),
             enumerated: 1,
             selected: 1,
             scanned: 1,

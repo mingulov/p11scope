@@ -328,6 +328,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     engine_collected_finish_calls: u64,
     /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
+    /// DEMO-4: the latest catalog lowering's reconciled scan
+    /// modules and aggregate pins, stashed at absorb time for one
+    /// no-manifest scan-seal attempt (consumed by
+    /// `prepare_scan_semantic_subset`; the next absorb refills it).
+    scan_mint_sources: Option<(
+        Vec<crate::discovery::identity::ReconciledModule>,
+        crate::discovery::identity::PinnedObjects,
+    )>,
     /// Explicit count inputs enter the catalog's one plan before admission.
     count_manifests: Vec<PathBuf>,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
@@ -796,6 +804,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             #[cfg(test)]
             engine_collected_finish_calls: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
+            scan_mint_sources: None,
             count_manifests: Vec::new(),
             prearm: None,
             prearm_prior: (0, 0),
@@ -1518,7 +1527,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The no-manifest scan mint (DEMO-4), over the same retained
     /// engine facts as [`Self::prepare_semantic_subset`].
     pub(crate) fn prepare_scan_semantic_subset(&mut self) -> semantics::SubsetPreparation {
-        self.semantic_inputs.prepare_scan(&self.engine)
+        let sources = self.scan_mint_sources.take();
+        self.semantic_inputs.prepare_scan(&self.engine, sources)
     }
 
     pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {
@@ -5234,7 +5244,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return BTreeMap::new();
         };
         let absorbed = self.attach_set.absorb(&lowering.plan, &lowering.pins);
-        drop(lowering);
+        // DEMO-4: retain this pass's reconciled scan modules and
+        // their aggregate pins for one no-manifest scan-seal
+        // attempt after the pass (consumed there; never more than
+        // one pass's lowering is held).
+        let crate::inspect_system::CatalogLowering { pins, modules, .. } = lowering;
+        if !modules.is_empty() {
+            self.scan_mint_sources = Some((modules, pins));
+        }
         self.record_absorbed(absorbed)
     }
 

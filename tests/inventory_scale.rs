@@ -179,7 +179,9 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
         use std::io::Read as _;
         let mut stdout = stdout;
         let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).expect("drain observer stdout");
+        stdout
+            .read_to_end(&mut bytes)
+            .expect("drain observer stdout");
         bytes
     });
     let mut peak = 0u64;

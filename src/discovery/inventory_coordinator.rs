@@ -274,6 +274,24 @@ pub(crate) struct PrearmReportRow {
     pub unobserved_windows: Option<Vec<crate::render::UnobservedWindow>>,
 }
 
+/// Prune cross-pass task memory to the latest enumeration: drop
+/// entries for departed pids and for pid reuse (same number, new start
+/// time), keep tasks still present with an unchanged generation. Unknown
+/// generations stay conservative: without positive start-time mismatch
+/// evidence nothing is dropped.
+fn retain_current_tasks(
+    tasks: &mut BTreeSet<(u32, Option<u64>)>,
+    current: &BTreeMap<u32, Option<u64>>,
+) {
+    tasks.retain(|(pid, start)| match current.get(pid) {
+        None => false,
+        Some(now) => match (start, now) {
+            (Some(was), Some(is)) => was == is,
+            _ => true,
+        },
+    });
+}
+
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
 /// catalog's Inventory lowering feeds every pass.
@@ -437,6 +455,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// stamps, so no clock comparison is needed. Cgroup scope never
     /// inserts (transaction coverage, not scan passes).
     post_pass_exec_newcomers: BTreeSet<(u32, Option<u64>)>,
+    /// Task identities deep-scanned by applied passes, pruned to the
+    /// latest enumeration: next-pass selection tiers never-scanned
+    /// groups first, so a stable sweep cannot starve a newcomer across
+    /// passes. Discarded passes record nothing (their outcomes never
+    /// applied); pid reuse drops the stale task by start-time mismatch.
+    scan_freshness: BTreeSet<(u32, Option<u64>)>,
     /// At least one scan pass completed: the terminal disclosure reads
     /// against the last completed scan, never a zero-pass run.
     completed_scan_pass: bool,
@@ -792,6 +816,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             staged_retirements: BTreeSet::new(),
             stopped: false,
             post_pass_exec_newcomers: BTreeSet::new(),
+            scan_freshness: BTreeSet::new(),
             completed_scan_pass: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
@@ -2415,6 +2440,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.unmatched_finish_exit_for_test(pid, at)
     }
 
+    #[cfg(test)]
+    pub(crate) fn scan_freshness_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
+        self.scan_freshness.clone()
+    }
+
     /// Refuse the final receiver only after its actual disposal is retained.
     #[cfg(test)]
     pub(crate) fn reference_refuse_joint_finish_publication_once(&mut self) {
@@ -3453,6 +3483,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (prior_objects, prior_bytes) = self.prearm_prior;
         let budget =
             self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
+        let scanned = self.scanned_pids_for_selection();
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -3476,6 +3507,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     max_scan_pids,
                     policy,
                     budget,
+                    &scanned,
                     &manifests,
                     prior_objects,
                     prior_bytes,
@@ -3505,6 +3537,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             crate::discovery::scan::CaptureWorkBudget::default(),
             semantic_capture_live,
         );
+        let scanned = self.scanned_pids_for_selection();
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -3529,6 +3562,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     policy,
                     shared,
                     budget,
+                    &scanned,
                     &manifests,
                     prior_objects,
                     prior_bytes,
@@ -3838,6 +3872,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // (a pending publication's service window) clear as covered
         // though the catalog could not hold them — a known narrow miss.
         self.post_pass_exec_newcomers.clear();
+        // This pass's examined tasks seed the next pass's freshness
+        // selection, so a rotated-out newcomer gets priority next time.
+        self.note_applied_scan_tasks(&catalog);
         self.completed_scan_pass = true;
         PassReport {
             pass,
@@ -8283,6 +8320,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             rendered.push_str(&format!(", and {} more", count - shown));
         }
         rendered
+    }
+
+    /// Record an applied pass's examined tasks for next-pass freshness:
+    /// prune to the pass enumeration, then insert deep-scanned and
+    /// maps-matched members. Memory-unavailable, unreadable, exited
+    /// and not-selected members stay fresh so the next pass retries them.
+    fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
+        let current: BTreeMap<u32, Option<u64>> = catalog
+            .processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid,
+                    process
+                        .generation
+                        .as_ref()
+                        .and_then(|member| member.start_time),
+                )
+            })
+            .collect();
+        retain_current_tasks(&mut self.scan_freshness, &current);
+        for process in &catalog.processes {
+            if matches!(
+                process.status,
+                crate::inspect_system::MemberStatus::Scanned
+                    | crate::inspect_system::MemberStatus::MapsMatched
+            ) {
+                self.scan_freshness.insert((
+                    process.pid,
+                    process
+                        .generation
+                        .as_ref()
+                        .and_then(|member| member.start_time),
+                ));
+            }
+        }
+    }
+
+    /// Pids the next pass treats as already scanned: recorded tasks whose
+    /// live `/proc` start-time still matches, plus tasks recorded without a
+    /// start-time (nothing verifiable, so nothing dropped). A recycled pid
+    /// reads fresh, so reuse never inherits the old incarnation's slot.
+    fn scanned_pids_for_selection(&self) -> BTreeSet<u32> {
+        self.scan_freshness
+            .iter()
+            .filter(|(pid, start_time)| {
+                start_time.is_none_or(|start| {
+                    crate::process::process_start_time(*pid).is_ok_and(|live| live == start)
+                })
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
     }
 
     /// A collection the stop discarded before apply: inspect the dropped
@@ -26366,6 +26455,7 @@ mod continuity_clock_tests {
 #[cfg(test)]
 mod scan_freshness_tests {
     use super::*;
+    use crate::discovery::caller_registry::OsProcessSource;
 
     /// Cross-pass task memory keeps entries still present with an
     /// unchanged start generation; departed pids and pid reuse (same
@@ -26388,5 +26478,113 @@ mod scan_freshness_tests {
         retain_current_tasks(&mut tasks, &current);
         let kept: BTreeSet<(u32, Option<u64>)> = [(1, Some(100)), (2, None)].into_iter().collect();
         assert_eq!(tasks, kept);
+    }
+
+    fn freshness_coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn unexamined_application() -> crate::inspect_identity::InspectApplicationResult {
+        crate::inspect_identity::InspectApplicationResult::Unknown(
+            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+        )
+    }
+
+    /// An applied pass records exactly its examined tasks: deep-scanned
+    /// and maps-matched members join cross-pass memory (even without a
+    /// generation), unselected and unreadable members stay fresh for a
+    /// retry, and a task from an earlier pass that this pass never saw is
+    /// pruned instead of lingering as scanned.
+    #[test]
+    fn applied_pass_records_only_examined_tasks() {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut coordinator = freshness_coordinator();
+        coordinator.scan_freshness.insert((999_999_999, Some(7)));
+        let generation = |start_time| {
+            Some(crate::inspect_system::MemberGeneration {
+                start_time,
+                exe: None,
+            })
+        };
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        let record = |pid, start_time, status| ProcessRecord {
+            pid,
+            status,
+            objects: Vec::new(),
+            generation: generation(start_time),
+            complete_scan: None,
+            application: unexamined_application(),
+            hints_examined: true,
+        };
+        catalog
+            .processes
+            .push(record(12, Some(120), MemberStatus::MapsMatched));
+        catalog.processes.push(record(
+            13,
+            Some(130),
+            MemberStatus::NotSelected { loss: None },
+        ));
+        catalog.processes.push(record(
+            14,
+            Some(140),
+            MemberStatus::Unreadable {
+                reason: "injected".into(),
+            },
+        ));
+        catalog
+            .processes
+            .push(record(15, None, MemberStatus::Scanned));
+        coordinator.note_applied_scan_tasks(&catalog);
+        let expected: BTreeSet<(u32, Option<u64>)> = [(11, Some(110)), (12, Some(120)), (15, None)]
+            .into_iter()
+            .collect();
+        assert_eq!(coordinator.scan_freshness_for_test(), expected);
+    }
+
+    /// The selection projection re-validates recorded start-times against
+    /// live `/proc`: the running test process projects scanned, a
+    /// mismatched start-time reads fresh (pid reuse inherits nothing), a
+    /// nonexistent pid drops, and a task recorded without a start-time
+    /// stays scanned (nothing verifiable, nothing dropped).
+    #[test]
+    fn scanned_projection_validates_start_time_against_live_proc() {
+        let me = std::process::id();
+        let live = crate::process::process_start_time(me).unwrap();
+        let project = |tasks: &[(u32, Option<u64>)]| {
+            let mut coordinator = freshness_coordinator();
+            coordinator.scan_freshness.extend(tasks.iter().copied());
+            coordinator.scanned_pids_for_selection()
+        };
+        assert_eq!(
+            project(&[(me, Some(live))]),
+            BTreeSet::from([me]),
+            "the live incarnation projects scanned"
+        );
+        assert!(
+            project(&[(me, Some(live.wrapping_add(1)))]).is_empty(),
+            "a mismatched start-time reads fresh"
+        );
+        assert!(
+            project(&[(u32::MAX, Some(7))]).is_empty(),
+            "a nonexistent pid drops"
+        );
+        assert_eq!(
+            project(&[(u32::MAX, None)]),
+            BTreeSet::from([u32::MAX]),
+            "an unknown generation stays scanned"
+        );
     }
 }

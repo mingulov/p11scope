@@ -36268,8 +36268,14 @@ fn select_excluding_kernel_threads_counts_absences_on_the_budget() {
     ];
     let unavailable: BTreeSet<u32> = [12].into_iter().collect();
     let mut budget = CaptureWorkBudget::default();
-    let selected =
-        select_excluding_kernel_threads(&sweep, &unavailable, &proc_root, 4, &mut budget);
+    let selected = select_excluding_kernel_threads(
+        &sweep,
+        &unavailable,
+        &proc_root,
+        4,
+        &mut budget,
+        &BTreeSet::new(),
+    );
     // Only pid 10 is a flagged thread with an empty available snapshot;
     // the cap then fits every remaining pid.
     assert_eq!(selected, vec![11, 12, 13, 14], "{selected:?}");

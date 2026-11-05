@@ -114,6 +114,8 @@ fn run_with_writer(
         hooks,
         max_scan_pids,
         AdmissionPolicy::detailed(),
+        // Single pass: no earlier scans, pure rarity selection.
+        &BTreeSet::new(),
     )?;
     if stage_timings_requested() {
         eprintln!(
@@ -368,8 +370,19 @@ fn collect_members(
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
 ) -> Collection {
-    collect_members_identity(hints, hooks, max_scan_pids, timings, false, budget, false).0
+    collect_members_identity(
+        hints,
+        hooks,
+        max_scan_pids,
+        timings,
+        false,
+        budget,
+        false,
+        scanned,
+    )
+    .0
 }
 
 /// Explicit userspace never attempts the kernel pass (`decide_pass_attempt`
@@ -404,6 +417,7 @@ pub(crate) fn build_identity_custody(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_members_identity(
     hints: &[PathBuf],
     hooks: &HookRegistry,
@@ -412,6 +426,7 @@ fn collect_members_identity(
     identity: bool,
     mut budget: CaptureWorkBudget,
     take_anchors: bool,
+    scanned: &BTreeSet<u32>,
 ) -> (Collection, Option<ExaminedCustody>) {
     debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
@@ -426,9 +441,12 @@ fn collect_members_identity(
 
     // Phase 1+2, exactly like capture discovery: the sweep and the
     // rarity selection run only over the cap; under it selection is the
-    // identity (ascending pids). Past the cap the sweep is kept: C1b
-    // attributes the unselected pids from it after the deep scans, and
-    // the capped-or-complete record is decided then, from its counts.
+    // identity (ascending pids). A non-empty scanned set tiers the
+    // selection (never-scanned groups first) so multi-pass scans cannot
+    // starve a newcomer; single passes pass an empty set. Past the cap
+    // the sweep is kept: C1b attributes the unselected pids from it
+    // after the deep scans, and the capped-or-complete record is decided
+    // then, from its counts.
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
     let selected: Vec<u32> = if pids.len() > cap {
@@ -452,6 +470,7 @@ fn collect_members_identity(
             Path::new("/proc"),
             cap,
             &mut budget,
+            scanned,
         );
         timings.span(StageKind::Scan, "select", select_start, monotonic_ns());
         sweep = swept;
@@ -1114,10 +1133,11 @@ pub(crate) fn collect(
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
+    scanned: &BTreeSet<u32>,
 ) -> Result<Catalog> {
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
-    collect_with_budget(hints, hooks, max_scan_pids, policy, budget)
+    collect_with_budget(hints, hooks, max_scan_pids, policy, budget, scanned)
 }
 
 pub(crate) fn collect_with_budget(
@@ -1126,13 +1146,28 @@ pub(crate) fn collect_with_budget(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
 ) -> Result<Catalog> {
-    collect_with_count_manifests(hints, hooks, max_scan_pids, policy, budget, &[], 0, 0)
+    collect_with_count_manifests(
+        hints,
+        hooks,
+        max_scan_pids,
+        policy,
+        budget,
+        scanned,
+        &[],
+        0,
+        0,
+    )
 }
 
 /// System collection with explicit count manifests. `prior_objects` /
 /// `prior_bytes` are already-retained capture-level pins, charged against
 /// the shared manifest+pre-arm budget (packet 6.13 round-3, finding 3).
+/// `scanned` holds pids deep-scanned by earlier passes; a non-empty set
+/// tiers selection (never-scanned groups first) so multi-pass scans cannot
+/// starve a newcomer, while single passes pass an empty set for pure
+/// rarity selection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_with_count_manifests(
     hints: &[PathBuf],
@@ -1140,6 +1175,7 @@ pub(crate) fn collect_with_count_manifests(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -1151,6 +1187,7 @@ pub(crate) fn collect_with_count_manifests(
         policy,
         false,
         budget,
+        scanned,
         manifests,
         prior_objects,
         prior_bytes,
@@ -1179,6 +1216,7 @@ pub(crate) fn collect_inventory_identity(
         policy,
         true,
         CaptureWorkBudget::default(),
+        &BTreeSet::new(),
         &[],
         0,
         0,
@@ -1194,6 +1232,7 @@ fn collect_identity(
     policy: AdmissionPolicy,
     identity: bool,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -1208,10 +1247,11 @@ fn collect_identity(
             true,
             budget,
             true,
+            scanned,
         )
     } else {
         (
-            collect_members(hints, hooks, max_scan_pids, &mut timings, budget),
+            collect_members(hints, hooks, max_scan_pids, &mut timings, budget, scanned),
             None,
         )
     };
@@ -4107,6 +4147,7 @@ pub(crate) fn collect_system_with_identity(
     policy: AdmissionPolicy,
     shared: IdentityShared,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -4131,6 +4172,7 @@ pub(crate) fn collect_system_with_identity(
         true,
         budget,
         identity_takes_anchors(selection),
+        scanned,
     );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
@@ -9120,6 +9162,8 @@ mod take_anchors_wiring_tests {
                 true,
                 CaptureWorkBudget::default(),
                 take_anchors,
+                // Cap 0 selects nothing; freshness is moot.
+                &std::collections::BTreeSet::new(),
             );
             assert!(
                 collection.selected.is_empty(),

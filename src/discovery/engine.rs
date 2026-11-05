@@ -6354,7 +6354,9 @@ pub(crate) fn kernel_thread_exclusions(
 /// Deep-scan selection with kernel threads excluded first: threads with
 /// no user address space never consume cap slots. Every excluded pid is
 /// counted on the pass budget's kernel-thread note, and the rest select
-/// by provider rarity. The three selection call sites (capture,
+/// by provider rarity — tiered by freshness when `scanned` is non-empty
+/// (groups holding never-scanned pids first, then all-scanned groups),
+/// pure rarity for an empty set. The three selection call sites (capture,
 /// system inspect, cgroup inventory) share this; the exclusion predicate
 /// above stays separately pinned.
 pub(crate) fn select_excluding_kernel_threads(
@@ -6363,6 +6365,7 @@ pub(crate) fn select_excluding_kernel_threads(
     proc_root: &Path,
     cap: usize,
     budget: &mut CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
 ) -> Vec<u32> {
     let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
     for _ in &excluded {
@@ -6373,7 +6376,11 @@ pub(crate) fn select_excluding_kernel_threads(
         .filter(|(pid, _)| !excluded.contains(pid))
         .cloned()
         .collect();
-    select_deep_scan_candidates(&eligible, cap)
+    if scanned.is_empty() {
+        select_deep_scan_candidates(&eligible, cap)
+    } else {
+        select_fresh_first_candidates(&eligible, cap, scanned)
+    }
 }
 
 /// Rotation's fairness-tiered variant of the selection above: identical
@@ -6438,6 +6445,79 @@ fn select_rotation_candidates(
                 .iter()
                 .copied()
                 .find(|pid| !stale.contains(pid))
+                .unwrap_or(members[0])
+        })
+        .chain(fresh_unmapped)
+        .chain(stale_unmapped)
+        .take(max_pids)
+        .collect()
+}
+
+/// Freshness-tiered deep-scan selection for multi-pass inventory: groups
+/// holding at least one never-scanned pid come first (rarity-ordered),
+/// then all-scanned groups (rarity-ordered), each represented by its
+/// lowest never-scanned member. A newcomer group ranked below the
+/// pure-rarity cut is still selected once earlier passes scanned the
+/// incumbents, so a stable sweep cannot starve it across passes. With
+/// nothing scanned this agrees with rarity selection exactly.
+pub(crate) fn select_fresh_first_candidates(
+    sweep: &[(u32, Vec<MapEntry>)],
+    max_pids: usize,
+    scanned: &BTreeSet<u32>,
+) -> Vec<u32> {
+    if sweep.len() <= max_pids {
+        let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        return pids;
+    }
+    // Same exact-maps grouping and census as rarity selection.
+    let mut groups: BTreeMap<BTreeSet<ObjectKey>, Vec<u32>> = BTreeMap::new();
+    let mut unmapped: Vec<u32> = Vec::new();
+    for (pid, entries) in sweep {
+        let key: BTreeSet<ObjectKey> = entries
+            .iter()
+            .filter(|entry| is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        if key.is_empty() {
+            unmapped.push(*pid);
+        } else {
+            groups.entry(key).or_default().push(*pid);
+        }
+    }
+    let mut census: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    for (key, members) in &groups {
+        for file in key {
+            *census.entry(*file).or_default() += members.len();
+        }
+    }
+    let mut ordered: Vec<(BTreeSet<ObjectKey>, Vec<u32>)> = groups.into_iter().collect();
+    for (_, members) in &mut ordered {
+        members.sort_unstable();
+    }
+    ordered.sort_by_key(|(key, members)| {
+        let min_global = key
+            .iter()
+            .map(|file| census[file])
+            .min()
+            .unwrap_or(usize::MAX);
+        (min_global, members.len(), members[0])
+    });
+    unmapped.sort_unstable();
+    // `partition` preserves the sorted order within each tier.
+    let (fresh_unmapped, stale_unmapped): (Vec<u32>, Vec<u32>) =
+        unmapped.into_iter().partition(|pid| !scanned.contains(pid));
+    let (fresh_groups, stale_groups): (Vec<_>, Vec<_>) = ordered
+        .into_iter()
+        .partition(|(_, members)| members.iter().any(|pid| !scanned.contains(pid)));
+    fresh_groups
+        .into_iter()
+        .chain(stale_groups)
+        .map(|(_, members)| {
+            members
+                .iter()
+                .copied()
+                .find(|pid| !scanned.contains(pid))
                 .unwrap_or(members[0])
         })
         .chain(fresh_unmapped)
@@ -6753,6 +6833,8 @@ fn discover_plan(
             Path::new("/proc"),
             max_scan_pids,
             &mut discovered.budget,
+            // Capture refresh keeps its own scheduler; no cross-pass set.
+            &BTreeSet::new(),
         );
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,

@@ -299,14 +299,35 @@ pub(crate) fn is_closure_array_refusal(reason: &str) -> bool {
     reason.contains(CLOSURE_ARRAY_MARKER)
 }
 
-/// The stable head of [`CLOSURE_ARRAY_NOTE`] that classifies a closure
-/// refusal, unchanged by later rewording of the rule after it.
+/// The stable head of both closure-array notes that classifies a closure
+/// refusal, unchanged by later rewording of the rule after it. Stored
+/// captures keep classifying under either note.
 const CLOSURE_ARRAY_MARKER: &str = "(a proxy closure array is admitted whole";
 
-/// The admission rule every closure-array refusal states.
-const CLOSURE_ARRAY_NOTE: &str = "(a proxy closure array is admitted whole, as a prefix when \
-     mapped before the capture's first plan beside a provider or named by the operator, or \
-     as published tables)";
+/// The admission rule a Detailed closure-array refusal states: published
+/// tables attach, and only an operator-named layer keeps its
+/// reserve-capped leading-templates prefix (whole for a late-start named
+/// layer). There is no first-plan prefix anymore (Route A).
+pub(crate) const CLOSURE_ARRAY_NOTE_DETAILED: &str = "(a proxy closure array is admitted whole, \
+     as a prefix when named by the operator, or as published tables; an unnamed layer in a \
+     detailed capture attaches only its published tables)";
+
+/// The admission rule an Inventory/Counters/broad closure-array refusal
+/// states: complete-union whole admission, no prefix and no
+/// published-only fallback.
+pub(crate) const CLOSURE_ARRAY_NOTE_WHOLE: &str =
+    "(a proxy closure array is admitted whole under this capture policy)";
+
+/// The closure-array note for one refusal: the Route A rule under
+/// Detailed, the whole rule everywhere else (broad admission lifts the
+/// Detailed closure back to the complete-union whole rule).
+fn closure_array_note(policy: AdmissionPolicy, broad_admit: bool) -> &'static str {
+    if matches!(policy, AdmissionPolicy::Detailed) && !broad_admit {
+        CLOSURE_ARRAY_NOTE_DETAILED
+    } else {
+        CLOSURE_ARRAY_NOTE_WHOLE
+    }
+}
 
 /// What an unpublished closure-array gap says instead of a demand: nothing
 /// it holds may attach yet, whatever the free capacity.
@@ -661,15 +682,19 @@ struct CapacityRefusal<'a> {
     /// A Detailed closure array limited to its published tables, with none
     /// published: not refused for capacity, so no demand is stated.
     unpublished: bool,
+    /// Task 1.6 broad admission lifts even a Detailed closure back to the
+    /// complete-union whole rule, so the note states whole admission.
+    broad_admit: bool,
 }
 
 impl CapacityRefusal<'_> {
     fn reason(&self) -> String {
+        let note = closure_array_note(self.policy, self.broad_admit);
         if self.unpublished {
             let mut reason = format!(
                 "a proxy closure array in a detailed capture attaches only its published \
                  tables, and none of its {} lookalike function tables {CLOSURE_UNPUBLISHED}, \
-                 so calls through it are not counted {CLOSURE_ARRAY_NOTE}; the providers it \
+                 so calls through it are not counted {note}; the providers it \
                  forwards to attach when they load",
                 self.closure_tables.unwrap_or_default()
             );
@@ -698,7 +723,7 @@ impl CapacityRefusal<'_> {
         reason.push_str(" — refusing to attach a prefix");
         if let Some(tables) = self.closure_tables {
             reason.push_str(&format!(
-                " of its {tables} lookalike function tables {CLOSURE_ARRAY_NOTE}"
+                " of its {tables} lookalike function tables {note}"
             ));
         }
         if self.closure_tables.is_none() {
@@ -3507,6 +3532,7 @@ fn merge(
                         && !closure_named,
                     counter_hint,
                     unpublished: awaiting_publication,
+                    broad_admit,
                 };
                 let reason = refusal.reason();
                 let kind = if awaiting_publication {

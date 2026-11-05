@@ -485,13 +485,13 @@ enum AdmissionClass {
     /// one object: a proxy's closure array (p11-kit decodes 64). A call
     /// through the proxy is seen at the real provider's own functions once
     /// that provider is attached, and the whole array (~6,656 endpoints)
-    /// never fits, so it is admitted last in every scope: whole when it
-    /// fits (late-start, reserve-capped), otherwise a reserve-capped
-    /// leading-templates prefix in every scope when the capture's first
-    /// plan held it beside a non-closure provider, or when its opened file
-    /// matched an operator-named `--module` input, and its published tables
-    /// only when unnamed (mapped mid-capture, or alone in the first plan) —
-    /// refused whole when none of those admit.
+    /// never fits, so it is decided last in every scope. A Detailed
+    /// closure admits only its published tables when unnamed (Route A);
+    /// an operator-named one keeps its reserve-capped leading-templates
+    /// prefix (whole first when late-start) before published-only — the
+    /// remote-client exception. Inventory/Counters/broad closures admit
+    /// whole under their complete-union rule. Refused whole, or left
+    /// awaiting publication, when none of those admit.
     ClosureArray,
 }
 
@@ -757,16 +757,14 @@ pub enum AdmissionScope {
     /// with `--module`: providers are admitted first-come in discovery order,
     /// and an unresolved heuristic object admits its strongest
     /// [`MAX_TABLES_PER_OBJECT`] tables (K4). A recognized proxy closure
-    /// array is decided after every provider: whole when it fits
-    /// (late-start, reserve-capped), otherwise a reserve-capped
-    /// leading-templates prefix only when the capture's first plan held it
-    /// beside a non-closure provider, or when operator-named — the prefix
-    /// never takes the [`shared_scope_reserve`] slots, so at least the
-    /// reserve (128 of 512 slots) stays free and one later standard function
-    /// list (at most 104 entries) always fits — and its published tables
-    /// only when unnamed (mapped mid-capture, or without an admitted
-    /// provider in the first plan). A second later provider may not fit; it
-    /// is refused by name with the `--exclude-module` remedy.
+    /// array is decided after every provider: an unnamed one admits only
+    /// its published tables (Route A), while an operator-named one keeps
+    /// its reserve-capped leading-templates prefix (whole first when
+    /// late-start) — the prefix never takes the [`shared_scope_reserve`]
+    /// slots, so at least the reserve (128 of 512 slots) stays free and one
+    /// later standard function list (at most 104 entries) always fits. A
+    /// second later provider may not fit; it is refused by name with the
+    /// `--exclude-module` remedy.
     #[default]
     Named,
     /// Cgroup or system scope without `--module` (GT-5). Every process in
@@ -780,13 +778,13 @@ pub enum AdmissionScope {
     /// `(dev, inode)` so the admitted set never depends on discovery order.
     /// Operator-attested modules are admitted whole or not at all, as are
     /// Inventory/Counters/broad modules under their complete-union rule; a
-    /// Detailed closure array takes the same reserve-capped
-    /// leading-templates prefix a named scope admits (JK-22a) before its
-    /// published tables, and any other Detailed provider refused whole
-    /// retries as its leading-tables prefix with a named partial gap
-    /// (JK-22a) — whole refusal stays only when not even the strongest
-    /// table fits within its reserve-aware budget, or when its
-    /// corroborated (published) tables together do not fit.
+    /// Detailed closure array admits only its published tables when unnamed
+    /// (Route A) and takes the same reserve-capped leading-templates prefix
+    /// a named scope admits when operator-named (JK-22a), and any other
+    /// Detailed provider refused whole retries as its leading-tables prefix
+    /// with a named partial gap (JK-22a) — whole refusal stays only when not
+    /// even the strongest table fits within its reserve-aware budget, or
+    /// when its corroborated (published) tables together do not fit.
     /// Uncorroborated modules leave [`shared_scope_reserve`] slots free.
     Shared,
 }
@@ -2931,25 +2929,26 @@ fn merge(
         // PA-5 C1+M3 plus the operator-named exception, extended to every
         // scope by JK-22a: a Detailed closure array, late-start (PA-9/C1:
         // beside a provider in the first plan) or operator-named, with no
-        // provider refused or omitted ahead of it, falls back to its
-        // leading-templates prefix when whole does not fit — outside the
-        // reserve, so at least the reserve (128 of 512 slots) stays free and
-        // one later standard function list (at most 104 entries) always
-        // fits; a second later provider may be refused by name. Closures
-        // decide last in every scope, so backends claim room first and keep
-        // attaching exactly; an unnamed mid-capture closure admits only its
-        // published tables below.
+        // provider refused or omitted ahead of it, may take its
+        // leading-templates prefix — a late-start named closure falls back
+        // to it when whole does not fit, a mid-capture named one starts at
+        // it — outside the reserve, so at least the reserve (128 of 512
+        // slots) stays free and one later standard function list (at most
+        // 104 entries) always fits; a second later provider may be refused
+        // by name. Closures decide last in every scope, so backends claim
+        // room first and keep attaching exactly; an unnamed closure admits
+        // only its published tables below.
         let closure_prefix_allowed = is_detailed_closure
             && (closure_late_start || closure_named)
             && !provider_refused
             && !provider_omitted;
         // PA-5 C2+M4 as amended by JK-22a: shared scope admits every
         // non-operator, non-closure module whole or not at all; a Detailed
-        // closure admitted whole respects the reserve cap and the first-plan
-        // rule — mid-capture closures skip whole entirely, for published-only
-        // below (or the prefix attempt when operator-named) — and a
-        // prefix-allowed closure retries as its reserve-capped prefix before
-        // published-only, like a named scope.
+        // closure keeps whole only when late-start — an unnamed one still
+        // skips whole for published-only below, a mid-capture named one
+        // starts at its prefix attempt — and a prefix-allowed closure
+        // retries as its reserve-capped prefix before published-only,
+        // like a named scope.
         // Inventory/Counters and broad admit keep their complete-union whole.
         let whole_original = broad_admit
             || admission_policy.admits_complete_validated_union()
@@ -2961,24 +2960,28 @@ fn merge(
         // do corroborated tables. Shared uncorroborated modules keep the
         // reserve as before.
         let reserved = if is_detailed_closure {
-            // Late-start starts whole (reserve-capped, M4); mid-capture
-            // starts published-only (full budget, corroborated tables) or
-            // at the reserve-capped prefix attempt when operator-named.
-            // The passes below re-cap accordingly.
+            // A late-start named closure starts whole (reserve-capped,
+            // M4); anything else starts published-only (full budget,
+            // corroborated tables), except a mid-capture named closure,
+            // which starts at the reserve-capped prefix attempt. The
+            // passes below re-cap accordingly.
             closure_late_start
         } else {
             shared && class.leaves_reserve()
         };
-        // Route A (publication-driven admission): Detailed closures admit
-        // published tables only, never whole and never a heuristic prefix,
-        // in every scope and arrival order. Only a live return of a
-        // standard getter publishes a table; unpublished templates take
-        // no slots, so a forwarding layer can never crowd out a provider.
+        // Route A (publication-driven admission): an unnamed Detailed
+        // closure admits published tables only, never whole and never a
+        // heuristic prefix, in every scope and arrival order. Publication
+        // evidence is a live return, interface linkage, a manifest, or
+        // export agreement (`table_observation_authorized`); unpublished
+        // templates take no slots, so a forwarding layer can never crowd
+        // out a provider.
         // Sole exception, proven by the remote-client cell: an
         // operator-named closure (`--module <path>`) keeps its
-        // reserve-capped prefix, because a remote client's tables are
-        // only ever handed out before any export probe can observe the
-        // return (the client module is classed as a closure array).
+        // reserve-capped prefix (whole first when late-start), because a
+        // remote client's tables are only ever handed out before any
+        // export probe can observe the return (the client module is
+        // classed as a closure array).
         let closure_named_exception =
             is_detailed_closure && closure_named && closure_prefix_allowed;
         let closure_published_only_first = is_detailed_closure && !closure_named_exception;
@@ -3473,8 +3476,11 @@ fn merge(
             }
             // Route A: an unnamed Detailed closure already ran
             // published-only, so its refusal is terminal. An
-            // operator-named closure retries whole, then prefix, then
-            // published-only (the remote-client exception chain).
+            // operator-named closure walks the remote-client exception
+            // chain instead: a late-start one tries whole, then its
+            // prefix, then published-only, while a mid-capture one
+            // starts at its prefix (`use_prefix_fallback` is already
+            // set) and falls through to published-only.
             if is_detailed_closure
                 && !closure_published_only_first
                 && kept.is_empty()

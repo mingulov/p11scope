@@ -9823,7 +9823,7 @@ mod tests {
                     true,
                     None,
                     None,
-                    Some(8193),
+                    Some(131_073),
                     None,
                     Some(&report),
                     dashboard,
@@ -9843,7 +9843,7 @@ mod tests {
                 .unwrap_err();
                 assert!(
                     error.to_string().contains("--max-endpoints")
-                        && error.to_string().contains("1..=8192")
+                        && error.to_string().contains("1..=131072")
                 );
                 assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             }

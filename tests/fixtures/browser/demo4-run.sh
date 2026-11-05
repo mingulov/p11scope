@@ -177,11 +177,30 @@ done
 [ -f "$work/setup-done" ] \
     || { echo "FAIL no-setup-done"; tail -15 "$work/driver.err"; kill "$driver_pid" 2>/dev/null; trap - RETURN; exit 1; }
 
+# DEMO4_LANE_HELD=1: the caller already holds the shared bpf lane
+# for a batch of cells (one lock wait instead of one per cell), so
+# the observer runs without a nested lane lock.
 start_observer() {
-    "$LANE" shared bpf timeout --signal=TERM --kill-after=10s 1200s sudo -n \
+    local lane=("$LANE" shared bpf)
+    [ "${DEMO4_LANE_HELD:-0}" = 1 ] && lane=()
+    "${lane[@]}" timeout --signal=TERM --kill-after=10s 1200s sudo -n \
         "$P11SCOPE" inventory --system --key-operations --duration 150 \
         -o "$work/inventory.json" >"$work/inventory.out" 2>"$work/inventory.err" &
     observer_pid=$!
+}
+# The observer is running (past any lane-lock wait): its own process
+# exists. A head start counted from the lock request would launch the
+# browser before the observer on a busy lane, turning a first-mode
+# cell into an unlabelled late-attach one.
+wait_observer_running() {
+    local waited=0
+    while [ $waited -lt 3600 ]; do
+        pgrep -f -- "^$P11SCOPE inventory --system .*-o $work/inventory.json" >/dev/null \
+            && return 0
+        kill -0 "$observer_pid" 2>/dev/null || return 1
+        sleep 1; waited=$((waited+1))
+    done
+    return 1
 }
 wait_seal() {
     local limit=${1:-900}
@@ -206,6 +225,8 @@ wait_pidfile() {
 t0=$(date +%s)
 if [ "$MODE" = first ]; then
     start_observer
+    wait_observer_running \
+        || { echo "FAIL observer-never-ran mode=first"; tail -15 "$work/inventory.err"; trap - RETURN; exit 1; }
     # p11scope starts first, but without a manifest the scan seal
     # can only mint once a complete provider exists to discover:
     # give the observer a head start, then launch the browser and

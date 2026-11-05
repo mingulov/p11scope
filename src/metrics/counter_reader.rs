@@ -250,6 +250,34 @@ fn transient_bytes(mode: CounterMode, cpus: usize, rv_keys: usize) -> Option<usi
         .checked_add(5 * OWNED_ALLOCATION_PADDING)
 }
 
+/// Zero placeholder for a slot whose bank cell could not be folded. All
+/// counts are unknown (named by `failed_slots`), and the slot's RVs are
+/// dropped like the legacy zero-with-gap path, so the row vector stays
+/// slot-aligned and later exact reads telescope from zero. Infallible in
+/// context: any visited slot proves `limits.rows >= 1`, no RV keys are
+/// folded, and zero adds cannot overflow or saturate.
+fn zero_row(
+    slot: &Slot,
+    mode: CounterMode,
+    limits: CounterLimits,
+) -> Result<CounterRow, CounterIssue> {
+    let rvs = std::iter::empty::<(RvKey, u64)>();
+    match mode {
+        CounterMode::Counts => {
+            let zero = CountStats::default();
+            CounterRow::fold(slot, mode, [CounterCell::Counts(&zero)], rvs, limits)
+        }
+        CounterMode::Timestamps => {
+            let zero = TimestampStats::default();
+            CounterRow::fold(slot, mode, [CounterCell::Timestamps(&zero)], rvs, limits)
+        }
+        CounterMode::Latency => {
+            let zero = SlotStats::ZERO;
+            CounterRow::fold(slot, mode, [CounterCell::Latency(&zero)], rvs, limits)
+        }
+    }
+}
+
 fn acquire(
     source: &impl CounterSource,
     generation: NonZeroU64,
@@ -381,6 +409,15 @@ fn acquire(
                 Ok(Ok(row)) => rows.push(row),
                 Ok(Err(_)) | Err(_) => {
                     gaps.failed_slots = gaps.failed_slots.saturating_add(1);
+                    // Keep row identity stable across the gap: a zero
+                    // placeholder (unknown, named by failed_slots) so a
+                    // first-read or generation-change gap still installs
+                    // a slot-aligned baseline that later exact reads
+                    // telescope against, instead of latching Topology.
+                    rows.push(
+                        zero_row(slot, source.mode(), limits)
+                            .expect("zero fold within validated limits"),
+                    );
                 }
             }
             start = end;
@@ -1218,9 +1255,20 @@ mod tests {
         .expect("one bad bank cell must not void the readable bank");
         let view = read.view();
         let rows = view.rows.unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].view().slot, 0);
         assert_eq!(rows[0].view().returned, 5);
+        assert_eq!(rows[1].view().slot, 2);
+        assert_eq!(
+            (
+                rows[1].view().entered,
+                rows[1].view().returned,
+                rows[1].view().errors
+            ),
+            (0, 0, 0),
+            "failed slot folds zero as unknown"
+        );
+        assert!(rows[1].view().rv_counts.is_empty());
         assert_eq!(view.gaps.failed_slots, 1);
         assert!(!view.gaps.health_failed);
         assert!(!view.gaps.kernel_failed);

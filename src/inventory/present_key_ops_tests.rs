@@ -842,3 +842,45 @@ fn joint_birth_gap_renders_plain_words_with_machine_reason() {
         "{verbose}"
     );
 }
+
+/// Item 14: when --key-operations was requested but per-key tracking did
+/// not start, the line names the request and the cause; without the
+/// request gap it stays "not reported (per-key tracking is off)".
+#[test]
+fn key_ops_line_requested_but_not_started_names_cause() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "key operations unavailable".into(),
+        reason:
+            "test journal refused; broad inventory continues with S1 mechanisms and API results"
+                .into(),
+        budget: None,
+        repeats: 1,
+    });
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        key_ops_line(&snapshot)
+            .starts_with("key operations: requested, but per-key tracking did not start"),
+        "{snapshot}"
+    );
+    assert!(
+        !key_ops_line(&snapshot).contains("not reported"),
+        "{snapshot}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        key_ops_line(&verbose)
+            .starts_with("key operations: requested, but per-key tracking did not start"),
+        "{verbose}"
+    );
+    let plain = key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    assert_eq!(
+        key_ops_line(&render_snapshot(&plain)),
+        "key operations: not reported (per-key tracking is off)",
+    );
+}

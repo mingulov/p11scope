@@ -3134,6 +3134,13 @@ fn render_coverage(out: &mut String, catalog: &Catalog) {
     }
 }
 
+/// Whether a planner refusal is a probe-budget refusal: the module needs
+/// more attach slots than remain. Concise folds these to one plain line;
+/// verbose and JSON keep the full demand.
+fn is_capacity_refusal(reason: &str) -> bool {
+    reason.contains("attach slots are available")
+}
+
 fn render_object(
     out: &mut String,
     index: usize,
@@ -3188,15 +3195,24 @@ fn render_object(
     }
     match &object.admission {
         AdmissionRecord::Admitted { class, endpoints } => {
+            // Inspect watches nothing: say what a capture aimed at this
+            // file would watch. Concise has no per-table listing below,
+            // so the scan-only note stays verbose-only.
+            let noun = if *endpoints == 1 {
+                "function"
+            } else {
+                "functions"
+            };
             if verbose {
                 let _ = writeln!(
                     out,
-                    "  admission  admitted ({class}, {endpoints} endpoints; {SCAN_ONLY_NOTE})"
+                    "  admission  profile/run would watch {endpoints} {noun} (class {class}; \
+                     {TEXT_SCAN_ONLY_NOTE})"
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "  admission  admitted ({endpoints} endpoints; {SCAN_ONLY_NOTE})"
+                    "  admission  profile/run would watch {endpoints} {noun}"
                 );
             }
         }
@@ -3252,6 +3268,14 @@ fn render_object(
                     out,
                     "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
                     crate::render::escape_controls(reason),
+                );
+            } else if is_capacity_refusal(reason) {
+                // A budget refusal names its demand in full under -v and
+                // JSON; concise keeps the plain budget line with the fix.
+                let _ = writeln!(
+                    out,
+                    "  admission  refused: too many functions for the remaining probe \
+                     budget; name it with --module to capture it alone"
                 );
             } else {
                 let _ = writeln!(
@@ -3505,6 +3529,27 @@ fn render_admission_summary(out: &mut String, catalog: &Catalog, verbose: bool) 
     );
 }
 
+/// Whether a skip reason is an unexamined-maps gap (`unexamined_maps_gap`):
+/// per-pid shared-object counts that would split concise groups by number.
+fn is_unexamined_maps_reason(reason: &str) -> bool {
+    reason.starts_with("maps ")
+        && reason.contains("shared object")
+        && reason.contains("no deep scan examined")
+}
+
+/// The per-object cap behind an over-capacity skip (`too_large (SIZE bytes;
+/// per-object cap is CAP)`), for folding sizes that would otherwise split
+/// concise groups. `None` for any other reason or an unparsable cap.
+fn too_large_cap(reason: &str) -> Option<u64> {
+    let rest = reason.strip_prefix("too_large (")?;
+    let (_, rest) = rest.split_once("per-object cap is ")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 /// Skipped records and notes in text. Verbose lists every record —
 /// the full per-gap detail `-v` promises. Concise folds member records
 /// by reason — a lone record keeps its pid and subject, a repeated
@@ -3535,8 +3580,43 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
         }
         return;
     }
-    let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();
+    // Plain folds first: reasons with per-record numbers (unexamined-maps
+    // counts, over-cap sizes) fold by kind with a process/file count,
+    // instead of splitting one group per number.
+    let mut plain_maps: Vec<&PidGap> = Vec::new();
+    let mut plain_large: BTreeMap<u64, Vec<&PidGap>> = BTreeMap::new();
+    let mut rest: Vec<&PidGap> = Vec::new();
     for gap in gaps.iter().filter(|gap| gap.pid.is_some()) {
+        if is_unexamined_maps_reason(&gap.reason) {
+            plain_maps.push(gap);
+        } else if let Some(cap) = too_large_cap(&gap.reason) {
+            plain_large.entry(cap).or_default().push(gap);
+        } else {
+            rest.push(gap);
+        }
+    }
+    if !plain_maps.is_empty() {
+        let processes: BTreeSet<u32> = plain_maps.iter().filter_map(|gap| gap.pid).collect();
+        let count = processes.len();
+        let noun = if count == 1 { "process" } else { "processes" };
+        let verb = if count == 1 { "maps" } else { "map" };
+        let _ = writeln!(
+            out,
+            "{title}: {count} {noun} {verb} libraries that were not deep-scanned (may hide \
+             providers) (--json lists each)",
+        );
+    }
+    for (cap, group) in &plain_large {
+        let mib = cap / (1024 * 1024);
+        let count = group.len();
+        let noun = if count == 1 { "file" } else { "files" };
+        let _ = writeln!(
+            out,
+            "{title}: {count} {noun} over {mib} MiB not read (--json lists each)",
+        );
+    }
+    let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();
+    for gap in rest {
         by_reason.entry(gap.reason.as_str()).or_default().push(gap);
     }
     for (reason, group) in &by_reason {
@@ -8602,8 +8682,10 @@ mod tests {
         assert!(!text.contains("closure_array"), "{text}");
     }
 
-    /// A capacity closure refusal keeps its full text: the demand it states
-    /// is actionable, not a by-design constant.
+    /// A capacity closure refusal keeps its full text under `-v`: the demand
+    /// it states is actionable, not a by-design constant. Concise folds it
+    /// to the plain budget line (see
+    /// `concise_capacity_refusal_is_plain_budget_line`).
     #[test]
     fn text_keeps_capacity_closure_refusal_verbatim() {
         let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
@@ -8622,11 +8704,154 @@ mod tests {
                 kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
-        let text = render_text(&catalog);
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
-            text.contains(&format!("refused: {reason} [{SCAN_ONLY_NOTE}]")),
+            verbose.contains(&format!(
+                "refused (closure_array): {reason} [{SCAN_ONLY_NOTE}]"
+            )),
+            "{verbose}"
+        );
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["objects"][0]["admission"]["reason"].as_str(),
+            Some(reason),
+            "{document}"
+        );
+    }
+
+    /// Item 12: concise admitted text says what profile/run would watch;
+    /// inspect itself watches nothing.
+    #[test]
+    fn concise_admitted_says_profile_run_would_watch() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            text.contains("profile/run would watch 68 functions"),
             "{text}"
         );
+        assert!(!text.contains("admission  watched"), "{text}");
+    }
+
+    /// Item 12: verbose admitted text also avoids claiming inspect watches.
+    #[test]
+    fn verbose_admitted_says_profile_run_would_watch() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            text.contains("profile/run would watch 68 functions"),
+            "{text}"
+        );
+        assert!(!text.contains("admission  watched"), "{text}");
+    }
+
+    /// Item 10: concise capacity refusal is one plain budget line; verbose
+    /// keeps the full planner reason.
+    #[test]
+    fn concise_capacity_refusal_is_plain_budget_line() {
+        let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
+             use — refusing to attach a prefix of its 67 lookalike function tables \
+             (a proxy closure array is admitted whole, as a prefix when mapped before the \
+             capture's first plan beside a provider or named by the operator, or as published \
+             tables)";
+        let catalog = catalog_with(vec![object(
+            "/usr/lib64/libp11-kit.so.0.4.11",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: reason.into(),
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains(
+                "refused: too many functions for the remaining probe budget; name it \
+                 with --module to capture it alone"
+            ),
+            "{concise}"
+        );
+        assert!(!concise.contains("lookalike"), "{concise}");
+        assert!(!concise.contains("closure_prefix"), "{concise}");
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("module needs 388 more"), "{verbose}");
+    }
+
+    /// Item 10: unexamined-maps skips with different counts fold to one
+    /// plain concise line; verbose lists each pid record.
+    #[test]
+    fn concise_folds_unexamined_maps_gaps_to_one_plain_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for (pid, count) in [(11u32, 13usize), (12, 14), (13, 9)] {
+            catalog.skipped.push(unexamined_maps_gap(pid, count));
+        }
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains(
+                "3 processes map libraries that were not deep-scanned (may hide providers)"
+            ),
+            "{concise}"
+        );
+        assert_eq!(
+            concise
+                .lines()
+                .filter(|line| line.starts_with("skipped"))
+                .count(),
+            1,
+            "{concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("maps 13 shared objects"), "{verbose}");
+        assert!(verbose.contains("maps 14 shared objects"), "{verbose}");
+    }
+
+    /// Item 10: over-capacity file skips with different sizes fold to one
+    /// plain concise line; verbose lists each record.
+    #[test]
+    fn concise_folds_too_large_gaps_to_one_plain_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for (pid, size) in [(21u32, 319346888u64), (22, 300000000)] {
+            catalog.skipped.push(PidGap::member(
+                pid,
+                Skipped {
+                    subject: format!("/proc/{pid}/root/usr/lib/big.so"),
+                    reason: format!("too_large ({size} bytes; per-object cap is 268435456)"),
+                },
+            ));
+        }
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("2 files over 256 MiB not read"),
+            "{concise}"
+        );
+        assert_eq!(
+            concise
+                .lines()
+                .filter(|line| line.starts_with("skipped"))
+                .count(),
+            1,
+            "{concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("too_large (319346888 bytes"), "{verbose}");
     }
 
     /// Twenty identical pin-loss skips across two processes fold to one

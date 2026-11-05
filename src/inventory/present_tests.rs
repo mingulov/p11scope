@@ -679,7 +679,8 @@ fn retained_labels_preserve_unknown_deleted_and_incarnation() {
         }),
     ] {
         presentation.callers[0].exe = exe;
-        let snapshot = render_snapshot(&presentation);
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
         assert!(
             snapshot.contains(&format!(
                 "application Unknown executable [{} pid 4242 incarnation 0]",
@@ -690,7 +691,8 @@ fn retained_labels_preserve_unknown_deleted_and_incarnation() {
     }
     for paths in [vec![], vec![String::new()]] {
         presentation.modules[0].paths = paths;
-        let snapshot = render_snapshot(&presentation);
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
         assert!(
             snapshot.contains(&format!("-> module Unknown module [{}]:", module.label())),
             "{snapshot}"
@@ -709,7 +711,8 @@ fn retained_labels_preserve_unknown_deleted_and_incarnation() {
         Some("Process state unknown")
     );
     presentation.modules[0].paths = vec!["/opt/provider\u{1b}[2J\u{7}\u{9b}\u{7f}.so".into()];
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
         snapshot.contains("application 日本語\\u{1b}[31m\\u{7}\\u{9b}\\u{7f}"),
         "{snapshot}"
@@ -728,7 +731,8 @@ fn retained_labels_preserve_unknown_deleted_and_incarnation() {
         module_label(&presentation, ModuleId(u32::MAX)),
         "Unknown module"
     );
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let overview = snapshot
         .lines()
         .find(|line| line.starts_with("application "))
@@ -892,7 +896,8 @@ fn overview_observations_preserve_evidence_meaning() {
         } else {
             assert_eq!(label, explanation);
         }
-        let snapshot = render_snapshot(&presentation);
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
         let overview = snapshot
             .lines()
             .find(|line| line.starts_with("application "))
@@ -2490,4 +2495,85 @@ fn coverage_line_carries_a_complete_or_partial_verdict() {
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(out.contains("coverage: PARTIAL"), "{out}");
     assert!(!out.contains("suppressed"), "{out}");
+}
+
+/// Item 13: the scan-identity gap reads in plain words in concise and
+/// verbose text; JSON keeps the stored subject/reason.
+#[test]
+fn concise_gap_summary_uses_plain_words_for_scan_identity_gap() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "exact image authority unavailable".into(),
+        reason: "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("process identity checked from /proc (PID and start time), not by the kernel"),
+        "{out}"
+    );
+    assert!(!out.contains("exact image authority unavailable"), "{out}");
+    assert!(!out.contains("pidfd/start-time"), "{out}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains(
+            "process identity checked from /proc (PID and start time), not by the kernel"
+        ),
+        "{verbose}"
+    );
+}
+
+/// Item 16: the concise limits line counts watched functions against the
+/// real inventory endpoint budget, never the registry ceiling.
+#[test]
+fn concise_limits_line_uses_real_inventory_endpoint_budget() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    let budget = presentation.budgets.inventory_endpoints_limit;
+    assert!(
+        limits.contains(&format!("of {budget}")),
+        "limits line must use the inventory budget {budget}: {limits}"
+    );
+    assert!(!limits.contains("of 1048576"), "{limits}");
+}
+
+/// Item 15: concise groups application edges per provider without
+/// internal ids; verbose keeps one line per edge with ids.
+#[test]
+fn concise_groups_edges_per_provider_without_ids() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert!(presentation.edges.len() > 1, "fixture needs several edges");
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(!out.contains("[c"), "{out}");
+    assert!(!out.contains("[m"), "{out}");
+    assert!(!out.contains("incarnation"), "{out}");
+    assert!(!out.contains(" -> module "), "{out}");
+    assert!(
+        !out.lines().any(|line| line.starts_with("application ")),
+        "{out}"
+    );
+    for module in &presentation.modules {
+        let name = module
+            .paths
+            .first()
+            .map(|p| p.rsplit('/').next().unwrap_or(p))
+            .unwrap_or("?");
+        assert!(out.contains(name), "provider {name} missing: {out}");
+    }
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains("application "), "{verbose}");
+    assert!(verbose.contains("incarnation"), "{verbose}");
 }

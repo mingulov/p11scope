@@ -1452,6 +1452,9 @@ fn concise_gap_summary_line(gaps: &[GapView], _suppressed: u64) -> Option<String
 
 /// The concise limits line (INV-1): the headline budgets in words.
 /// The full budget dump stays verbose-only; `--json` carries `budgets`.
+/// Watched functions count against the real inventory endpoint budget
+/// (the attach set's `--max-endpoints` limit), never the registry's
+/// internal endpoint ceiling.
 fn render_limits_line(out: &mut String, budgets: &BudgetView) {
     use std::fmt::Write as _;
     let plural = |count: usize| if count == 1 { "" } else { "s" };
@@ -1465,11 +1468,31 @@ fn render_limits_line(out: &mut String, budgets: &BudgetView) {
         budgets.edges_occupied,
         plural(budgets.edges_occupied),
         budgets.refusals(),
-        budgets.endpoints_occupied,
-        plural(budgets.endpoints_occupied),
-        budgets.endpoints_limit,
-        budgets.endpoints_refused,
+        budgets.inventory_endpoints_occupied,
+        plural(budgets.inventory_endpoints_occupied),
+        budgets.inventory_endpoints_limit,
+        budgets.inventory_endpoints_refused,
     );
+}
+
+/// The refused journal-start cause behind a `journal_unavailable`
+/// observation, when `--key-operations` was requested: the first clause
+/// of the "key operations unavailable" scope gap's reason (the rest is
+/// the shared "broad inventory continues" tail). `None` when no such
+/// gap exists, so an unrequested run still reads "tracking is off".
+fn key_operations_refusal_cause(presentation: &Presentation) -> Option<String> {
+    presentation
+        .gaps
+        .iter()
+        .find(|gap| gap.subject == "key operations unavailable")
+        .map(|gap| {
+            gap.reason
+                .split_once(';')
+                .map_or(gap.reason.as_str(), |(first, _)| first)
+                .trim()
+                .to_string()
+        })
+        .map(|cause| escape_controls(&cause).into_owned())
 }
 
 /// One key-observation machine reason in plain words (text only; JSON
@@ -1502,6 +1525,9 @@ fn gap_plain_subject(subject: &str) -> &str {
         "per-key tracking is off; this capture keeps S1 mechanisms and API results" => {
             "per-key tracking is off; function and mechanism counts are unaffected"
         }
+        "exact image authority unavailable" => {
+            "process identity checked from /proc (PID and start time), not by the kernel"
+        }
         other => other,
     }
 }
@@ -1524,7 +1550,147 @@ fn gap_plain_reason(reason: &str) -> &str {
         "joint_birth_no_admission" => "process was not admitted for tracking",
         "joint_journal_unavailable" => "per-key tracking is off in this run",
         "foreign_or_unproven_caller" => "caller not confirmed",
+        "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection" => {
+            "some processes were identified from /proc only"
+        }
         other => other,
+    }
+}
+
+/// One module's concise outcome across its grouped edges: refused modules
+/// were never watched (a proxy forwards to real providers); otherwise the
+/// observed entry total, or the shared zero-use wording when nothing was
+/// counted. Plain words only; per-edge coverage stays verbose-only.
+fn concise_module_status(
+    presentation: &Presentation,
+    module: ModuleId,
+    edges: &[&EdgeView],
+) -> String {
+    if let Ok(index) = presentation
+        .modules
+        .binary_search_by_key(&module, |view| view.id)
+    {
+        let view = &presentation.modules[index];
+        if view.admission == AdmissionState::Refused {
+            let proxy = view
+                .admission_class
+                .as_deref()
+                .is_some_and(|class| class.contains("closure"))
+                || view
+                    .admission_reasons
+                    .iter()
+                    .any(|reason| crate::plan::is_closure_awaiting_publication(reason));
+            if proxy {
+                return "not watched (proxy)".to_string();
+            }
+            return "not watched".to_string();
+        }
+    }
+    let total: u64 = edges.iter().map(|edge| edge.entry_count).sum();
+    if total > 0 {
+        let noun = if total == 1 { "entry" } else { "entries" };
+        return format!("{total} {noun} observed");
+    }
+    if edges
+        .iter()
+        .all(|edge| matches!(edge.coverage, UseCoverage::WatchedNoUse { .. }))
+        && !edges.is_empty()
+    {
+        return "no use in the covered interval".to_string();
+    }
+    if edges
+        .iter()
+        .all(|edge| matches!(edge.coverage, UseCoverage::Unknown(UnknownReason::ScanOnly)))
+    {
+        return "activity not captured".to_string();
+    }
+    "activity unknown".to_string()
+}
+
+/// One verbose edge line with internal caller/module ids, lifecycle and
+/// coverage: the full per-edge detail `-v` promises. Concise groups by
+/// provider instead (see `render_concise_edges`).
+fn render_verbose_edge(out: &mut String, presentation: &Presentation, edge: &EdgeView) {
+    use std::fmt::Write as _;
+    let caller = retained_caller(presentation, edge.caller);
+    let identity = caller.map_or_else(
+        || edge.caller.label(),
+        |caller| {
+            format!(
+                "{} pid {} incarnation {}",
+                caller.id.label(),
+                caller.pid,
+                caller.incarnation
+            )
+        },
+    );
+    let _ = write!(
+        out,
+        "application {} [{identity}] -> module {} [{}]: {}",
+        application_label(presentation, edge.caller),
+        module_label(presentation, edge.module),
+        edge.module.label(),
+        observation_label_at(edge, presentation.ended_ns),
+    );
+    if let Some(lifecycle) = caller.and_then(caller_lifecycle_label) {
+        let _ = write!(out, "; {lifecycle}");
+    }
+    // Other unknown reasons already accompany the zero-count explanation;
+    // positive history still keeps its unknown coverage reason alongside it.
+    let show_coverage = match edge.coverage {
+        UseCoverage::Counted { .. } => edge.entry_count == 0,
+        UseCoverage::WatchedNoUse { .. }
+        | UseCoverage::Unknown(UnknownReason::PendingFirstUse | UnknownReason::ScanOnly) => true,
+        UseCoverage::Unknown(_) => edge.entry_count > 0,
+        UseCoverage::Witnessed { .. } => false,
+    };
+    if show_coverage {
+        let _ = write!(
+            out,
+            "; coverage {}",
+            escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns))
+        );
+    }
+    out.push('\n');
+}
+
+/// Concise application edges grouped per provider: one line per module
+/// naming the mapped application count and the outcome, without internal
+/// caller/module ids (those stay verbose-only). JSON keeps every edge.
+fn render_concise_edges(out: &mut String, presentation: &Presentation) {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fmt::Write as _;
+    let mut by_module: BTreeMap<ModuleId, Vec<&EdgeView>> = BTreeMap::new();
+    for edge in &presentation.edges {
+        by_module.entry(edge.module).or_default().push(edge);
+    }
+    let mut groups: Vec<(ModuleId, Vec<&EdgeView>)> = by_module.into_iter().collect();
+    groups.sort_by_key(|(module, _)| module_label(presentation, *module));
+    for (module, edges) in groups {
+        let mut callers: BTreeSet<CallerId> = BTreeSet::new();
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for edge in &edges {
+            callers.insert(edge.caller);
+            names.insert(application_label(presentation, edge.caller));
+        }
+        let count = callers.len();
+        let noun = if count == 1 {
+            "application"
+        } else {
+            "applications"
+        };
+        let all_names: Vec<String> = names.into_iter().collect();
+        let mut shown: Vec<String> = all_names.iter().take(3).cloned().collect();
+        if all_names.len() > 3 {
+            shown.push("…".to_string());
+        }
+        let status = concise_module_status(presentation, module, &edges);
+        let _ = writeln!(
+            out,
+            "{}: mapped by {count} {noun} ({}); {status}",
+            module_label(presentation, module),
+            shown.join(", "),
+        );
     }
 }
 
@@ -1590,7 +1756,16 @@ fn render_snapshot_inner(
             // Other reasons name the cause in plain words, with the
             // machine reason beside it in verbose text (JSON keeps it).
             if observations.reason == "journal_unavailable" {
-                if verbose {
+                // A refused journal start leaves a "key operations
+                // unavailable" scope gap: --key-operations was requested
+                // but per-key tracking never started. Name the request and
+                // the cause; without that gap tracking is simply off.
+                if let Some(cause) = key_operations_refusal_cause(presentation) {
+                    let _ = writeln!(
+                        out,
+                        "key operations: requested, but per-key tracking did not start ({cause})"
+                    );
+                } else if verbose {
                     let _ = writeln!(
                         out,
                         "key operations: not reported (per-key tracking is off; \
@@ -1706,49 +1881,14 @@ fn render_snapshot_inner(
             let _ = writeln!(out, "{line}");
         }
     }
-    for edge in &presentation.edges {
-        let caller = retained_caller(presentation, edge.caller);
-        let identity = caller.map_or_else(
-            || edge.caller.label(),
-            |caller| {
-                format!(
-                    "{} pid {} incarnation {}",
-                    caller.id.label(),
-                    caller.pid,
-                    caller.incarnation
-                )
-            },
-        );
-        let _ = write!(
-            out,
-            "application {} [{identity}] -> module {} [{}]: {}",
-            application_label(presentation, edge.caller),
-            module_label(presentation, edge.module),
-            edge.module.label(),
-            observation_label_at(edge, presentation.ended_ns),
-        );
-        if let Some(lifecycle) = caller.and_then(caller_lifecycle_label) {
-            let _ = write!(out, "; {lifecycle}");
+    // Verbose keeps one line per edge with internal ids; concise and
+    // quiet group per provider (see `render_concise_edges`).
+    if verbose {
+        for edge in &presentation.edges {
+            render_verbose_edge(&mut out, presentation, edge);
         }
-        // Other unknown reasons already accompany the zero-count explanation;
-        // positive history still keeps its unknown coverage reason alongside it.
-        let show_coverage = match edge.coverage {
-            UseCoverage::Counted { .. } => edge.entry_count == 0,
-            UseCoverage::WatchedNoUse { .. }
-            | UseCoverage::Unknown(UnknownReason::PendingFirstUse | UnknownReason::ScanOnly) => {
-                true
-            }
-            UseCoverage::Unknown(_) => edge.entry_count > 0,
-            UseCoverage::Witnessed { .. } => false,
-        };
-        if show_coverage {
-            let _ = write!(
-                out,
-                "; coverage {}",
-                escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns))
-            );
-        }
-        out.push('\n');
+    } else {
+        render_concise_edges(&mut out, presentation);
     }
     if presentation.edges.is_empty() {
         let _ = writeln!(

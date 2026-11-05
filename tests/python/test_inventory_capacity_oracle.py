@@ -118,7 +118,8 @@ def refusal_case(limit=4096):
 
     Sixty full 68-endpoint copies plus a 17-endpoint tail make 4,097; the
     tail is refused whole with the lowering wording observed on a real N+1
-    run, and the admitted 4,080 endpoints keep exact native counts.
+    run, and the admitted 4,080 endpoints keep exact native counts. With
+    limit=32768 this makes 481 full copies plus a 61-endpoint tail (32769).
     """
     demand = limit + 1
     full, tail = divmod(demand, 68)

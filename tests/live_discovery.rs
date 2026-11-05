@@ -49,6 +49,8 @@ fn engine_initial_discovery_preserves_plan() {
     let pid = std::process::id();
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: vec![provider],
         exclude_modules: vec![],

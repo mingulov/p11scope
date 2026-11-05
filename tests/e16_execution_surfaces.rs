@@ -431,6 +431,8 @@ impl HeldDriver {
 fn args_for(pid: u32, hint: &Path) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: vec![hint.to_path_buf()],
         exclude_modules: vec![],

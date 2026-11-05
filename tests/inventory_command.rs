@@ -506,7 +506,7 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     let text_path = dir.join("edges.txt");
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
-        .args(["--capture", "scan"])
+        .args(["--capture", "scan", "-v"])
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "reload")
         .env("INV_PROV", &prov)
@@ -715,7 +715,7 @@ fn inventory_snapshot_names_the_observed_executable_and_module() {
     // preserving parent custody of its single owned fixture under Yama.
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
-        .args(["--capture", "scan", "--duration", "2s", "-o"])
+        .args(["--capture", "scan", "-v", "--duration", "2s", "-o"])
         .arg(&file)
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "plain")
@@ -1206,12 +1206,12 @@ fn s1_command_json_carries_semantic_schema_with_honest_unknowns() {
 #[test]
 fn s1_command_degraded_run_keeps_stderr_honest() {
     // A refused run (dashboard forced onto a pipe) degrades with an
-    // honest stderr notice; the snapshot it emits instead carries the
-    // S1 semantic budget line and withheld columns.
+    // honest stderr notice; the full snapshot it emits under -v
+    // carries the S1 semantic budget line and withheld columns.
     let _guard = serial_guard();
     let dir = tmp("inventory-command-s1-degrade");
     let driver = LiveDriver::spawn(&dir, "s1d", &["s1d-p1.so"]);
-    let output = observe(driver.pid, &["--capture", "scan", "--dashboard"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--dashboard", "-v"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "degraded run exits 0: {stderr}");
     assert!(

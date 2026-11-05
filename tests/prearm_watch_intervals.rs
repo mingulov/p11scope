@@ -98,6 +98,8 @@ fn capture_args(
         counter_mode: None,
         select_endpoint: None,
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         duration: None,
         out: None,
         max_events: None,

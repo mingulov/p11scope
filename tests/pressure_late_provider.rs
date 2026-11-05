@@ -129,6 +129,8 @@ fn spawn_loaded(driver: &Path, provider: &Path) -> support::ChildGuard {
 fn system_args(hints: Vec<PathBuf>) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: hints,
         exclude_modules: vec![],

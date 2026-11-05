@@ -29,6 +29,8 @@ fn work_dir(name: &str) -> PathBuf {
 fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
     RunArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         exclude_modules: vec![],

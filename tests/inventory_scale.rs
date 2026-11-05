@@ -1222,6 +1222,9 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let file = out_dir.path().join("partial.json");
     let stderr_log = dir.join("stderr.log");
+    // System-wide JSON exceeds the 64 KiB pipe nobody drains mid-run
+    // (see `spawn_with_peak`), so stdout goes to a file like stderr.
+    let stdout_log = dir.join("stdout.log");
     // One small budget, overflowed on purpose: the machine always holds
     // more than one process (the test, its shell, the observer), so a
     // scan cap of 1 always truncates and the run is always partial.
@@ -1230,6 +1233,8 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     // counts it otherwise).
     let (output, peak) = {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_p11scope"));
+        // The per-pass gap line is verbose-only since CLI-1 (the concise
+        // head carries the PARTIAL coverage); full detail for the pin.
         cmd.args([
             "inventory",
             "--system",
@@ -1240,11 +1245,12 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
             "userspace",
             "--max-scan-pids",
             "1",
+            "-v",
             "-o",
         ])
         .arg(&file)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped());
+        .stdout(std::fs::File::create(&stdout_log).unwrap());
         spawn_with_peak(&mut cmd, &stderr_log)
     };
     let stderr = std::fs::read_to_string(&stderr_log).unwrap();
@@ -1255,7 +1261,7 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     );
     // Both sinks carry the same bytes: the `-o` file and stdout agree.
     assert_eq!(
-        output.stdout,
+        std::fs::read(&stdout_log).unwrap(),
         std::fs::read(&file).unwrap(),
         "stdout and the -o report agree byte for byte"
     );

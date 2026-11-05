@@ -2148,10 +2148,10 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
     };
     let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
     if crate::plan::is_closure_array_refusal(&skipped.reason) {
-        body.push_str(&closure_forwarding_hint(ev, reports));
+        body.push_str(&closure_forwarding_hint(ev, reports, &skipped.name));
         body.push_str(". Calls the forwarding layer answers itself are not counted.");
     } else if crate::plan::is_closure_array_prefix(&skipped.reason) {
-        body.push_str(&closure_forwarding_hint(ev, reports));
+        body.push_str(&closure_forwarding_hint(ev, reports, &skipped.name));
         body.push_str(
             ". Calls the forwarding layer answers itself through a template \
              that was not attached are not counted.",
@@ -2168,10 +2168,23 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
 /// Where a refused proxy layer's forwarded calls are counted: the attached
 /// providers with their completed calls, top three plus "and K more" — or,
 /// when nothing below it counted, an explicit statement to that effect.
-fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
+/// The skipped layer itself is never listed: a prefix-admitted layer's own
+/// stub slots count under its own module id, and naming it as a provider
+/// below itself would be circular. A refused layer holds no slots, so the
+/// exclusion is a no-op there.
+fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: &str) -> String {
+    let skipped_id = ev
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.path == skipped_name)
+        .map(|module| module.id);
     let mut calls = std::collections::BTreeMap::<ModuleId, u64>::new();
     for report in reports {
         if let Some(module) = report.module {
+            if Some(module) == skipped_id {
+                continue;
+            }
             let total = calls
                 .get(&module)
                 .copied()

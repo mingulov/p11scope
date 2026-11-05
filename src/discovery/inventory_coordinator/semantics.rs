@@ -473,6 +473,38 @@ fn accept_retained_inputs(
                 }
             }
         } else {
+            // One entry per provider object: a multi-process
+            // browser maps one provider in several views, and the
+            // completeness claim is per object — a partial walk in
+            // one view must not poison a full walk of the same
+            // tables in another. Keep a complete entry when one
+            // exists (all tables full, no affecting unpinned
+            // entries, matching the claims' completeness rule).
+            let entry_complete = |module: &ReconciledModule| {
+                module.scanned.tables.iter().all(|table| {
+                    table.walk == "full"
+                        && !table.unpinned.iter().any(|entry| {
+                            crate::kinds::descriptor(&entry.subject).is_none_or(|descriptor| {
+                                descriptor != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                            })
+                        })
+                })
+            };
+            let mut by_object: std::collections::BTreeMap<_, ReconciledModule> =
+                std::collections::BTreeMap::new();
+            for module in modules {
+                match by_object.entry(module.object) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(module);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        if !entry_complete(slot.get()) && entry_complete(&module) {
+                            slot.insert(module);
+                        }
+                    }
+                }
+            }
+            let modules: Vec<_> = by_object.into_values().collect();
             for module in &modules {
                 accepted.insert(module.object);
             }

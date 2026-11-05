@@ -12098,6 +12098,11 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "terminal publishes stale, failing only without a snapshot",
         ),
         (
+            "            plan, pins, profile, binding, acquire, legacy, generation, kernel,\n        )",
+            "            plan, pins, profile, binding, acquire, legacy, generation, kernel,\n        )?",
+            "terminal must return the fresh observation directly",
+        ),
+        (
             "kernel.ring_loss = 0;",
             "kernel.ring_loss = 1;",
             "ordinary collection preserves legacy mode",

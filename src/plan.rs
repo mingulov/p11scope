@@ -12530,7 +12530,7 @@ mod tests {
     /// late-start closure array. Backends attach exactly as before; the
     /// unpublished layer carries the awaiting-publication gap.
     #[test]
-    fn shared_scope_admits_a_late_start_closure_prefix_behind_backends() {
+    fn shared_scope_keeps_late_start_closure_published_only_behind_backends() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
@@ -12564,7 +12564,7 @@ mod tests {
     /// Route A twin: a shared-scope Detailed closure array beside a
     /// provider attaches only published tables (none here).
     #[test]
-    fn shared_scope_admits_a_small_closure_array_whole_beside_a_provider() {
+    fn shared_scope_keeps_small_closure_array_published_only_beside_a_provider() {
         let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
         let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
         let shared = scoped_plan(&[family, sidecar], AdmissionScope::Shared);
@@ -12714,7 +12714,7 @@ mod tests {
     /// it attaches only published tables (none here) alone or beside a
     /// provider, and reads as awaiting publication either way.
     #[test]
-    fn named_scope_admits_a_small_closure_array_whole_only_beside_a_provider() {
+    fn named_scope_keeps_small_closure_array_published_only_beside_a_provider() {
         let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
         let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
 
@@ -12810,7 +12810,7 @@ mod tests {
     /// Route A: a Detailed closure takes no slots at all (published-only),
     /// so a provider arriving later always fits beside it.
     #[test]
-    fn closure_prefix_leaves_the_reserve_free_for_a_later_provider() {
+    fn published_only_closure_leaves_room_for_a_later_provider() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
@@ -12874,7 +12874,7 @@ mod tests {
     /// beside the first is admitted — the crowding the prefix caused is
     /// gone, and the closure still takes nothing.
     #[test]
-    fn provider_refused_after_the_prefix_names_the_holder_and_remedy() {
+    fn later_provider_fits_beside_published_only_closure() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let small = provider_with_tables(32, "/opt/small.so", 1, 68, false);
         let big = provider_with_tables(33, "/opt/big.so", 1, 250, false);
@@ -12892,7 +12892,7 @@ mod tests {
     /// attaches; its heuristic templates are counted as uncorroborated
     /// evidence, never slots, and no prefix partial is reported.
     #[test]
-    fn closure_prefix_counts_authorized_tables_in_its_reported_total() {
+    fn closure_attaches_only_its_authorized_table_without_prefix_partial() {
         let filler = provider_with_tables(50, "/opt/filler.so", 1, 200, true);
         let mut closure = provider_with_tables(31, P11_KIT, 65, 68, false);
         closure.scanned.tables[64].live_return = true;
@@ -12914,7 +12914,7 @@ mod tests {
     /// Route A: an authorized table attaches while every heuristic
     /// template stays evidence only; no "N of M" partial is reported.
     #[test]
-    fn closure_prefix_never_reports_zero_of_m_as_partial() {
+    fn published_only_closure_never_reports_zero_of_m_as_partial() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
 
         let filler = provider_with_tables(50, "/opt/filler.so", 1, 250, true);
@@ -12960,7 +12960,7 @@ mod tests {
     /// Route A: with no prefix holding room, a provider's later growth
     /// is admitted whole instead of omitted behind the closure.
     #[test]
-    fn provider_growth_omitted_after_the_prefix_names_the_holder_and_remedy() {
+    fn provider_growth_admitted_whole_beside_published_only_closure() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let small = provider_with_tables(32, "/opt/small.so", 1, 68, false);
         let first = scoped_plan(&[p11_kit.clone(), small.clone()], AdmissionScope::Named);
@@ -13857,8 +13857,9 @@ mod tests {
     }
 
     /// The unpublished-closure gap states no demand: nothing is refused for
-    /// capacity, so the text never claims slots are short, and no
-    /// `--module` remedy is named (naming no longer grants a prefix).
+    /// capacity, so the text never claims slots are short. The `--module`
+    /// remedy is still named (with its narrowing effect): naming grants
+    /// the remote-client prefix.
     #[test]
     fn unpublished_closure_gap_states_no_capacity_demand() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
@@ -14044,7 +14045,7 @@ mod tests {
     /// providers are all mapped before the first plan. Providers admit
     /// whole; the Detailed closure attaches only published tables.
     #[test]
-    fn late_start_first_plan_admits_prefix_after_providers_without_starvation() {
+    fn late_start_first_plan_keeps_closure_published_only_after_providers() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
@@ -14068,7 +14069,7 @@ mod tests {
     /// Route A twin: the shared-scope Detailed closure holds no slots,
     /// so a later corroborated provider fits beside it.
     #[test]
-    fn shared_scope_closure_prefix_leaves_room_for_later_provider() {
+    fn shared_scope_published_only_closure_leaves_room_for_later_provider() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, false);
         let softhsm = provider_with_tables(33, SOFTHSM, 1, 68, false);
@@ -14135,11 +14136,11 @@ mod tests {
     }
 
     /// M6 twin: an unnamed mid-capture closure refused whole names `--module`
-    /// as the way to get the prefix, and "first seen" reads as mapped
-    /// before the capture's first plan. Still recognized as a closure
-    /// refusal, so the terminal report keeps its forwarding hint.
+    /// as the way to get the prefix, in every arrival order. Still
+    /// recognized as a closure refusal, so the terminal report keeps its
+    /// forwarding hint.
     #[test]
-    fn unnamed_mid_capture_closure_refusal_names_module_and_first_plan() {
+    fn unnamed_mid_capture_closure_refusal_names_module_remedy() {
         let closure = provider_with_tables(31, P11_KIT, 64, 103, false);
         let empty = scoped_plan(&[], AdmissionScope::Named);
         let first = empty.rebuild_from_sources(
@@ -14321,12 +14322,11 @@ mod tests {
     }
 
     /// PA-5 I4 twin (reviewer's panic probe): an empty-target leading table
-    /// (all entries unpinned) passes the top-table check, then the next
-    /// table does not fit, so the prefix fallback admits nothing and must
-    /// fall through to the whole refusal instead of panicking or emitting
-    /// a "0 of M" partial.
+    /// (all entries unpinned) with nothing published. Route A admits
+    /// nothing and must record the whole refusal instead of panicking or
+    /// emitting a "0 of M" partial.
     #[test]
-    fn prefix_fallback_with_empty_leading_table_falls_through_to_whole_refusal() {
+    fn empty_leading_table_with_nothing_published_falls_through_to_whole_refusal() {
         let filler = provider_with_tables(50, "/opt/filler.so", 1, 300, true);
         let mut closure = provider_with_tables(31, P11_KIT, 64, 100, false);
         let moved: Vec<Skipped> = closure.scanned.tables[0]
@@ -14364,7 +14364,7 @@ mod tests {
     /// exits (empty input) and another starts (mixed input again). The
     /// Detailed closure holds no slots across the churn.
     #[test]
-    fn shared_scope_closure_churn_holds_a_stable_prefix() {
+    fn shared_scope_closure_churn_holds_published_only() {
         let p11_kit = provider_with_tables(31, P11_KIT, 64, 103, false);
         let trust = provider_with_tables(32, TRUST, 1, 68, true);
         let mixed = [p11_kit.clone(), trust.clone()];

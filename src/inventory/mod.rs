@@ -1322,17 +1322,17 @@ fn run_with_terminal_budget(
         Some(pin_inventory_prearm(prearm_modules, scope)?)
     };
     validate_primary_destinations(out, event_log)?;
-    if capture != CaptureMode::Scan {
-        if let Err(refusal) = host() {
-            // An auto PID capture without root falls back to the scan lane
-            // (never-stop) instead of failing here: the native opening
-            // below records the named fallback gap. Other scopes and modes
-            // keep the fatal host refusal before any sink exists.
-            let pid_auto_fallback =
-                capture == CaptureMode::Auto && matches!(scope, InventoryRunScope::Pid(_));
-            if !pid_auto_fallback {
-                return Err(refusal.into());
-            }
+    if capture != CaptureMode::Scan
+        && let Err(refusal) = host()
+    {
+        // An auto PID capture without root falls back to the scan lane
+        // (never-stop) instead of failing here: the native opening
+        // below records the named fallback gap. Other scopes and modes
+        // keep the fatal host refusal before any sink exists.
+        let pid_auto_fallback =
+            capture == CaptureMode::Auto && matches!(scope, InventoryRunScope::Pid(_));
+        if !pid_auto_fallback {
+            return Err(refusal.into());
         }
     }
     // D3d: forced-kernel preflight before any sink exists. A refused

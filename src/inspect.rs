@@ -103,14 +103,10 @@ fn render_text_with_application(
     let _ = writeln!(out, "{}", application_label(application, pid));
     // Verbose keeps the full image identity; concise names the executable
     // only; quiet keeps the header label alone.
-    if verbose {
-        if let Some(detail) = application_detail(application) {
-            out.push_str(&detail);
-        }
-    } else if !quiet {
-        if let Some(exe) = application_executable(application) {
-            out.push_str(&exe);
-        }
+    if verbose && let Some(detail) = application_detail(application) {
+        out.push_str(&detail);
+    } else if !quiet && let Some(exe) = application_executable(application) {
+        out.push_str(&exe);
     }
     let _ = write!(out, "pid {pid} — {} {word} mapped", modules.len());
     match outcome {

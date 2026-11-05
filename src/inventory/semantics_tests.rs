@@ -833,6 +833,52 @@ fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
     );
 }
 
+/// DEMO-4 regression (fedora cr-late-3/4, 2026-11-05): the system
+/// p11-kit trust module's function table entries live in
+/// libp11-kit.so itself — its required keys are cross-object by
+/// construction, so the attested seal's per-provider instance
+/// check (`slot.object == provider`) can never accept it. Seeded
+/// into the scan subset it refuses the whole seal
+/// (`provider_instance_unproven`, surfaced as
+/// `semantic_attachment_refused`) on every pass. The scan mint
+/// must count it incomplete and mint the own-object provider
+/// beside it.
+#[test]
+fn native_semantic_scan_subset_skips_cross_object_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let cross = ProviderFixture::new();
+    let complete = ProviderFixture::new();
+    let good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = cross.source(["C_SignInit", "C_Sign"]);
+    // Point the cross provider's entries into the complete
+    // provider's object (distinct offsets, so no key is shared).
+    let target_key = complete.pins.raw_keys_for(complete.pins.pinned().next().unwrap().id)[0];
+    for (entry, delta) in bad.scanned.tables[0]
+        .entries
+        .iter_mut()
+        .zip([2u64, 3])
+    {
+        entry.object = target_key;
+        entry.object_path = complete.manifest.module_path.clone();
+        entry.file_offset = complete.offsets[0] + delta;
+    }
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the cross-object provider is a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("the own-object provider mints beside a cross-object one");
+    assert_eq!(subset.required().len(), 1, "only the own-object provider");
+    assert_eq!(subset.plan().slots.len(), 2);
+}
+
 /// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live
 /// `--system` capture the creation-time `engine.modules` snapshot
 /// stays empty; current scanned tables live in the per-view scan

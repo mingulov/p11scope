@@ -475,7 +475,7 @@
         "ec_p521",
         "unknown"
       ],
-      "description": "Frozen label from established facts only: RSA modulus bits, AES value length in bits, EC finite curve. Requested-only sizes never label; success never certifies a requested size. One provenance exception: an RSA private key from C_GenerateKeyPair carries its pair-mate public key's established size when both handles came from the same successful return; its own established.modulus_bits stays unknown. The additional version-4 label 'unknown' names a first-observed key (first seen before attach) whose identity and counts are proved but whose type/size were never established in the observed window; it is never a guessed type or size."
+      "description": "Frozen label from established facts only: RSA modulus bits, AES value length in bits, EC finite curve. Requested-only sizes never label; success never certifies a requested size. One provenance exception: an RSA private key from C_GenerateKeyPair carries its pair-mate public key's established size when both handles came from the same successful return; its own established.modulus_bits stays unknown. The additional version-4 label 'unknown' names a first-observed key whose identity and counts are proved but whose type/size were never established in the observed window; it is never a guessed type or size."
     },
     "gap_reason": {
       "enum": [

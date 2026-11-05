@@ -994,8 +994,9 @@ Limits that matter in pods:
   journal object, or a refused journal start, keeps the S1 capture with a
   finite reason instead of refusing the inventory. Attaching to an
   already-running application needs no restart: operations that start
-  after attach attribute per key (a key first seen before attach rows
-  with type `unknown` until an observed attribute call establishes it),
+  after attach attribute per key (a key whose type was not established
+  in the observed window rows with type `unknown` until an observed
+  attribute call establishes it),
   and anything that cannot be attributed is counted beside the rows.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.

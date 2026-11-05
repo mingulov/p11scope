@@ -4340,7 +4340,7 @@ fn key_operation_unknown_key_and_requested_only() {
 /// and any session/login happened before attach) that signs after
 /// attach must keep a per-key row even though its type/size were
 /// never established: the row carries the object id with metadata
-/// `unknown` (type unknown: first seen before attach), never a
+/// `unknown` (type not established in the observed window), never a
 /// guessed label and never a dropped row. A sibling key whose type
 /// is later established by an already-observed
 /// `C_GetAttributeValue` keeps its exact label in the same capture.

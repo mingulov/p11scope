@@ -877,6 +877,49 @@ fn native_semantic_scan_subset_skips_cross_object_provider() {
     assert_eq!(subset.plan().slots.len(), 2);
 }
 
+/// Scan authority for argument reads needs interface linkage, a live
+/// function-list return or manifest corroboration. Export-name
+/// agreement alone (every table entry matches the object's own
+/// `.dynsym`) proves names, not the table a caller actually uses: the
+/// scan subset must not mint from it, and the provider counts as a
+/// refusal. The same table with a live return mints.
+#[test]
+fn native_semantic_scan_subset_refuses_exports_only_tables() {
+    let fixture = ProviderFixture::new();
+    let mut exports_only = fixture.source(["C_SignInit", "C_Sign"]);
+    exports_only.scanned.tables[0].live_return = false;
+    let symbols: Vec<(String, u64)> = exports_only.scanned.tables[0]
+        .entries
+        .iter()
+        .map(|entry| (entry.name.to_string(), entry.file_offset))
+        .collect();
+    exports_only.exports = std::sync::Arc::from(symbols);
+    let plan = crate::plan::build_from_sources_scan_authorized(
+        std::slice::from_ref(&exports_only),
+        &[],
+        &fixture.pins,
+    );
+    assert!(
+        !plan.slots.is_empty(),
+        "the exports-only table is still planned (counts)"
+    );
+    assert!(
+        plan.slots.iter().all(|slot| !slot.semantic_authorized),
+        "an exports-only table never carries semantic authority"
+    );
+
+    let live = fixture.source(["C_SignInit", "C_Sign"]);
+    let plan = crate::plan::build_from_sources_scan_authorized(
+        std::slice::from_ref(&live),
+        &[],
+        &fixture.pins,
+    );
+    assert!(
+        !plan.slots.is_empty() && plan.slots.iter().all(|slot| slot.semantic_authorized),
+        "the live-return twin carries semantic authority"
+    );
+}
+
 /// The cross-object twin of the huge-incomplete regression: a
 /// cross-object provider can never mint, so it must not consume the
 /// 512-slot subset plan either. Created (and so planned) first, its

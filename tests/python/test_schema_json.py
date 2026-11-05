@@ -703,13 +703,39 @@ class SchemaOracleAgreement(unittest.TestCase):
     def test_evidence_keys_match_oracle_closed_sets(self):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag +
-        the two optional additive envelopes."""
+        the optional additive envelopes (counter, selection, excludes)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
-            | {"child_still_running", "counter_collection", "selected_detail"}
+            | {"child_still_running", "counter_collection", "selected_detail",
+               "excluded_modules", "unmatched_excludes"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
+
+    def test_excluded_modules_shape_twins(self):
+        document = self.metrics_document()
+        valid = copy.deepcopy(document)
+        valid["evidence"]["excluded_modules"] = [
+            {"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3}
+        ]
+        valid["evidence"]["unmatched_excludes"] = ["nope.so"]
+        CHECKER["exact_metrics_schema"](valid)
+        for excluded, unmatched in (
+            ([{"path": "", "dev": 8, "ino": 42, "processes": 3}], ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 0}],
+             ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42}], ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3,
+               "extra": 1}], ["nope.so"]),
+            ([{"path": "/lib/x.so", "dev": 8, "ino": 42, "processes": 3}],
+             [42]),
+        ):
+            with self.subTest(excluded=excluded, unmatched=unmatched):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["excluded_modules"] = excluded
+                invalid["evidence"]["unmatched_excludes"] = unmatched
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
 
     def test_metrics_required_is_oracle_base(self):
         """Metrics requires exactly the oracle base key set."""

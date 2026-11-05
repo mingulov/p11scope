@@ -3569,13 +3569,26 @@ fn is_unexamined_maps_reason(reason: &str) -> bool {
         && reason.contains("no deep scan examined")
 }
 
-/// The per-object cap behind an over-capacity skip (`too_large (SIZE bytes;
-/// per-object cap is CAP)`), for folding sizes that would otherwise split
-/// concise groups. `None` for any other reason or an unparsable cap.
+/// The per-object cap behind an over-capacity skip, for folding sizes
+/// that would otherwise split concise groups. Handles both producer
+/// formats (`too_large (SIZE bytes; per-object cap is CAP)` from the
+/// scan budget and `object is SIZE bytes; limit is LIMIT` from the view
+/// filesystem). `None` for any other reason or an unparsable cap.
 fn too_large_cap(reason: &str) -> Option<u64> {
-    let rest = reason.strip_prefix("too_large (")?;
-    let (_, rest) = rest.split_once("per-object cap is ")?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if let Some(rest) = reason.strip_prefix("too_large (") {
+        let (_, rest) = rest.split_once("per-object cap is ")?;
+        return parse_leading_u64(rest);
+    }
+    if let Some(rest) = reason.strip_prefix("object is ") {
+        let (_, rest) = rest.split_once("; limit is ")?;
+        return parse_leading_u64(rest);
+    }
+    None
+}
+
+/// Leading ASCII digits as u64, for cap parsing with a graceful fallback.
+fn parse_leading_u64(text: &str) -> Option<u64> {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
         return None;
     }
@@ -8913,7 +8926,8 @@ mod tests {
     }
 
     /// Item 10: over-capacity file skips with different sizes fold to one
-    /// plain concise line; verbose lists each record.
+    /// plain concise line; verbose lists each record. Both producer
+    /// formats fold together.
     #[test]
     fn concise_folds_too_large_gaps_to_one_plain_line() {
         let mut catalog = catalog_with(Vec::new());
@@ -8926,11 +8940,15 @@ mod tests {
                 },
             ));
         }
+        catalog.skipped.push(PidGap::member(
+            23,
+            Skipped {
+                subject: "/proc/23/root/usr/lib/huge.so".into(),
+                reason: "object is 407976096 bytes; limit is 268435456".into(),
+            },
+        ));
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
-        assert!(
-            concise.contains("2 files over 256 MiB not read"),
-            "{concise}"
-        );
+        assert!(concise.contains("3 files over 256 MiB not read"), "{concise}");
         assert_eq!(
             concise
                 .lines()
@@ -8941,6 +8959,10 @@ mod tests {
         );
         let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(verbose.contains("too_large (319346888 bytes"), "{verbose}");
+        assert!(
+            verbose.contains("object is 407976096 bytes; limit is 268435456"),
+            "{verbose}"
+        );
     }
 
     /// Twenty identical pin-loss skips across two processes fold to one

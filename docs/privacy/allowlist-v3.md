@@ -65,13 +65,36 @@ globally unique key, token inventory, or age before observation.
 
 ## Authority and ABI rules
 
-Every new call-derived field requires all of: an explicitly operator-attested
-function/offset claim, its retained and unchanged physical provider pin, one
-unambiguous named descriptor, an accepted LP64 or ia32 specialization, exact
-process-image identity, and the matching owned entry/return lifetime. A
+Every new call-derived field requires all of: a function/offset claim with
+semantic authority (below), its retained and unchanged physical provider pin,
+one unambiguous named descriptor, an accepted LP64 or ia32 specialization,
+exact process-image identity, and the matching owned entry/return lifetime. A
 provider export, readable pointer, equal path/hash, scan result, or successful
-return alone is insufficient. Scan-only and ambiguous slots remain count-only.
+return alone is insufficient. Ambiguous slots remain count-only.
 Public inventory must retain modules and callers when semantics are withheld.
+
+Semantic authority comes from exactly one of two sources:
+
+- an operator-attested claim (`--manifest`), as before; or
+- a scan-derived claim, only in `inventory --key-operations` runs started
+  without a manifest (the explicit key-operations opt-in), and only for a
+  scanned function table that meets every condition: its publication is
+  proved by standard interface linkage (`C_GetInterfaceList` /
+  `C_GetInterface` naming the table), by a live function-list return, or by
+  manifest corroboration — export-name agreement alone never grants it; the
+  table walk is full (a prefix or capped walk makes the provider incomplete);
+  no affecting entry of the provider is unpinned, rival or degraded; and every
+  required key lives in the provider's own object (a provider whose table
+  entries point into another object, such as the p11-kit trust shim, is
+  refused). A provider that fails any condition is refused as a whole and
+  counted; it never gets a partial table.
+
+Every other scan result, including every ordinary (non-`--key-operations`)
+capture, stays count-only. The read set is the same in both sources: a
+scan-derived claim never adds a field, an argument or a read beyond the rows
+below; it only replaces the operator attestation as the source of the
+function/offset claim, and the run discloses it as the
+`semantic subset scan-derived` scope gap.
 
 Arguments below are **zero-based**. Linux x86-64 LP64 uses eight-byte pointers,
 handles and `CK_ULONG`; Linux ia32 uses four-byte words, zero-extended after a
@@ -498,8 +521,9 @@ whether they mint at runtime is not yet measured live. Ordinary
 sessions never get a generation, so the Detailed object's marker stays inactive: its hooks do one gated
 read and return.
 In a marker build, this adds state only in a lane Session that has published an attach generation
-(closure): only an `inventory --manifest --key-operations` capture whose semantic lane seals over the
-loaded journal pair publishes the attach generation. That Session runs the journal object, which carries
+(closure): only an `inventory --key-operations` capture whose semantic lane seals over the loaded
+journal pair publishes the attach generation — with `--manifest` over the attested subset, or without
+one over the scan-derived subset under the conditions in "Authority and ABI rules". That Session runs the journal object, which carries
 both the READY exec writer and the DIRTY gap writer, so the generation arms gap marking and exec-time
 READY records. Ordinary captures seal with generation 0 and never touch the attach cell; their marker
 hooks stop at the gated read. Under `--system` with the flag, records come from both writers: DIRTY

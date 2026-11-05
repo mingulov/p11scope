@@ -2135,9 +2135,10 @@ fn excluded_lines(ev: &Evidence) -> String {
 }
 
 /// One named gap line's body: the status, the planner's reason, and the
-/// hint. A refused proxy layer points at the attached providers that count
-/// its forwarded calls; a prefix-admitted proxy layer names its covered
-/// templates with no further hint; a refused provider points at `--module`
+/// hint. A forwarding (proxy closure) layer points at the attached providers
+/// that count its forwarded calls and states plainly that calls the layer
+/// answers itself are not counted (through a template that was not attached,
+/// for a prefix); a refused provider points at `--module`
 /// (unless the reason already carries that hint, as shared-scope refusals do).
 fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
     let status = if crate::plan::is_partial_coverage(&skipped.reason) {
@@ -2148,8 +2149,13 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
     let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
     if crate::plan::is_closure_array_refusal(&skipped.reason) {
         body.push_str(&closure_forwarding_hint(ev, reports));
+        body.push_str(" Calls the forwarding layer answers itself are not counted.");
     } else if crate::plan::is_closure_array_prefix(&skipped.reason) {
-        // The reason already names the covered templates; no hint.
+        body.push_str(&closure_forwarding_hint(ev, reports));
+        body.push_str(
+            " Calls the forwarding layer answers itself through a template \
+             that was not attached are not counted.",
+        );
     } else if !skipped.reason.contains("--module") {
         body.push_str(&format!(
             "; capture it alone with --module {}",
@@ -6600,7 +6606,14 @@ pub(crate) mod tests {
         assert!(text.contains("4 of 64 template tables attached"), "{text}");
         assert!(!text.contains("--module"), "{text}");
         assert!(
-            text.contains("Calls the forwarding layer answers itself are not counted"),
+            text.contains(
+                "Calls the forwarding layer answers itself through a template \
+                 that was not attached are not counted"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("calls it forwards are counted at the attached providers"),
             "{text}"
         );
     }

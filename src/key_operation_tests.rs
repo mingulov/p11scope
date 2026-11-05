@@ -20882,6 +20882,106 @@ fn key_operation_watchdog_unsealed_staged_calls_count() {
     assert_eq!(staging.reduced(), 0, "nothing replayed or attributed");
 }
 
+/// Watchdog conservation: after the trip the staged calls leave
+/// exactly once (as `watchdog_no_progress`) and nothing can count
+/// them again — a later seal attributes nothing, a later loss
+/// disposes nothing, and a later call can no longer stage but
+/// counts once under the watchdog reason as a direct reduction.
+/// attributed + unattributed == observed.
+#[test]
+fn key_operation_watchdog_trip_conserves_across_later_loss_seal_and_stage() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let flow = sign_flow();
+    // Three calls seal and attribute.
+    for call in flow[0..3].iter() {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut edge,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
+    }
+    assert_eq!(staging.reduced(), 3);
+    // Two calls stage; their seal has not been applied yet.
+    for call in flow[3..5].iter() {
+        prepare_call(&mut scene, &mut staging, call);
+    }
+    assert_eq!(staging.staged_len(), 2);
+    staging.note_watchdog_trip();
+    staging.note_watchdog_trip();
+    assert_eq!(staging.watchdog_unsealed(), 2, "the trip counts both once");
+    assert_eq!(staging.staged_len(), 0, "the trip takes the staged calls");
+    // A seal arriving after the trip attributes nothing.
+    if let Ok(success) = scene.seal() {
+        let _ = staging.apply_seal(
+            &success,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut edge,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            None,
+        );
+    }
+    assert_eq!(staging.reduced(), 3, "no post-trip seal replays");
+    // A loss after the trip disposes nothing again.
+    assert_eq!(
+        staging.dispose_below_barrier(None, Some(scene.adapter.ledger_mut())),
+        0
+    );
+    // A later call cannot stage; the driver reduces it direct and
+    // it counts once under the watchdog reason.
+    let admitted = admit_call_input(&mut scene, &flow[5]);
+    let facts = admitted.s1_facts().clone();
+    let origin = EffectOrigin::from(&facts);
+    assert!(
+        staging
+            .stage(
+                facts.clone(),
+                origin,
+                admitted.h0_ordinal(),
+                scene.adapter.ledger_mut()
+            )
+            .is_err(),
+        "no stage after the trip"
+    );
+    staging.note_direct_reduction(&facts.function);
+    assert!(!staging.resume_joint(), "a tripped feed never resumes");
+
+    let observations = commit(72, &[&staging], &scene.model.project(), &keyuse);
+    let unattributed: u64 = observations.unattributed.iter().map(|row| row.count).sum();
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "watchdog_no_progress",
+            count: 3,
+        }],
+        "{:?}",
+        observations.unattributed
+    );
+    let observed = 6u64;
+    assert_eq!(
+        staging.reduced() + unattributed,
+        observed,
+        "conservation: attributed + unattributed = observed"
+    );
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "a tripped lane is partial, its exact rows kept"
+    );
+}
+
 /// Conservation across every staging-derived reason (round 3):
 /// sealed, fallback-replayed, degraded-window (both endings),
 /// history-disposed, pre-attach, unmodelled and watchdog counts
@@ -22057,6 +22157,12 @@ fn key_operation_schema_v4_pins_unknown_metadata_contract() {
         )
     };
     assert_eq!(schema["properties"]["version"]["const"], 4);
+    // `unattributed` is always present in v4 and may be empty: a v4
+    // section with exact rows and nothing unattributed is valid.
+    assert_eq!(
+        schema["properties"]["unattributed"]["minItems"], 0,
+        "an empty unattributed list is a valid v4 section"
+    );
     assert_eq!(
         required("/required"),
         sorted(SECTION_KEYS_V3.iter().map(|key| key.to_string()).collect())

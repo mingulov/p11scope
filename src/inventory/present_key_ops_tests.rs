@@ -163,7 +163,7 @@ fn dashboard_projection_line(presentation: &Presentation) -> String {
     text.replace("\x1b[H", "")
         .replace("\x1b[K", "")
         .lines()
-        .find(|line| line.starts_with("objects/keys"))
+        .find(|line| line.starts_with("keys revision"))
         .expect("projection line")
         .to_string()
 }
@@ -176,7 +176,7 @@ fn snapshot_tallies(line: &str) -> Vec<(&str, u64, u64, u64)> {
         if segment == "no key operations observed" {
             continue;
         }
-        // "<category> <completed> completed, <failed> failed, <active> active <unit>"
+        // "<category> <completed> completed, <failed> returned an error/errors, <active> active <unit>"
         let (category, rest) = segment.split_once(' ').expect("category");
         let rest = rest
             .strip_suffix(" operations")
@@ -186,7 +186,15 @@ fn snapshot_tallies(line: &str) -> Vec<(&str, u64, u64, u64)> {
         let completed: u64 = words.next().expect("completed").parse().expect("digits");
         assert_eq!(words.next(), Some("completed,"));
         let failed: u64 = words.next().expect("failed").parse().expect("digits");
-        assert_eq!(words.next(), Some("failed,"));
+        assert_eq!(words.next(), Some("returned"));
+        match words.next() {
+            Some("an") => {
+                assert_eq!(failed, 1, "singular for one: {line}");
+                assert_eq!(words.next(), Some("error,"));
+            }
+            Some("errors,") => {}
+            other => panic!("failed noun: {other:?} in {line}"),
+        }
         let active: u64 = words.next().expect("active").parse().expect("digits");
         assert_eq!(words.next(), Some("active"));
         assert_eq!(words.next(), None);
@@ -196,7 +204,7 @@ fn snapshot_tallies(line: &str) -> Vec<(&str, u64, u64, u64)> {
 }
 
 /// Per-category (completed, failed, active) parsed from a dashboard
-/// `objects/keys` line.
+/// `keys revision` line.
 fn dashboard_tallies(line: &str) -> Vec<(&str, u64, u64, u64)> {
     let tail = line.split(" | ").nth(2).expect("tally tail");
     let mut tallies = Vec::new();
@@ -323,7 +331,7 @@ fn key_ops_line_populated_counts_primary_once() {
     assert_eq!(
         key_ops_line(&snapshot),
         "key operations: rev 3 populated; 1 session, 1 object; \
-         sign 5 completed, 1 failed, 1 active operations",
+         sign 5 completed, 1 returned an error, 1 active operations",
         "primary + unknown only, secondary never double-counted:\n{snapshot}"
     );
 }
@@ -362,8 +370,8 @@ fn key_ops_line_lossless_large_values() {
     assert_eq!(
         key_ops_line(&snapshot),
         "key operations: rev 5 populated; 0 sessions, 0 objects; \
-         sign 18446744073709551614 completed, 0 failed, 0 active operations; \
-         verify 18446744073709551615 completed, 0 failed, 0 active operations",
+         sign 18446744073709551614 completed, 0 returned errors, 0 active operations; \
+         verify 18446744073709551615 completed, 0 returned errors, 0 active operations",
         "u64 digits render exactly, categories in order:\n{snapshot}"
     );
 }
@@ -415,6 +423,89 @@ fn key_ops_line_matches_dashboard_tallies() {
         text_tallies, other_frame,
         "the comparison is sensitive to the tallies"
     );
+}
+
+/// F5: the tally says what happened to the call ("returned an
+/// error/errors"), not "failed" (which reads as an observer failure).
+/// JSON keys stay `failed`.
+#[test]
+fn key_ops_tally_says_returned_an_error_not_failed() {
+    let mut observations = populated(3);
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 2, 1, 0, "operations"));
+    observations
+        .key_operations
+        .push(key_row("verify", "key", 5, 2, 0, "operations"));
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let line = key_ops_line(&snapshot);
+    assert!(
+        line.contains("1 returned an error"),
+        "singular tally missing: {line}"
+    );
+    assert!(
+        line.contains("2 returned errors"),
+        "plural tally missing: {line}"
+    );
+    assert!(
+        !line.contains(" failed"),
+        "observer-failure wording leaked: {line}"
+    );
+}
+
+/// F5: the dashboard projection line spells its fields (sessions,
+/// keys, per-key rows, unattributed rows, revision, refused), not
+/// `sess/obj/krows/urows/rev`.
+#[test]
+fn dashboard_projection_line_spells_fields() {
+    let mut observations = populated(91);
+    observations.status = ObsStatus::Populated;
+    observations.reason = "none";
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 2, 1, 0, "operations"));
+    let presentation = key_ops_presentation(observations);
+    let mut tail = LogTail::bounded();
+    tail.push("p11scope: pass 1: f5");
+    let frame = DisplayFrame {
+        presentation: std::sync::Arc::new(presentation),
+        log: tail.snapshot(),
+    };
+    let bytes = render_frame(
+        &frame,
+        Viewport {
+            width: 300,
+            height: 24,
+        },
+        &DashboardState::new(),
+    );
+    let text = String::from_utf8(bytes).expect("frames are valid UTF-8");
+    let line = text
+        .replace("\x1b[H", "")
+        .replace("\x1b[K", "")
+        .lines()
+        .find(|line| line.contains("rev"))
+        .expect("projection line")
+        .to_string();
+    for plain in [
+        "revision",
+        "sessions",
+        "per-key rows",
+        "unattributed rows",
+        "refused",
+    ] {
+        assert!(line.contains(plain), "{plain} missing: {line}");
+    }
+    for abbrev in ["sess ", "krows", "urows", " rev "] {
+        assert!(!line.contains(abbrev), "{abbrev} leaked: {line}");
+    }
 }
 
 #[test]
@@ -642,6 +733,70 @@ fn unavailable_key_operations_name_plain_reason_with_machine_code() {
             "{reason}: {verbose}"
         );
     }
+}
+
+/// F3: the unlinked-journal, seal and fallback gaps render in plain
+/// words with their machine tokens beside them (verbose); concise
+/// must never see the raw `S1` / `joint_*` strings.
+#[test]
+fn joint_journal_seal_fallback_gaps_render_plain_words_with_machine_tokens() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "per-key tracking is off; this capture keeps S1 mechanisms and API results".into(),
+        reason: "joint_journal_unavailable".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason: "joint_seal_h3_loss_history_loss".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason: "joint_fallback_staging_full".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("per-key tracking is off; function and mechanism counts are unaffected"),
+        "keeps-S1 subject needs a plain twin: {verbose}"
+    );
+    assert!(
+        verbose.contains("per-key tracking ended early"),
+        "joint_seal_* needs a plain twin: {verbose}"
+    );
+    assert!(
+        verbose.contains("per-key tracking fell back to plain counts"),
+        "joint_fallback_* needs a plain twin: {verbose}"
+    );
+    // The machine tokens stay beside the plain words in verbose text.
+    assert!(
+        verbose.contains("(joint_seal_h3_loss_history_loss)"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains("(joint_fallback_staging_full)"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains(
+            "(per-key tracking is off; this capture keeps S1 mechanisms and API results)"
+        ),
+        "{verbose}"
+    );
 }
 
 /// CLI-1/KEY-3: the Joint birth gap renders in plain words with the

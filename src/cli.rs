@@ -548,17 +548,16 @@ usage:
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
---module narrows the scan to named providers. --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots. A full path excludes exactly that file by identity; a bare name excludes every file with that basename or ELF soname. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach. Inventory rescans in passes; a process that starts after its last pass is reported, not scanned (system and pid scopes).
+--module narrows the scan to named providers. --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots. A full path excludes exactly that file by identity; a bare name excludes every file with that basename or ELF soname. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is checked against the scan when possible.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach. Inventory rescans in passes; a process that starts after its last pass is reported, not scanned (system and pid scopes).
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
---track-short-lived (profile/run, default off) is extensive mode: the kernel records
-exec-time executable identity and unmatched exits classify into STATIC HINT linkage
-classes beside pid_descendant_gaps, never moving call or attribution shares.
-Refused beside --counter-mode: extensive mode arms Detailed captures only.
+--track-short-lived (profile/run, default off) also records short-lived processes (extra detail; off by default): the kernel records
+exec-time executable identity and unmatched exits are grouped by linkage, never moving call or attribution shares.
+Refused beside --counter-mode: it arms Detailed captures only.
 Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 Live capture requires usable uprobe_multi host capability (normally Linux 6.6+;
 working backports qualify by probe), including with --attach-backend singles.
@@ -581,19 +580,19 @@ no cgroup path. Aggregate across the selected scope; counts are not per applicat
 Inventory usage entries and trace completed events have separate attribution rules.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
 counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
-Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop (helper 181), on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
+Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop helper support, on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
 --select-endpoint <FUNCTION> names one endpoint for full detail while aggregate counters continue; it requires --mode metrics
-with --counter-mode on profile or run. The name must resolve to exactly one broad slot (use --module to narrow providers);
+with --counter-mode on profile or run. The name must match exactly one watched function (narrow with --module if it matches several);
 it resolves once at start, and a provider loaded after start needs --prearm-module <provider.so> (with run, usually required). An unknown or ambiguous name refuses by name and the
-capture continues aggregate-only. The detail is the function's own broad-counter cells between selection and close; if the
+capture continues aggregate-only. The detail is the function's own counter values between selection and close; if the
 watched process replaces itself (exec) in between, the detail is withheld with a named reason, a leader exit that is the
 last lifecycle record ends the window cleanly, and --cgroup/--system refuse the selection by name (no single process to detail).
-The selection attempt is recorded in the report's additive selected_detail ledger; aggregate and detail counts are never summed.
+The selection attempt is recorded in the report; aggregate and detail counts are never summed.
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
 Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail (every gap and reason, per-function data, timing) plus informational stderr notes; --quiet prints only the summary head. --json and -o are always complete.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
+Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
 P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
 capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
@@ -618,20 +617,20 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available.
 Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
 --select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
-detail while aggregate counters continue; the name must resolve to exactly one broad slot, once at
+detail while aggregate counters continue; the name must match exactly one watched function (narrow with --module if it matches several), once at
 start (a provider loaded after start needs --prearm-module <provider.so>). The detail is the function's
-own broad-counter cells between selection and close; an exec of the watched process in between withholds it with a named
+own counter values between selection and close; an exec of the watched process in between withholds it with a named
 reason, a leader exit that is the last lifecycle record ends the window cleanly, and
 --cgroup/--system refuse by name.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
---track-short-lived (default off) is extensive mode: the kernel records exec-time
-executable identity and unmatched exits classify into STATIC HINT linkage classes.
-Refused beside --counter-mode: extensive mode arms Detailed captures only.
+--track-short-lived (default off) also records short-lived processes (extra detail; off by default): the kernel records exec-time
+executable identity and unmatched exits are grouped by linkage.
+Refused beside --counter-mode: it arms Detailed captures only.
 Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions.
@@ -651,8 +650,8 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available.
 Trace reports completed call events; PID/TID are diagnostic identifiers.
 Executable names require verified event-image evidence; missing identity stays unknown.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
@@ -675,21 +674,21 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
-detail while aggregate counters continue; the name must resolve to exactly one broad slot, once at
+detail while aggregate counters continue; the name must match exactly one watched function (narrow with --module if it matches several), once at
 start (a provider loaded after start needs --prearm-module <provider.so>; with run it is usually
-required). The detail is the function's own broad-counter cells between selection and close; an exec of the owned child in between withholds it with a named reason
+required). The detail is the function's own counter values between selection and close; an exec of the owned child in between withholds it with a named reason
 while a leader exit that is the last lifecycle record ends the window cleanly.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
---track-short-lived (default off) is extensive mode: the kernel records exec-time
-executable identity and unmatched exits classify into STATIC HINT linkage classes.
-Refused beside --counter-mode: extensive mode arms Detailed captures only.
+--track-short-lived (default off) also records short-lived processes (extra detail; off by default): the kernel records exec-time
+executable identity and unmatched exits are grouped by linkage.
+Refused beside --counter-mode: it arms Detailed captures only.
 Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
 ";
@@ -759,10 +758,9 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and attaches proved offsets through the inventory lane, with one interval row per input in `prearm[]`; requires auto or native.
---key-operations opts in to per-key tracking through a linked journal session (default off); requires --capture auto or native, and a build with the journal object.
-In this version it adds per-key operation rows once tracking starts; mechanisms and API results are reported with or without it.
-Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads through the inventory lane, with one interval row per input in `prearm[]`; requires auto or native.
+--key-operations also tracks which key each operation used (needs --capture auto or native; start the observer before the application for best coverage). Without it you still get per-provider function and mechanism counts.
+Per-key results appear under object_observations in --json and in the key operations: line.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --max-endpoints selects capture-lifetime physical endpoint IDs: 1..=131072, default 32768; unloading does not refund IDs.
 --capture scan disables usage BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
@@ -2278,10 +2276,11 @@ mod tests {
     fn inventory_help_states_manifest_s1_scope_and_opt_in_key_operations() {
         let help = HelpTopic::Inventory.text();
         assert!(
-            help.contains(
-                "In this version it adds per-key operation rows once tracking starts; \
-                 mechanisms and API results are reported with or without it."
-            ),
+            help.contains("also tracks which key each operation used"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Per-key results appear under object_observations"),
             "{help}"
         );
     }
@@ -3380,7 +3379,7 @@ mod tests {
         let help = HelpTopic::Inventory.text();
         assert!(help.contains("[--key-operations]"), "{help}");
         assert!(help.contains("--key-operations"), "{help}");
-        assert!(help.contains("requires --capture auto or native"), "{help}");
+        assert!(help.contains("needs --capture auto or native"), "{help}");
     }
 
     #[test]
@@ -4830,22 +4829,89 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 10678 / 0xb0ec5d13d144e1bf (concise-by-default verbosity
-        // plus the late-process scope sentence): USAGE diff vs the
-        // 9958/0xd9a94a6d21a3e430 pin is exactly the `[-v] [--quiet]`
-        // synopsis insertions, the wrapped inventory synopsis lines
-        // (one option group per line), and the concise/verbose/quiet
-        // notes line; the scope sentence is unchanged. No other drift.
-        assert_eq!(USAGE.len(), 10678);
-        assert_eq!(hash, 0xb0ec5d13d144e1bf);
+        // 10718 / 0xbe49d069bdf88642 (F4 plain-words help plus the
+        // late-process scope sentence): USAGE diff vs the
+        // 10678/0xb0ec5d13d144e1bf pin is exactly the HELP-3 jargon
+        // replacements (checked-against-scan, counted-but-not-named,
+        // short-lived wording, bpf_loop helper, watched function,
+        // counter values, report recording, Environment prefix); the
+        // scope sentence is unchanged. No other drift.
+        assert_eq!(USAGE.len(), 10718);
+        assert_eq!(hash, 0xbe49d069bdf88642);
         assert_eq!(HelpTopic::Global.text(), USAGE);
+    }
+
+    /// F4: help uses plain words (HELP-3/KEY-6), not internal names.
+    /// No parser change; JSON keeps the machine tokens.
+    #[test]
+    fn help_uses_plain_words_without_internal_names() {
+        let helps = [
+            ("USAGE", USAGE),
+            ("PROFILE_HELP", PROFILE_HELP),
+            ("TRACE_HELP", TRACE_HELP),
+            ("RUN_HELP", RUN_HELP),
+            ("INVENTORY_HELP", INVENTORY_HELP),
+        ];
+        for (name, help) in helps {
+            for jargon in [
+                "corroborated against the scan",
+                "semantics-unverified",
+                "STATIC HINT",
+                "pid_descendant_gaps",
+                "helper 181",
+                "broad slot",
+                "broad-counter",
+                "selected_detail",
+                "linked journal session",
+                "journal object",
+                "Subset preparation",
+                "positive instance delivery",
+                "pre-arms its proved offsets",
+                "attaches proved offsets",
+                "extensive mode",
+            ] {
+                assert!(
+                    !help.contains(jargon),
+                    "{name} still contains jargon {jargon:?}"
+                );
+            }
+        }
+        // The plain replacements land where the jargon was.
+        assert!(USAGE.contains("checked against the scan when possible"));
+        for help in [USAGE, PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+            assert!(help.contains("counted but not named"), "{help:.200}");
+            assert!(
+                help.contains("watches the file from before it loads"),
+                "{help:.200}"
+            );
+        }
+        for help in [USAGE, PROFILE_HELP, RUN_HELP] {
+            assert!(
+                help.contains("also records short-lived processes"),
+                "{help:.200}"
+            );
+            assert!(help.contains("exactly one watched function"), "{help:.200}");
+            assert!(help.contains("counter values"), "{help:.200}");
+        }
+        assert!(USAGE.contains("bpf_loop helper"));
+        assert!(!USAGE.contains("helper 181"));
+        assert!(USAGE.contains("recorded in the report;"));
+        assert!(USAGE.contains("Environment (advanced; normally unset)"));
+        assert!(
+            INVENTORY_HELP.contains("also tracks which key each operation used"),
+            "{INVENTORY_HELP:.500}"
+        );
+        assert!(
+            INVENTORY_HELP.contains("Per-key results appear under object_observations"),
+            "{INVENTORY_HELP:.500}"
+        );
     }
 
     #[test]
     fn help_states_manifest_attestation_and_scan_only_limits() {
         for statement in [
             "--manifest is explicit operator attestation of exact accepted function-name/offset claims",
-            "scan-only discovery is semantics-unverified and count-only",
+            "scan-only discovery is counted but not named",
             "aggregate counts/RVs/latency remain available",
         ] {
             assert!(
@@ -4861,7 +4927,7 @@ mod tests {
             "--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.",
             "counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.",
             "Omit --counter-mode to keep existing metrics behavior.",
-            "can refuse with a named reason, including on kernels without bpf_loop (helper 181)",
+            "can refuse with a named reason, including on kernels without bpf_loop helper support",
             "where the kernel verifier rejects the counter programs",
         ] {
             assert!(

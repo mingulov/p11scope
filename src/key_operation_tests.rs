@@ -5914,12 +5914,12 @@ fn key_operation_one_projection_three_consumers() {
     assert_eq!(wide.len(), 24, "frames fill the viewport");
     let line = wide
         .iter()
-        .find(|line| line.starts_with("objects/keys"))
+        .find(|line| line.starts_with("keys revision"))
         .expect("projection line");
     assert_eq!(
         line,
         &format!(
-            "objects/keys rev 1 populated | sess 1 obj 3 krows {} urows {} refused 0+0 | {}",
+            "keys revision 1 populated | 1 sessions 3 keys {} per-key rows {} unattributed rows 0 refused | {}",
             r1.key_operations.len(),
             r1.unknown_key_operations.len(),
             "encapsulate 1/0/0 operations, generate_key 1/0/0 operations, sign 1/0/2 operations, verify 1/1/0 operations, wrap 1/0/0 operations",
@@ -5934,10 +5934,10 @@ fn key_operation_one_projection_three_consumers() {
     let narrow = dashboard_text(&presentation, 80, 24);
     let short = narrow
         .iter()
-        .find(|line| line.starts_with("objects/keys"))
+        .find(|line| line.starts_with("keys revision"))
         .expect("narrow line");
     assert!(
-        short.starts_with("objects/keys rev 1 populated | sess 1 obj 3 krows "),
+        short.starts_with("keys revision 1 populated | 1 sessions 3 keys "),
         "{short}"
     );
 

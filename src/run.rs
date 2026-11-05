@@ -9313,6 +9313,60 @@ mod tests {
         );
     }
 
+    /// F7: `run --quiet` frames are header, totals and coverage only —
+    /// no function table, no Evidence, no `-v` hint. Mirrors
+    /// `render::tests::quiet_live_frame_keeps_header_totals_coverage_only`
+    /// from run's perspective (run renders through the shared live
+    /// frame); a quiet-shape regression in the shared renderer would
+    /// break run's quiet output here as well as there.
+    #[test]
+    fn run_quiet_frame_keeps_header_totals_coverage_only() {
+        use crate::attach::CapturePolicy;
+        use crate::render::tests::evidence;
+        use p11scope_ebpf_common::{CounterMode, LATENCY_BUCKETS};
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+        let report = crate::metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantic_authorized: true,
+            module: None,
+            module_ambiguous: false,
+            module_unresolved: false,
+            mode: CounterMode::Latency,
+            calls: 10,
+            errors: 0,
+            in_flight: 0,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; LATENCY_BUCKETS],
+            rv_counts: Default::default(),
+        };
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        let out = crate::render::live_scoped_with_verbosity(
+            &[report],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Quiet,
+        );
+        assert!(out.contains("p11scope — PID scope"), "{out}");
+        assert!(out.contains("10 completed calls;"), "{out}");
+        assert!(out.contains("Coverage PARTIAL"), "{out}");
+        assert!(!out.contains("FUNCTION"), "{out}");
+        assert!(!out.contains("Evidence:"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
     /// The timing summary wraps to short prefixed stderr lines: every line
     /// stays greppable under `p11scope: timing:`, every token of the old
     /// single line survives, and the oracle's `pending N (oldest X)`

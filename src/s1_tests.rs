@@ -2538,7 +2538,7 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             passes,
             if passes == 1 { "" } else { "es" },
             plural(callers, "caller", "callers"),
-            plural(modules, "module", "modules"),
+            plural(modules, "provider file", "provider files"),
             plural(edges, "edge", "edges"),
         )),
         "snapshot totals"

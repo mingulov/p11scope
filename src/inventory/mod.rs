@@ -12711,7 +12711,7 @@ mod tests {
         let coordinator = coordinator();
         let text = render_text(&coordinator, "system", 90, 120, 2);
         assert!(
-            text.starts_with("inventory system (2 passes, 0 callers, 0 modules, 0 edges)"),
+            text.starts_with("inventory system (2 passes, 0 callers, 0 provider files, 0 edges)"),
             "{text}"
         );
     }
@@ -21609,9 +21609,14 @@ mod promotion_driver_tests {
                         if json {
                             assert_eq!(stdout.bytes, bytes, "both sinks agree: {case}");
                         } else {
-                            // Concise text carries the PARTIAL coverage and
-                            // the `-v` hint; gap subjects are verbose-only
-                            // (the JSON above pins them).
+                            // Concise text carries the PARTIAL coverage, the
+                            // gap summary (F1: plain subjects with counts),
+                            // and the `-v` hint; per-gap `gap [` lines stay
+                            // verbose-only (the JSON above pins every gap).
+                            // The zero-pass subject is always present here;
+                            // the other two subjects vary by case (refused
+                            // vs clean stop), so only the always-present one
+                            // is pinned in concise.
                             let text = String::from_utf8(stdout.bytes).unwrap();
                             assert!(
                                 text.contains("coverage: PARTIAL"),
@@ -21622,16 +21627,16 @@ mod promotion_driver_tests {
                                 "concise zero-pass hint: {case}: {text}"
                             );
                             assert!(
-                                !text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT),
-                                "gap subjects are verbose-only: {case}: {text}"
+                                text.contains("gaps: "),
+                                "concise gap summary present: {case}: {text}"
                             );
                             assert!(
-                                !text.contains("global native retirement"),
-                                "gap subjects are verbose-only: {case}"
+                                text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT),
+                                "concise gap summary names the zero-pass gap: {case}: {text}"
                             );
                             assert!(
-                                !text.contains("joint finish abandoned for exit"),
-                                "gap subjects are verbose-only: {case}"
+                                !text.contains("gap ["),
+                                "per-gap lines stay verbose-only: {case}: {text}"
                             );
                         }
                     }

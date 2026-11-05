@@ -94,16 +94,16 @@ fn render_text_with_application(
     let quiet = verbosity == TextVerbosity::Quiet;
     let modules = outcome.modules();
     let word = if modules.len() == 1 {
-        "module"
+        "provider file"
     } else {
-        "modules"
+        "provider files"
     };
     let mut out = String::new();
     let _ = writeln!(out, "{}", application_label(application, pid));
     if let Some(detail) = application_detail(application) {
         out.push_str(&detail);
     }
-    let _ = write!(out, "pid {pid} — {} PKCS#11 {word} mapped", modules.len());
+    let _ = write!(out, "pid {pid} — {} {word} mapped", modules.len());
     match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
             if verbose {
@@ -127,20 +127,20 @@ fn render_text_with_application(
                     );
                     let _ = writeln!(
                         out,
-                        "  otherwise CAP_SYS_PTRACE. Modules below come from /proc/{pid}/maps and \
+                        "  otherwise CAP_SYS_PTRACE. Provider files below come from /proc/{pid}/maps and \
                          .dynsym only."
                     );
                 } else {
                     let _ = writeln!(
                         out,
-                        "table scan unavailable: {reason}. Modules below come from /proc/{pid}/maps \
+                        "table scan unavailable: {reason}. Provider files below come from /proc/{pid}/maps \
                          and .dynsym only."
                     );
                 }
             }
         }
     }
-    out.push_str("Mapped modules only; activity was not captured by inspect.\n\n");
+    out.push_str("Mapped provider files only; activity was not captured by inspect.\n\n");
 
     if verbose {
         for module in modules {
@@ -205,12 +205,12 @@ fn render_text_with_application(
 }
 
 /// One concise line per provider: path plus the walked-function total.
+/// `entries` already excludes NULL slots (`null_entries` are separate
+/// evidence, never entries — see `ScannedTable`), so both verbosities
+/// count `entries.len()`; verbose annotates the NULLs beside the same
+/// total.
 fn render_module_summary(out: &mut String, module: &ScannedModule) {
-    let functions: usize = module
-        .tables
-        .iter()
-        .map(|table| table.entries.len().saturating_sub(table.null_entries.len()))
-        .sum();
+    let functions: usize = module.tables.iter().map(|table| table.entries.len()).sum();
     let tables = module.tables.len();
     let _ = writeln!(
         out,
@@ -251,8 +251,11 @@ fn render_folded_skips(out: &mut String, skipped: &[Skipped]) {
     }
 }
 
-/// One coverage status line: complete only when the scan finished and
-/// nothing was skipped.
+/// One coverage status line: complete only when the scan finished,
+/// nothing was skipped, and every table was fully walked. A
+/// `known_prefix` walk covered the known legacy functions and says
+/// nothing about newer ones, so it downgrades to partial even with no
+/// skips.
 fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
     match outcome {
         ScanOutcome::Unavailable { reason, .. } => {
@@ -262,16 +265,38 @@ fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
                 crate::render::escape_controls(reason)
             );
         }
-        ScanOutcome::Scanned { skipped, .. } if !skipped.is_empty() => {
+        ScanOutcome::Scanned {
+            modules, skipped, ..
+        } => {
+            let partial_tables = modules
+                .iter()
+                .flat_map(|module| &module.tables)
+                .filter(|table| table.walk != "full")
+                .count();
+            if skipped.is_empty() && partial_tables == 0 {
+                let _ = writeln!(out, "coverage: complete");
+                return;
+            }
+            let mut parts = Vec::new();
+            if !skipped.is_empty() {
+                parts.push(format!(
+                    "{} item{} skipped",
+                    skipped.len(),
+                    if skipped.len() == 1 { "" } else { "s" },
+                ));
+            }
+            if partial_tables > 0 {
+                parts.push(format!(
+                    "{} table{} only partly walked",
+                    partial_tables,
+                    if partial_tables == 1 { "" } else { "s" },
+                ));
+            }
             let _ = writeln!(
                 out,
-                "coverage: partial — {} item{} skipped (--json lists each)",
-                skipped.len(),
-                if skipped.len() == 1 { "" } else { "s" },
+                "coverage: partial — {} (--json lists each)",
+                parts.join(", "),
             );
-        }
-        ScanOutcome::Scanned { .. } => {
-            let _ = writeln!(out, "coverage: complete");
         }
     }
 }
@@ -1676,7 +1701,7 @@ mod tests {
             &PinnedObjects::empty(),
             crate::cli::TextVerbosity::Concise,
         );
-        assert!(out.contains("1 PKCS#11 module mapped"), "{out}");
+        assert!(out.contains("1 provider file mapped"), "{out}");
         assert!(out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
         assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("identity   sha256"), "{out}");
@@ -1755,9 +1780,68 @@ mod tests {
             &PinnedObjects::empty(),
             crate::cli::TextVerbosity::Quiet,
         );
-        assert!(out.contains("1 PKCS#11 module mapped"), "{out}");
+        assert!(out.contains("1 provider file mapped"), "{out}");
         assert!(out.contains("coverage: complete"), "{out}");
         assert!(!out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
         assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// F6: concise and verbose agree on function counts (NULL slots are
+    /// evidence, not functions, and `entries` already excludes them —
+    /// see `ScannedTable` docs). Both report 1 function for the sample
+    /// (1 entry + 1 NULL), with the NULL still annotated in verbose.
+    #[test]
+    fn pid_inspect_concise_and_verbose_agree_on_function_counts() {
+        let outcome = sample();
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            concise.contains("1 function (1 table)"),
+            "concise undercounts NULLs twice: {concise}"
+        );
+        assert!(!concise.contains("0 functions"), "{concise}");
+        assert!(verbose.contains("1 function (fully walked)"), "{verbose}");
+        assert!(
+            verbose.contains("(NULL: C_GetFunctionStatus)"),
+            "NULL annotation kept: {verbose}"
+        );
+    }
+
+    /// F6: a `known_prefix` walk (newer functions unknown) downgrades
+    /// coverage to partial, even with no skips.
+    #[test]
+    fn pid_inspect_partial_walk_downgrades_coverage_to_partial() {
+        let mut outcome = sample();
+        let ScanOutcome::Scanned { modules, .. } = &mut outcome else {
+            panic!("sample is a completed scan");
+        };
+        modules[0].tables[0].walk = "known_prefix";
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out =
+                render_text_with_verbosity(4242, &outcome, &PinnedObjects::empty(), verbosity);
+            assert!(
+                out.contains("coverage: partial"),
+                "{verbosity:?} hides a partial walk: {out}"
+            );
+            assert!(
+                out.contains("only partly walked"),
+                "{verbosity:?} names no walk reason: {out}"
+            );
+            assert!(!out.contains("coverage: complete"), "{verbosity:?}: {out}");
+        }
     }
 }

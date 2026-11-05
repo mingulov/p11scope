@@ -218,6 +218,8 @@ fn completed_entries_and_returns_are_distinct() {
 }
 
 // Catch treating ring-buffer loss as erased or allocated map counts.
+// F2: the human text shows coverage once (the `call records lost`
+// fragment), without the duplicate event-detail sentence.
 #[test]
 fn loss_does_not_erase_map_counts() {
     let reports = [report(12, 1, 0)];
@@ -235,9 +237,10 @@ fn loss_does_not_erase_map_counts() {
     assert_eq!(trace::lost_line(4).as_deref(), Some("LOST 4 events"));
     let text = human(&reports, &ev);
     assert!(text.contains("12 completed calls"), "{text}");
-    assert!(text.contains("event detail was lost"), "{text}");
+    assert!(text.contains("4 call records lost"), "{text}");
+    assert!(!text.contains("event detail was lost"), "{text}");
     assert!(
-        text.contains("Aggregate counts use the counter maps"),
+        !text.contains("Aggregate counts use the counter maps"),
         "{text}"
     );
 }

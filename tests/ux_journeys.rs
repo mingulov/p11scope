@@ -394,7 +394,7 @@ fn j2_unprivileged_inspect_succeeds_with_guidance() {
     let inspect = run(&["inspect", "--pid", &target.pid()]);
     assert_eq!(inspect.code, Some(0));
     assert!(
-        inspect.stdout.contains("PKCS#11 modules mapped"),
+        inspect.stdout.contains("provider files mapped"),
         "{}",
         inspect.stdout
     );
@@ -854,7 +854,7 @@ fn high1_missing_privilege_is_named_and_never_offers_the_override() {
 
 /// HIGH-2: a target whose mappings cannot be read (pid 1 belongs to root)
 /// is the documented hard error — exit 1, empty stdout, one stderr line
-/// with the cause and the fix — never a clean "0 PKCS#11 modules mapped".
+/// with the cause and the fix — never a clean "0 provider files mapped".
 #[test]
 fn high2_inspect_of_an_unreadable_target_exits_1_with_the_fix() {
     if unsafe { libc::geteuid() } == 0 {

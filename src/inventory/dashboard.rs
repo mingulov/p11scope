@@ -712,7 +712,9 @@ fn render_compact_edge_window(
 /// reason unless `none`), row counts, refusals, and per-category
 /// completed/failed/active totals with their units. Important fields
 /// come first: narrow terminals truncate the category tail, never
-/// the revision or status.
+/// the revision or status. Fields are spelled out (sessions, keys,
+/// per-key rows, unattributed rows, revision, refused), not
+/// abbreviated.
 fn object_keys_line(
     observations: &crate::key_operation_projection::ObjectObservations,
 ) -> Option<String> {
@@ -737,16 +739,19 @@ fn object_keys_line(
             )
         })
         .collect();
+    let refused = observations
+        .budgets
+        .key_refused
+        .saturating_add(observations.budgets.object_refused);
     Some(format!(
-        "objects/keys rev {} {} | sess {} obj {} krows {} urows {} refused {}+{} | {}",
+        "keys revision {} {} | {} sessions {} keys {} per-key rows {} unattributed rows {} refused | {}",
         observations.revision,
         status,
         observations.sessions.len(),
         observations.objects.len(),
         observations.key_operations.len(),
         observations.unknown_key_operations.len(),
-        observations.budgets.key_refused,
-        observations.budgets.object_refused,
+        refused,
         tallies.join(", "),
     ))
 }

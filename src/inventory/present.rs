@@ -1414,6 +1414,42 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
     render_snapshot_inner(presentation, true, crate::cli::TextVerbosity::Quiet)
 }
 
+/// The concise gap summary (F1): one line grouping gaps by plain
+/// subject/reason with counts, top three plus "and K more". Plain
+/// words only (reusing `gap_plain_*`); per-gap `gap [` lines stay
+/// verbose-only. Counts distinct gap rows like the coverage line, not
+/// `repeats` (JSON carries `repeats`). `None` when no gaps are
+/// retained; suppressed-but-unretained gaps stay in the coverage line.
+fn concise_gap_summary_line(gaps: &[GapView], _suppressed: u64) -> Option<String> {
+    if gaps.is_empty() {
+        return None;
+    }
+    let mut groups: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for gap in gaps {
+        let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
+        let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
+        *groups.entry((subject, reason)).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<((String, String), usize)> = groups.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    const SHOWN: usize = 3;
+    let shown = ranked.len().min(SHOWN);
+    let mut parts: Vec<String> = ranked
+        .iter()
+        .take(shown)
+        .map(|((subject, reason), count)| format!("{count} × {subject} — {reason}"))
+        .collect();
+    let more = ranked.len().saturating_sub(shown);
+    if more > 0 {
+        parts.push(format!("and {more} more"));
+    }
+    Some(format!(
+        "gaps: {} (--json has every item)",
+        parts.join("; ")
+    ))
+}
+
 /// The concise limits line (INV-1): the headline budgets in words.
 /// The full budget dump stays verbose-only; `--json` carries `budgets`.
 fn render_limits_line(out: &mut String, budgets: &BudgetView) {
@@ -1455,13 +1491,16 @@ fn key_observation_plain_reason(reason: &str) -> &str {
 }
 
 /// One gap subject in plain words (text only; JSON keeps the stored
-/// subject). Both Joint birth subjects map — the disclosed refusal
-/// and the silent-bootstrap one; everything else passes through
-/// verbatim.
+/// subject). The Joint subjects map — the disclosed refusal, the
+/// silent-bootstrap one, and the unlinked-journal disclosure;
+/// everything else passes through verbatim.
 fn gap_plain_subject(subject: &str) -> &str {
     match subject {
         "Joint key operations unavailable; retained S1" | JOINT_BIRTH_UNAVAILABLE_SUBJECT => {
             "Per-key tracking did not start for this process; function counts above are unaffected"
+        }
+        "per-key tracking is off; this capture keeps S1 mechanisms and API results" => {
+            "per-key tracking is off; function and mechanism counts are unaffected"
         }
         other => other,
     }
@@ -1471,12 +1510,19 @@ fn gap_plain_subject(subject: &str) -> &str {
 /// reason). Unknown reasons pass through verbatim so a new gap lane
 /// always surfaces.
 fn gap_plain_reason(reason: &str) -> &str {
+    if let Some(_suffix) = reason.strip_prefix("joint_seal_") {
+        return "per-key tracking ended early";
+    }
+    if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
+        return "per-key tracking fell back to plain counts";
+    }
     match reason {
         "joint_birth_unoffered" => "no key session was offered to track",
         "joint_image_refused" | "joint_birth_claim_ImageTainted" => {
             "process image changed before tracking could start"
         }
         "joint_birth_no_admission" => "process was not admitted for tracking",
+        "joint_journal_unavailable" => "per-key tracking is off in this run",
         "foreign_or_unproven_caller" => "caller not confirmed",
         other => other,
     }
@@ -1493,7 +1539,7 @@ fn render_snapshot_inner(
     let budgets = &presentation.budgets;
     let _ = writeln!(
         out,
-        "inventory {} ({} pass{}, {} caller{}, {} module{}, {} edge{})",
+        "inventory {} ({} pass{}, {} caller{}, {} provider file{}, {} edge{})",
         presentation.scope_label,
         presentation.passes,
         if presentation.passes == 1 { "" } else { "es" },
@@ -1635,9 +1681,21 @@ fn render_snapshot_inner(
                 let parts: Vec<String> = tallies
                     .iter()
                     .map(|tally| {
+                        // What happened to the call, not an observer
+                        // failure (JSON keeps `failed`).
+                        let failed_noun = if tally.failed == 1 {
+                            "returned an error"
+                        } else {
+                            "returned errors"
+                        };
                         format!(
-                            "{} {} completed, {} failed, {} active {}",
-                            tally.category, tally.completed, tally.failed, tally.active, tally.unit
+                            "{} {} completed, {} {}, {} active {}",
+                            tally.category,
+                            tally.completed,
+                            tally.failed,
+                            failed_noun,
+                            tally.active,
+                            tally.unit
                         )
                     })
                     .collect();
@@ -1708,6 +1766,11 @@ fn render_snapshot_inner(
     }
     if verbosity == crate::cli::TextVerbosity::Concise {
         render_limits_line(&mut out, budgets);
+        if let Some(line) =
+            concise_gap_summary_line(&presentation.gaps, presentation.gaps_suppressed)
+        {
+            let _ = writeln!(out, "{line}");
+        }
         let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);
         return out;
     }

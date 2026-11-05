@@ -3025,7 +3025,9 @@ fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerb
         catalog.scan_ms,
         catalog.scan_status,
     );
-    out.push_str("Mapped files are scan evidence; activity was not captured by inspect.\n");
+    out.push_str(
+        "Mapped provider files are scan evidence; activity was not captured by inspect.\n",
+    );
     out.push('\n');
     if verbosity == TextVerbosity::Quiet {
         render_excluded(&mut out, catalog);
@@ -3166,7 +3168,10 @@ fn render_object(
                 .map_or(&unknown, |process| &process.application);
             let label = application_label(application, *pid);
             match view {
-                Some(view) => format!("{label} (view {})", view.0),
+                Some(view) if verbose => format!("{label} (view {})", view.0),
+                // Concise names the process; the internal view id stays
+                // verbose-only (JSON keeps every process).
+                Some(_) => label,
                 None => format!("{label} (maps match)"),
             }
         })
@@ -8757,6 +8762,37 @@ mod tests {
         assert!(!out.contains("closure_array"), "{out}");
         assert!(!out.contains("uncorroborated"), "{out}");
         assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// F7: concise system inspect omits internal `(view N)` ids from
+    /// the mapped-by lines (first-timers need names, not view ids);
+    /// verbose keeps them beside the names, JSON keeps every process.
+    #[test]
+    fn concise_system_inspect_omits_view_ids_verbose_keeps_them() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("Unknown executable (PID 100)"),
+            "{concise}"
+        );
+        assert!(
+            !concise.contains("(view "),
+            "concise leaks view ids: {concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains("Unknown executable (PID 100) (view 0)"),
+            "{verbose}"
+        );
     }
 
     /// CLI-1: verbose system inspect pairs machine names with the plain

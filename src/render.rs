@@ -2077,6 +2077,35 @@ pub(crate) const MODULE_GAPS_SHOWN: usize = 5;
 /// three by counted calls plus an "and K more" suffix.
 const GAP_PROVIDERS_SHOWN: usize = 3;
 
+/// Concise module gaps shown in default text: at most this many
+/// `modules_skipped` lines plus an "and K more" line. Verbose shows
+/// up to `MODULE_GAPS_SHOWN`; quiet shows none.
+pub(crate) const CONCISE_MODULE_GAPS_SHOWN: usize = 2;
+
+/// The concise twin of [`module_gap_lines`]: the first one or two
+/// refused or partially covered providers with file, plain status and
+/// the `--module` remedy, so a concise PARTIAL names its target
+/// without requiring `-v`. Empty when nothing was refused.
+fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
+    let total = ev.discovery.modules_skipped.len();
+    if total == 0 {
+        return String::new();
+    }
+    let shown = total.min(CONCISE_MODULE_GAPS_SHOWN);
+    let mut out = format!("Module gaps (showing {shown} of {total}):\n");
+    for skipped in ev.discovery.modules_skipped.iter().take(shown) {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            escape_controls(&skipped.name),
+            gap_line_body(ev, reports, skipped)
+        ));
+    }
+    if total > shown {
+        out.push_str(&format!("  and {} more\n", total - shown));
+    }
+    out
+}
+
 /// The named module gaps behind a PARTIAL verdict: every refused or
 /// partially covered module with its reason in plain words, what is still
 /// counted, and the hint. Empty when nothing was refused. Paths and reasons
@@ -2214,7 +2243,7 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
         if ev.discovery.modules.is_empty() {
             return "; no provider below it was captured".into();
         }
-        return "; the attached providers counted 0 calls".into();
+        return "; the attached provider files counted 0 calls".into();
     }
     let mut list: Vec<String> = providers
         .iter()
@@ -2232,7 +2261,7 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
         list.push(format!("and {more} more"));
     }
     format!(
-        "; calls it forwards are counted at the attached providers ({})",
+        "; calls it forwards are counted at the attached provider files ({})",
         list.join(", ")
     )
 }
@@ -2278,8 +2307,8 @@ fn unattributed_provider_line(ev: &Evidence) -> String {
         shown.join(", ")
     };
     format!(
-        "Attribution: {} of {} mapped provider{} {} no manifest ({}); counts are exact, \
-         names are withheld — rerun with --manifest for each mapped provider.\n",
+        "Attribution: {} of {} mapped provider file{} {} no manifest ({}); counts are exact, \
+         names are withheld — rerun with --manifest for each mapped provider file.\n",
         unattested.len(),
         modules.len(),
         if modules.len() == 1 { "" } else { "s" },
@@ -2296,9 +2325,10 @@ pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> Stri
 }
 
 /// [`scope_summary`] at an explicit verbosity: the tests' race-free
-/// handle. Concise keeps totals, plain coverage reasons and the
-/// attribution hint; verbose adds module gaps and owner-gap lines;
-/// quiet keeps totals and coverage only.
+/// handle. Concise keeps totals, plain coverage reasons, the
+/// attribution hint and the first module gaps; verbose adds every
+/// module gap and owner-gap lines; quiet keeps totals and coverage
+/// only.
 pub fn scope_summary_with_verbosity(
     scope: &str,
     reports: &[SlotReport],
@@ -2361,14 +2391,11 @@ pub fn scope_summary_with_verbosity(
     }
     if verbosity != TextVerbosity::Quiet {
         text.push_str(&unattributed_provider_line(ev));
-        if ev.event_loss > 0 {
-            text.push_str(
-                "Coverage partial: event detail was lost. Aggregate counts use the counter maps.\n",
-            );
-        }
     }
     if verbose {
         text.push_str(&module_gap_lines(ev, reports));
+    } else if verbosity == TextVerbosity::Concise {
+        text.push_str(&concise_module_gap_lines(ev, reports));
     }
     text.push_str(&excluded_lines(ev));
     if verbose {
@@ -2604,7 +2631,7 @@ pub fn live_scoped_with_verbosity(
         if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
             s.push_str(&format!(
                 "Mechanisms: none attributed — {} function{} counted but not named; \
-                 add --manifest for each mapped provider (see Coverage).\n",
+                 add --manifest for each mapped provider file (see Coverage).\n",
                 ev.semantic_unverified_slots,
                 if ev.semantic_unverified_slots == 1 {
                     ""
@@ -2921,11 +2948,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             "aliased" => count(ev.aliased.len() as u64, "functions sharing an address"),
             "module_ambiguous" => count(
                 ev.discovery.module_ambiguous,
-                "functions claimed by two providers",
+                "functions claimed by two provider files",
             ),
             "module_unresolved_slots" => count(
                 ev.module_unresolved_slots as u64,
-                "functions with no proven provider",
+                "functions with no proven provider file",
             ),
             "unregistered_mechanisms" => {
                 count(ev.unregistered_mechanisms, "unregistered mechanisms")
@@ -2935,13 +2962,13 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "vendor mechanisms not listed by name",
             ),
             "discovery_conflicts" => format!(
-                "manifest and scan disagree on {} provider{}",
+                "manifest and scan disagree on {} provider file{}",
                 ev.discovery.conflicts,
                 if ev.discovery.conflicts == 1 { "" } else { "s" }
             ),
             "discovery_uncorroborated" => count(
                 ev.discovery.uncorroborated,
-                "providers not confirmed from a second source",
+                "provider files not confirmed from a second source",
             ),
             "interface_selection.selection_count_only" => {
                 "function list counted without names".to_string()
@@ -6455,15 +6482,15 @@ pub(crate) mod tests {
             CapturePolicy::Allowlisted,
         );
         assert!(
-            out.contains("manifest and scan disagree on 1 provider"),
+            out.contains("manifest and scan disagree on 1 provider file"),
             "{out}"
         );
         assert!(
-            out.contains("2 providers not confirmed from a second source"),
+            out.contains("2 provider files not confirmed from a second source"),
             "{out}"
         );
         assert!(
-            out.contains("3 functions claimed by two providers"),
+            out.contains("3 functions claimed by two provider files"),
             "{out}"
         );
         assert!(out.contains("1 provider files not watched"), "{out}");
@@ -6471,8 +6498,9 @@ pub(crate) mod tests {
         assert!(out.contains("PARTIAL"), "{out}");
     }
 
-    /// CLI-1: the concise profile summary keeps totals with plain
-    /// coverage reasons and no machine names or module-gap section.
+    /// CLI-1/F2: the concise profile summary keeps totals with plain
+    /// coverage reasons and no machine names, plus the first module
+    /// gaps (file + remedy) so a refused provider is actionable.
     #[test]
     fn concise_profile_summary_keeps_plain_reasons_without_machine_names() {
         let mut ev = evidence();
@@ -6496,7 +6524,7 @@ pub(crate) mod tests {
         assert!(out.contains("names withheld"), "{out}");
         assert!(out.contains("68 functions counted but not named"), "{out}");
         assert!(
-            out.contains("manifest and scan disagree on 1 provider"),
+            out.contains("manifest and scan disagree on 1 provider file"),
             "{out}"
         );
         for machine in [
@@ -6508,7 +6536,69 @@ pub(crate) mod tests {
         ] {
             assert!(!out.contains(machine), "{machine} leaked: {out}");
         }
-        assert!(!out.contains("Module gaps"), "{out}");
+        // F2: concise names the refused file with its remedy.
+        assert!(out.contains("Module gaps (showing 1 of 1):"), "{out}");
+        assert!(out.contains("/opt/x.so"), "{out}");
+        assert!(
+            out.contains("capture it alone with --module /opt/x.so"),
+            "{out}"
+        );
+    }
+
+    /// F2: the concise profile summary names a refused provider with
+    /// its file and the `--module` remedy (not just the aggregate
+    /// "1 provider files not watched" fragment).
+    #[test]
+    fn concise_profile_summary_names_refused_provider_with_remedy() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/refused.so".into(),
+            reason: "capacity".into(),
+        });
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("1 provider files not watched"), "{out}");
+        assert!(out.contains("/opt/refused.so"), "{out}");
+        assert!(
+            out.contains("capture it alone with --module /opt/refused.so"),
+            "{out}"
+        );
+    }
+
+    /// F2: with lost events, concise and verbose show coverage once —
+    /// the `call records lost` fragment — without the duplicate
+    /// `Coverage partial: event detail was lost` sentence.
+    #[test]
+    fn profile_summary_shows_coverage_once_with_event_loss() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
+            assert!(out.contains("12 call records lost"), "{verbosity:?}: {out}");
+            assert!(
+                !out.contains("event detail was lost"),
+                "{verbosity:?} duplicates coverage: {out}"
+            );
+            assert!(
+                !out.contains("Aggregate counts use the counter maps"),
+                "{verbosity:?} duplicates coverage: {out}"
+            );
+            // One coverage verdict, not two worded differently.
+            let coverage_lines = out
+                .lines()
+                .filter(|line| line.to_lowercase().starts_with("coverage "))
+                .count();
+            assert_eq!(coverage_lines, 1, "{verbosity:?}: {out}");
+        }
     }
 
     /// CLI-1: the verbose profile summary pairs every machine name with
@@ -6758,13 +6848,13 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
             text.contains(
-                "Attribution: 1 of 2 mapped providers has no manifest (libsoftokn3.so); \
+                "Attribution: 1 of 2 mapped provider files has no manifest (libsoftokn3.so); \
                  counts are exact, names are withheld"
             ),
             "{text}"
         );
         assert!(
-            text.contains("rerun with --manifest for each mapped provider"),
+            text.contains("rerun with --manifest for each mapped provider file"),
             "{text}"
         );
     }
@@ -6792,7 +6882,7 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
             text.contains(
-                "Attribution: 2 of 3 mapped providers have no manifest (a.so, b.so); \
+                "Attribution: 2 of 3 mapped provider files have no manifest (a.so, b.so); \
                  counts are exact, names are withheld"
             ),
             "{text}"
@@ -6980,7 +7070,7 @@ pub(crate) mod tests {
         );
         assert!(
             text.contains(
-                "calls it forwards are counted at the attached providers \
+                "calls it forwards are counted at the attached provider files \
                  (/opt/p11-kit-trust.so: 744 calls)"
             ),
             "{text}"
@@ -7240,7 +7330,7 @@ pub(crate) mod tests {
             scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(!ev.discovery.modules.is_empty());
         assert!(
-            text.contains("the attached providers counted 0 calls"),
+            text.contains("the attached provider files counted 0 calls"),
             "{text}"
         );
         assert!(
@@ -7674,7 +7764,7 @@ pub(crate) mod tests {
         assert!(
             out.contains(
                 "Mechanisms: none attributed — 212 functions counted but not named; \
-                 add --manifest for each mapped provider (see Coverage)."
+                 add --manifest for each mapped provider file (see Coverage)."
             ),
             "{out}"
         );
@@ -7872,7 +7962,7 @@ pub(crate) mod tests {
             out.find("3 unreadable kernel records").unwrap(),
             out.find("provider file changed during capture").unwrap(),
             out.find("names withheld (").unwrap(),
-            out.find("manifest and scan disagree on 1 provider")
+            out.find("manifest and scan disagree on 1 provider file")
                 .unwrap(),
         ];
         assert!(
@@ -7912,13 +8002,13 @@ pub(crate) mod tests {
         // fragment without a gate term rendered nothing. The table derives
         // the gate from the same fragments; each counter alone must surface.
         let gap_cases: [(&str, EvidenceMutation); 23] = [
-            ("manifest and scan disagree on 1 provider", |e| {
+            ("manifest and scan disagree on 1 provider file", |e| {
                 e.discovery.conflicts = 1
             }),
-            ("1 providers not confirmed from a second source", |e| {
+            ("1 provider files not confirmed from a second source", |e| {
                 e.discovery.uncorroborated = 1;
             }),
-            ("1 functions claimed by two providers", |e| {
+            ("1 functions claimed by two provider files", |e| {
                 e.discovery.module_ambiguous = 1;
             }),
             ("1 provider files not watched", |e| {

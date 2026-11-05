@@ -941,7 +941,7 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     );
     for (label, key) in [
         ("caller", "callers"),
-        ("module", "modules"),
+        ("provider file", "modules"),
         ("edge", "edges"),
     ] {
         let count = document[key].as_array().unwrap().len();
@@ -1966,7 +1966,7 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
     assert_eq!(
         snapshot,
         concat!(
-            "inventory f7 (1 pass, 2 callers, 2 modules, 2 edges)\n",
+            "inventory f7 (1 pass, 2 callers, 2 provider files, 2 edges)\n",
             "coverage: PARTIAL — 1 gap, 0 refused, 0 more not shown\n",
             "key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)\n",
             "application f7-app0 [c0 pid 70000 incarnation 0] -> module m0.so [m0]: At least 34 entries observed\n",
@@ -2288,6 +2288,122 @@ fn concise_snapshot_keeps_head_limits_and_hint() {
     assert!(!out.contains("Details:"), "{out}");
     assert!(!out.contains("gap ["), "{out}");
     assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+}
+
+/// F1: the concise snapshot groups gap reasons with counts, so a
+/// partial result names WHY (two distinct reasons both appear);
+/// per-gap `gap [` lines stay verbose-only.
+#[test]
+fn concise_snapshot_groups_gap_reasons_with_counts() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason: "joint_birth_unoffered".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "fixture scope".into(),
+        reason: "fixture reason".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(out.contains("coverage: PARTIAL"), "{out}");
+    // Both plain reasons appear with counts; no per-gap flood.
+    assert!(
+        out.contains("no key session was offered to track"),
+        "first gap reason missing: {out}"
+    );
+    assert!(
+        out.contains("fixture reason"),
+        "second gap reason missing: {out}"
+    );
+    assert!(!out.contains("gap ["), "{out}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains("gap ["), "{verbose}");
+}
+
+/// F1+F3: the concise gap summary uses plain words for the Joint
+/// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
+#[test]
+fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for reason in [
+        "joint_seal_h3_loss_history_loss",
+        "joint_fallback_staging_full",
+        "joint_journal_unavailable",
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: if reason == "joint_journal_unavailable" {
+                "per-key tracking is off; this capture keeps S1 mechanisms and API results".into()
+            } else {
+                "Joint key operations unavailable; retained S1".into()
+            },
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    for plain in [
+        "per-key tracking ended early",
+        "per-key tracking fell back to plain counts",
+        "per-key tracking is off; function and mechanism counts are unaffected",
+    ] {
+        assert!(out.contains(plain), "{plain} missing: {out}");
+    }
+    for machine in [
+        "joint_seal_",
+        "joint_fallback_",
+        "joint_journal_unavailable",
+        "keeps S1",
+    ] {
+        assert!(!out.contains(machine), "{machine} leaked: {out}");
+    }
+}
+
+/// F1: more than three gap groups fold the tail into "and K more".
+#[test]
+fn concise_gap_summary_folds_beyond_three_groups() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for (subject, reason) in [
+        ("scope-a", "reason-a"),
+        ("scope-b", "reason-b"),
+        ("scope-c", "reason-c"),
+        ("scope-d", "reason-d"),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: subject.into(),
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(out.contains("and 1 more"), "{out}");
+    assert!(!out.contains("gap ["), "{out}");
 }
 
 /// CLI-1: the concise limits line uses singular nouns for counts of

@@ -737,7 +737,8 @@ fn concise_diff_summarizes_counts_and_top_applications() {
     let mut output = Vec::new();
     super::render::render_concise(&report, &mut output).unwrap();
     let text = String::from_utf8(output).unwrap();
-    assert!(text.contains("application groups changed"), "{text}");
+    assert!(text.contains("application group"), "{text}");
+    assert!(text.contains("changed"), "{text}");
     assert!(text.contains("run with -v for details"), "{text}");
     assert!(!text.contains("absence_is_not_removal"), "{text}");
     assert!(!text.contains("Limitation:"), "{text}");

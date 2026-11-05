@@ -1149,15 +1149,30 @@ fn pin_inventory_prearm(
     // budget is enforced on the other side instead — the coordinator
     // retains this pinning's object/byte usage and both the semantic and
     // the count manifest readers charge it when they pin.
-    pin_prearm_objects_in_views_with_budget(prearm_modules, &views, named_pid, 0, 0, &mut budget)
-        .map_err(|error| {
-            for problem in error.problems() {
-                eprintln!("p11scope: {problem}");
-            }
-            anyhow::anyhow!(
-                "--prearm-module inputs are not usable trusted inputs; refusing to attach"
-            )
-        })
+    let pinning = pin_prearm_objects_in_views_with_budget(
+        prearm_modules,
+        &views,
+        named_pid,
+        0,
+        0,
+        &mut budget,
+    )
+    .map_err(|error| {
+        for problem in error.problems() {
+            eprintln!("p11scope: {problem}");
+        }
+        anyhow::anyhow!("--prearm-module inputs are not usable trusted inputs; refusing to attach")
+    })?;
+    // Never-stop: per-path failures become gaps naming the bad path;
+    // good pins continue.
+    for skip in &pinning.skipped {
+        eprintln!(
+            "p11scope: discovery skipped {} — {}",
+            crate::render::escape_controls(&skip.subject),
+            crate::render::escape_controls(&skip.reason)
+        );
+    }
+    Ok(pinning)
 }
 
 /// Test-only count of pass-heap reclamations on any thread: each
@@ -1271,8 +1286,8 @@ fn run_with_terminal_budget(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
-    // F5: pin `--prearm-module` inputs before any sink, probe or scan, so
-    // one bad path refuses all-or-nothing before side effects.
+    // F5: pin `--prearm-module` inputs before any sink, probe or scan; one
+    // bad path gaps (PARTIAL) while good pins continue (never-stop).
     let prearm_pinning = if prearm_modules.is_empty() {
         None
     } else {
@@ -8702,61 +8717,28 @@ mod tests {
     }
 
     #[test]
-    fn inventory_run_refuses_bad_prearm_path_before_side_effects() {
-        // One bad `--prearm-module` path refuses all-or-nothing before
-        // probing, sinks or scans; a valid provider is retained instead
-        // (see the positive twin below).
-        for mode in [CaptureMode::Auto, CaptureMode::Native] {
-            let dir = tempfile::tempdir().unwrap();
-            let out = dir.path().join("out.json");
-            let mut stdout = Vec::new();
-            let error = run_with_terminal_budget(
-                InspectScope::Pid(std::process::id()),
-                &[],
-                &[],
-                &[],
-                &[PathBuf::from("/opt/p11-provider.so")],
-                &HookRegistry::builtin(),
-                true,
-                Some(1),
-                None,
-                inventory_endpoint_budget(None).unwrap(),
-                None,
-                Some(&out),
-                false,
-                None,
-                None,
-                None,
-                mode,
-                crate::attach::BackendSelection::Singles,
-                None,
-                false,
-                &|| false,
-                &|| {},
-                false,
-                &mut WriterStdout(&mut stdout),
-                &DashboardIo::stdio(),
-                DiagnosticRequest::disabled(),
-                None,
-                &|| panic!("refusal must precede host probing"),
-                None,
-                None,
-                false,
-            )
-            .expect_err("inventory with a bad --prearm-module path must refuse");
-            assert!(
-                format!("{error:#}").contains("--prearm-module"),
-                "unexpected refusal: {error:#}"
-            );
-            assert!(!out.exists(), "refusal must precede sink creation");
-            assert!(stdout.is_empty());
-        }
+    fn inventory_run_gaps_bad_prearm_path_and_continues() {
+        // Never-stop: one bad `--prearm-module` path gaps (PARTIAL) while
+        // good pins continue; a valid provider is retained instead (see the
+        // positive twin below). Tested at the pinning seam (no BPF).
+        let scope = InventoryRunScope::Pid(std::process::id());
+        let pinning = super::pin_inventory_prearm(&[PathBuf::from("/opt/p11-provider.so")], scope)
+            .expect("bad prearm path gaps, siblings continue");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
+        assert!(
+            pinning.skipped[0]
+                .reason
+                .contains("prearm object unavailable"),
+            "{:?}",
+            pinning.skipped
+        );
     }
 
-    /// Packet 6.13 round-2 (F5): startup pinning is all-or-nothing — one
-    /// bad path refuses the whole batch and retains no partial pins.
+    /// Never-stop: one bad path gaps while the good provider still pins
+    /// and retains its held file.
     #[test]
-    fn inventory_prearm_pinning_refuses_mixed_batch_without_partial_pins() {
+    fn inventory_prearm_pinning_gaps_mixed_batch_and_keeps_good_pins() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("prearm-mixed.c");
         std::fs::write(&src, "int prearm_mixed_marker;\n").unwrap();
@@ -8779,14 +8761,19 @@ mod tests {
             "pinning retains the held file"
         );
         drop(valid);
-        let error = super::pin_inventory_prearm(
+        let mixed = super::pin_inventory_prearm(
             &[provider, PathBuf::from("/nonexistent-prearm-provider.so")],
             scope,
         )
-        .expect_err("a mixed batch must refuse all-or-nothing");
+        .expect("a mixed batch gaps the bad path");
+        assert_eq!(mixed.inputs.len(), 1);
+        assert_eq!(mixed.skipped.len(), 1);
         assert!(
-            format!("{error:#}").contains("--prearm-module"),
-            "unexpected refusal: {error:#}"
+            mixed.skipped[0]
+                .reason
+                .contains("prearm object unavailable"),
+            "{:?}",
+            mixed.skipped
         );
     }
 

@@ -1624,6 +1624,17 @@ fn prepare_count_manifests(
                 pinning.stale.is_empty(),
                 "manifest object identity is stale"
             );
+            // Never-stop partial pinning returns per-object skips; inspect
+            // keeps its strict refusal here (no silent loss) until its own
+            // partial lane (F-07) relaxes it.
+            ensure!(
+                pinning.skipped.is_empty(),
+                "manifest object unavailable: {}",
+                pinning
+                    .skipped
+                    .first()
+                    .map_or("unknown", |skip| skip.reason.as_str())
+            );
             ensure!(
                 pinning.pins.check_unchanged() == Ok(true),
                 "manifest object identity changed"

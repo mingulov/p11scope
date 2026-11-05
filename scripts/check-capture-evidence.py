@@ -542,6 +542,11 @@ LOADER_SCAN_LEDGER_EXCEEDED = (
     "a deferred loader memory scan exceeded the bounded loader-context ledger"
 )
 LOADER_ARM_LEDGER_FULL = "the bounded loader-arm catch-up ledger was full"
+# Never-stop (2026-11-05): per-object manifest/pre-arm skips and live
+# discovery transport failures project to these finite reasons.
+MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
+PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
+DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
@@ -554,6 +559,9 @@ DISCOVERY_REASONS = {
     LOADER_CONTEXT_CAPACITY_EXHAUSTED,
     LOADER_SCAN_LEDGER_EXCEEDED,
     LOADER_ARM_LEDGER_FULL,
+    MANIFEST_OBJECT_UNAVAILABLE,
+    PREARM_OBJECT_UNAVAILABLE,
+    DISCOVERY_TRANSPORT_UNAVAILABLE,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a

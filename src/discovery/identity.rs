@@ -6635,6 +6635,10 @@ impl StaleManifestObject {
 pub struct ManifestPinning {
     pub pins: PinnedObjects,
     pub stale: Vec<StaleManifestObject>,
+    /// Per-object pin failures that must not abort siblings: each bad
+    /// object becomes one gap (PARTIAL) while good pins continue.
+    /// `Invalid` (structural) and whole-budget refusals stay `Err`.
+    pub skipped: Vec<Skipped>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6950,7 +6954,7 @@ fn pin_manifest_objects_with_read_policy(
         )]));
     }
 
-    let mut problems = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     let mut stale = Vec::new();
     let mut pinned = Vec::new();
     let mut total_object_bytes = prior_bytes;
@@ -6961,15 +6965,17 @@ fn pin_manifest_objects_with_read_policy(
             Err(binding_error) => {
                 // Preserve the actionable permission diagnostic for an inaccessible
                 // locator, but never open or accept an unbound proc-root object.
-                match path.try_exists() {
+                // Never-stop: one bad object becomes a gap, siblings continue.
+                let detail = match path.try_exists() {
                     Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                        problems.push(format!(
-                            "{}: cannot inspect the file locator now ({error})",
-                            object.path
-                        ));
+                        format!("cannot inspect the file locator now ({error})")
                     }
-                    _ => problems.push(binding_error),
-                }
+                    _ => binding_error,
+                };
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {detail}"),
+                });
                 continue;
             }
         };
@@ -6980,7 +6986,10 @@ fn pin_manifest_objects_with_read_policy(
                 {
                     Ok((opened, mountinfo)) => (opened, Some(mountinfo)),
                     Err(error) => {
-                        problems.push(format!("{}: {error}", object.path));
+                        skipped.push(Skipped {
+                            subject: object.path.clone(),
+                            reason: format!("manifest object unavailable: {error}"),
+                        });
                         continue;
                     }
                 }
@@ -7002,7 +7011,10 @@ fn pin_manifest_objects_with_read_policy(
                 continue;
             }
             ManifestLocatorOpen::Fatal(error) => {
-                problems.push(error);
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
@@ -7015,7 +7027,10 @@ fn pin_manifest_objects_with_read_policy(
                 {
                     Ok(table) => table,
                     Err(error) => {
-                        problems.push(format!("{}: {error}", object.path));
+                        skipped.push(Skipped {
+                            subject: object.path.clone(),
+                            reason: format!("manifest object unavailable: {error}"),
+                        });
                         continue;
                     }
                 };
@@ -7025,26 +7040,32 @@ fn pin_manifest_objects_with_read_policy(
         let pin = match pin_of(&file) {
             Ok(pin) => pin,
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
         let len = pin.size;
         let Some(total) = total_object_bytes.checked_add(len) else {
-            problems.push("total object size overflowed u64".into());
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: "manifest object unavailable: total object size overflowed u64".into(),
+            });
             continue;
         };
         if total > MAX_TOTAL_OBJECT_BYTES {
-            problems.push(format!(
-                "manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-            ));
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: format!(
+                    "manifest object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                ),
+            });
             continue;
         }
         total_object_bytes = total;
         pinned.push((object, file, pin, mountinfo));
-    }
-    if !problems.is_empty() {
-        return Err(ManifestPinError::Fatal(problems));
     }
 
     let mut opened = BTreeMap::new();
@@ -7053,7 +7074,10 @@ fn pin_manifest_objects_with_read_policy(
             match identity_of_manifest(&file, mountinfo.as_deref()) {
                 Ok(mapping) => Some(mapping),
                 Err(error) => {
-                    problems.push(format!("{}: {error}", object.path));
+                    skipped.push(Skipped {
+                        subject: object.path.clone(),
+                        reason: format!("manifest object unavailable: {error}"),
+                    });
                     continue;
                 }
             }
@@ -7071,10 +7095,12 @@ fn pin_manifest_objects_with_read_policy(
         } {
             Ok(inspected) => inspected,
             Err(error) => {
-                problems.push(format!(
-                    "{}: cannot identify the file now ({error})",
-                    object.path
-                ));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!(
+                        "manifest object unavailable: cannot identify the file now ({error})"
+                    ),
+                });
                 continue;
             }
         };
@@ -7086,18 +7112,25 @@ fn pin_manifest_objects_with_read_policy(
         match pin_of(&file) {
             Ok(after) if after == pin => {}
             Ok(_) => {
-                problems.push(format!(
-                    "{}: file changed while it was being identified — retry",
-                    object.path
-                ));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: "manifest object unavailable: file changed while it was being identified — retry".into(),
+                });
                 continue;
             }
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         }
-        let mut offsets_valid = true;
+        // One gap per object, not per function: count the bad offsets and
+        // name the first, so a 67-function manifest with all offsets bad
+        // records one skip, not 67.
+        let mut bad_offsets = 0usize;
+        let mut first_bad: Option<(String, u64)> = None;
         let surface_functions = m.surfaces.iter().flat_map(|surface| &surface.functions);
         let selection_functions = m
             .selection_evidence
@@ -7113,14 +7146,19 @@ fn pin_manifest_objects_with_read_policy(
                 continue;
             };
             if target == object.id && !inspected.contains_executable_offset(file_offset) {
-                problems.push(format!(
-                    "{}: {}+{file_offset:#x} is outside every executable ELF segment",
-                    function.name, object.path
-                ));
-                offsets_valid = false;
+                bad_offsets += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((function.name.clone(), file_offset));
+                }
             }
         }
-        if !offsets_valid {
+        if let Some((name, file_offset)) = first_bad {
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: format!(
+                    "manifest object unavailable: {bad_offsets} function offset(s) outside every executable ELF segment, first {name}+{file_offset:#x}"
+                ),
+            });
             continue;
         }
         let mapping = match count_mapping
@@ -7129,13 +7167,19 @@ fn pin_manifest_objects_with_read_policy(
         {
             Ok(mapping) => mapping,
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
         let key = object_key(mapping);
         let Some(raw) = RawObjectInstance::manifest(key, object.path.clone()) else {
-            problems.push(format!("{}: object path cannot be normalized", object.path));
+            skipped.push(Skipped {
+                subject: object.path.clone(),
+                reason: "manifest object unavailable: object path cannot be normalized".into(),
+            });
             continue;
         };
         let held = meter_identity
@@ -7153,7 +7197,10 @@ fn pin_manifest_objects_with_read_policy(
         ) {
             Ok(entry) => entry,
             Err(error) => {
-                problems.push(format!("{}: {error}", object.path));
+                skipped.push(Skipped {
+                    subject: object.path.clone(),
+                    reason: format!("manifest object unavailable: {error}"),
+                });
                 continue;
             }
         };
@@ -7202,38 +7249,38 @@ fn pin_manifest_objects_with_read_policy(
         opened.insert(object.id, (entry, inspected));
     }
 
-    if !problems.is_empty() {
-        return Err(ManifestPinError::Fatal(problems));
-    }
     let mut result = PinnedObjects::empty();
     for (entry, _) in opened.into_values() {
         let path = entry.path.clone();
-        let mut skipped = Vec::new();
-        if result.insert_entry(entry, &mut skipped).is_none() {
-            problems.extend(
-                skipped
-                    .into_iter()
-                    .map(|skip| format!("{path}: {}", skip.reason)),
-            );
+        let mut insert_skipped = Vec::new();
+        if result.insert_entry(entry, &mut insert_skipped).is_none() {
+            skipped.extend(insert_skipped.into_iter().map(|skip| Skipped {
+                subject: path.clone(),
+                reason: format!("manifest object unavailable: {}", skip.reason),
+            }));
         }
-    }
-    if !problems.is_empty() {
-        return Err(ManifestPinError::Fatal(problems));
     }
     Ok(ManifestPinning {
         pins: result,
         stale,
+        skipped,
     })
 }
 
 /// Strict compatibility API for callers that have no scan fallback context.
 pub fn pin_manifest_objects(m: &Manifest) -> Result<PinnedObjects, Vec<String>> {
     match pin_manifest_objects_deferred(m) {
-        Ok(result) if result.stale.is_empty() => Ok(result.pins),
+        Ok(result) if result.stale.is_empty() && result.skipped.is_empty() => Ok(result.pins),
         Ok(result) => Err(result
             .stale
             .into_iter()
-            .map(|stale| stale.diagnostic)
+            .map(|stale| stale.diagnostic().to_string())
+            .chain(
+                result
+                    .skipped
+                    .into_iter()
+                    .map(|skip| format!("{}: {}", skip.subject, skip.reason)),
+            )
             .collect()),
         Err(error) => Err(error.problems().to_vec()),
     }
@@ -7260,10 +7307,14 @@ pub(crate) struct PrearmPinnedInput {
 pub(crate) struct PrearmPinning {
     pub(crate) pins: PinnedObjects,
     pub(crate) inputs: Vec<PrearmPinnedInput>,
+    /// Per-path pin failures that must not abort siblings: each bad path
+    /// becomes one gap (PARTIAL) while good pins continue. Whole-budget
+    /// refusals stay `Err`.
+    pub(crate) skipped: Vec<Skipped>,
 }
 
-/// Pre-arm pinning fails whole: one bad path refuses the capture's startup
-/// (R2-D1-1), never a partial pin set.
+/// Pre-arm pinning refuses whole only on whole-input failures (shared
+/// object budget); one bad path gaps that path (PARTIAL), never the set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrearmPinError {
     Fatal(Vec<String>),
@@ -7297,23 +7348,23 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
     prior_bytes: u64,
     budget: &mut CaptureWorkBudget,
 ) -> Result<PrearmPinning, PrearmPinError> {
-    let mut problems = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     if prior_objects.saturating_add(paths.len()) > MAX_OBJECTS {
-        problems.push(format!(
+        return Err(PrearmPinError::Fatal(vec![format!(
             "manifest and pre-arm objects total more than the {MAX_OBJECTS}-object limit"
-        ));
-        return Err(PrearmPinError::Fatal(problems));
+        )]));
     }
-    // Phase 1: resolve and open every path before pinning any, so one bad
-    // path cannot leave a partial pin set behind.
+    // Phase 1: resolve and open every path; one bad path becomes a gap
+    // while good paths continue (never-stop).
     let mut opened = Vec::new();
     let mut total_object_bytes = prior_bytes;
     for path in paths {
         let spelling = path.to_string_lossy().into_owned();
         if normalize_target_path(&spelling).is_none() {
-            problems.push(format!(
-                "{spelling}: --prearm-module paths must be absolute"
-            ));
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: "prearm object unavailable: --prearm-module paths must be absolute".into(),
+            });
             continue;
         }
         enum PrearmRoot<'a> {
@@ -7338,16 +7389,22 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                             .join(spelling.trim_start_matches('/')),
                     },
                     None => {
-                        problems.push(format!(
-                            "{spelling}: no exact retained process view exists for pid {pid}"
-                        ));
+                        skipped.push(Skipped {
+                            subject: spelling.clone(),
+                            reason: format!(
+                                "prearm object unavailable: no exact retained process view exists for pid {pid}"
+                            ),
+                        });
                         continue;
                     }
                 },
                 None => PrearmRoot::Observer { open: path.clone() },
             },
             Err(binding_error) => {
-                problems.push(binding_error);
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {binding_error}"),
+                });
                 continue;
             }
         };
@@ -7358,7 +7415,10 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                 {
                     Ok((located, mountinfo)) => (located, Some(mountinfo)),
                     Err(error) => {
-                        problems.push(format!("{spelling}: {error}"));
+                        skipped.push(Skipped {
+                            subject: spelling.clone(),
+                            reason: format!("prearm object unavailable: {error}"),
+                        });
                         continue;
                     }
                 }
@@ -7368,13 +7428,19 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         let file = match located {
             ManifestLocatorOpen::Opened(file) => file,
             ManifestLocatorOpen::Stale => {
-                problems.push(format!(
-                    "{spelling}: the pre-arm file locator no longer resolves"
-                ));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason:
+                        "prearm object unavailable: the pre-arm file locator no longer resolves"
+                            .into(),
+                });
                 continue;
             }
             ManifestLocatorOpen::Fatal(error) => {
-                problems.push(error);
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
                 continue;
             }
         };
@@ -7387,7 +7453,10 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                 {
                     Ok(table) => table,
                     Err(error) => {
-                        problems.push(format!("{spelling}: {error}"));
+                        skipped.push(Skipped {
+                            subject: spelling.clone(),
+                            reason: format!("prearm object unavailable: {error}"),
+                        });
                         continue;
                     }
                 };
@@ -7397,25 +7466,31 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         let pin = match pin_of(&file) {
             Ok(pin) => pin,
             Err(error) => {
-                problems.push(format!("{spelling}: {error}"));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
                 continue;
             }
         };
         let Some(total) = total_object_bytes.checked_add(pin.size) else {
-            problems.push("total object size overflowed u64".into());
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: "prearm object unavailable: total object size overflowed u64".into(),
+            });
             continue;
         };
         if total > MAX_TOTAL_OBJECT_BYTES {
-            problems.push(format!(
-                "manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
-            ));
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: format!(
+                    "prearm object unavailable: manifest and pre-arm objects total more than the {MAX_TOTAL_OBJECT_BYTES}-byte limit"
+                ),
+            });
             continue;
         }
         total_object_bytes = total;
         opened.push((spelling, file, pin, mountinfo));
-    }
-    if !problems.is_empty() {
-        return Err(PrearmPinError::Fatal(problems));
     }
 
     // Phase 2: identify, hash, bracket and file every opened object.
@@ -7429,9 +7504,12 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         ) {
             Ok(inspected) => inspected,
             Err(error) => {
-                problems.push(format!(
-                    "{spelling}: cannot identify the file now ({error})"
-                ));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!(
+                        "prearm object unavailable: cannot identify the file now ({error})"
+                    ),
+                });
                 continue;
             }
         };
@@ -7442,26 +7520,37 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         match pin_of(&file) {
             Ok(after) if after == pin => {}
             Ok(_) => {
-                problems.push(format!(
-                    "{spelling}: file changed while it was being identified — retry"
-                ));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: "prearm object unavailable: file changed while it was being identified — retry"
+                        .into(),
+                });
                 continue;
             }
             Err(error) => {
-                problems.push(format!("{spelling}: {error}"));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
                 continue;
             }
         }
         let mapping = match identity_of_manifest(&file, mountinfo.as_deref()) {
             Ok(mapping) => mapping,
             Err(error) => {
-                problems.push(format!("{spelling}: {error}"));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
                 continue;
             }
         };
         let key = object_key(mapping);
         let Some(raw) = RawObjectInstance::prearm(key, spelling.clone()) else {
-            problems.push(format!("{spelling}: object path cannot be normalized"));
+            skipped.push(Skipped {
+                subject: spelling.clone(),
+                reason: "prearm object unavailable: object path cannot be normalized".into(),
+            });
             continue;
         };
         let input_path = raw.path.clone();
@@ -7477,7 +7566,10 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
         ) {
             Ok(entry) => entry,
             Err(error) => {
-                problems.push(format!("{spelling}: {error}"));
+                skipped.push(Skipped {
+                    subject: spelling.clone(),
+                    reason: format!("prearm object unavailable: {error}"),
+                });
                 continue;
             }
         };
@@ -7493,13 +7585,12 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
                 entry.probed_maps_unproven = true;
             }
         }
-        let mut skipped = Vec::new();
-        if pins.insert_entry(entry, &mut skipped).is_none() {
-            problems.extend(
-                skipped
-                    .into_iter()
-                    .map(|skip| format!("{spelling}: {}", skip.reason)),
-            );
+        let mut insert_skipped = Vec::new();
+        if pins.insert_entry(entry, &mut insert_skipped).is_none() {
+            skipped.extend(insert_skipped.into_iter().map(|skip| Skipped {
+                subject: spelling.clone(),
+                reason: format!("prearm object unavailable: {}", skip.reason),
+            }));
             continue;
         }
         // R2-D1-2(b): only defined exports proved executable in held bytes
@@ -7520,10 +7611,11 @@ pub(crate) fn pin_prearm_objects_in_views_with_budget(
             non_executable,
         });
     }
-    if !problems.is_empty() {
-        return Err(PrearmPinError::Fatal(problems));
-    }
-    Ok(PrearmPinning { pins, inputs })
+    Ok(PrearmPinning {
+        pins,
+        inputs,
+        skipped,
+    })
 }
 
 /// Opens, identity-checks, hashes once and pins every object the scan named. Objects
@@ -15256,5 +15348,166 @@ mod tests {
             None,
             "no path association is minted"
         );
+    }
+
+    #[test]
+    fn one_bad_manifest_object_keeps_the_good_pin() {
+        // Never-stop: one bad object must not abort the whole capture.
+        // RED: currently Err(Fatal), dropping the good pin.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::copy("/bin/sh", &good).unwrap();
+        let bad_dir = dir.path().join("bad-dir");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let file = std::fs::File::open(&good).unwrap();
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let key = object_key(mapping_file_key(&file).unwrap());
+        let mut manifest = manifest_for(key);
+        manifest.schema = p11scope_manifest::manifest::SCHEMA.into();
+        manifest.module_path = good.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.objects[0].identity = inspected.identity.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].device_major = key.device.major;
+        manifest.provenance_objects[0].device_minor = key.device.minor;
+        manifest.provenance_objects[0].inode = key.inode;
+        manifest.provenance_objects[0].identity = inspected.identity.clone();
+        let bad_ino = std::fs::metadata(&bad_dir).unwrap().ino();
+        manifest.objects.push(ObjectRecord {
+            id: 1,
+            path: bad_dir.to_str().unwrap().into(),
+            identity: inspected.identity.clone(),
+        });
+        manifest.provenance_objects.push(ProvenanceObject {
+            path: bad_dir.to_str().unwrap().into(),
+            device_major: 0,
+            device_minor: 0,
+            inode: bad_ino,
+            identity: inspected.identity.clone(),
+        });
+        manifest.surfaces[0].functions[0].resolution = Resolution::NullPointer;
+        assert!(validate_structure(&manifest).is_empty());
+        let pinning = pin_manifest_objects_deferred(&manifest)
+            .expect("one bad object must not abort good pins");
+        assert_eq!(pinning.pins.pinned().count(), 1);
+        assert!(pinning.stale.is_empty());
+        assert_eq!(pinning.skipped.len(), 1);
+        assert_eq!(pinning.skipped[0].subject, bad_dir.to_str().unwrap());
+        assert!(
+            pinning.skipped[0]
+                .reason
+                .starts_with("manifest object unavailable"),
+            "{}",
+            pinning.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn two_good_manifest_objects_pin_together() {
+        // Healthy twin: full coverage unchanged when every object pins.
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::copy("/bin/sh", &first).unwrap();
+        std::fs::copy("/bin/sh", &second).unwrap();
+        let file = std::fs::File::open(&first).unwrap();
+        let inspected = inspect_file_with_reader_exporting(
+            &file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let key = object_key(mapping_file_key(&file).unwrap());
+        let second_file = std::fs::File::open(&second).unwrap();
+        let second_inspected = inspect_file_with_reader_exporting(
+            &second_file,
+            |file, bytes, offset| file.read_at(bytes, offset),
+            &standard_function_names(),
+        )
+        .unwrap();
+        let second_key = object_key(mapping_file_key(&second_file).unwrap());
+        let mut manifest = manifest_for(key);
+        manifest.schema = p11scope_manifest::manifest::SCHEMA.into();
+        manifest.module_path = first.to_str().unwrap().into();
+        manifest.objects[0].path = manifest.module_path.clone();
+        manifest.objects[0].identity = inspected.identity.clone();
+        manifest.provenance_objects[0].path = manifest.module_path.clone();
+        manifest.provenance_objects[0].device_major = key.device.major;
+        manifest.provenance_objects[0].device_minor = key.device.minor;
+        manifest.provenance_objects[0].inode = key.inode;
+        manifest.provenance_objects[0].identity = inspected.identity.clone();
+        manifest.objects.push(ObjectRecord {
+            id: 1,
+            path: second.to_str().unwrap().into(),
+            identity: second_inspected.identity.clone(),
+        });
+        manifest.provenance_objects.push(ProvenanceObject {
+            path: second.to_str().unwrap().into(),
+            device_major: second_key.device.major,
+            device_minor: second_key.device.minor,
+            inode: second_key.inode,
+            identity: second_inspected.identity.clone(),
+        });
+        manifest.surfaces[0].functions[0].resolution = Resolution::NullPointer;
+        assert!(validate_structure(&manifest).is_empty());
+        let pinning = pin_manifest_objects_deferred(&manifest).expect("two good objects pin");
+        assert!(pinning.stale.is_empty());
+        assert!(pinning.skipped.is_empty());
+        assert_eq!(pinning.pins.pinned().count(), 2);
+    }
+
+    #[test]
+    fn one_bad_prearm_path_keeps_the_good_pins() {
+        // Never-stop: one bad --prearm-module path must not abort the rest.
+        // RED: currently Err(Fatal), dropping the good pins.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::copy("/bin/sh", &good).unwrap();
+        let bad_dir = dir.path().join("bad-dir");
+        std::fs::create_dir(&bad_dir).unwrap();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let bad_path = bad_dir.clone();
+        let pinning = pin_prearm_objects_in_views_with_budget(
+            &[good.clone(), bad_dir],
+            &[],
+            None,
+            0,
+            0,
+            &mut budget,
+        )
+        .expect("one bad prearm path must not abort good pins");
+        assert_eq!(pinning.pins.pinned().count(), 1);
+        assert_eq!(pinning.inputs.len(), 1);
+        assert_eq!(pinning.skipped.len(), 1);
+        assert_eq!(pinning.skipped[0].subject, bad_path.to_string_lossy());
+        assert!(
+            pinning.skipped[0]
+                .reason
+                .starts_with("prearm object unavailable"),
+            "{}",
+            pinning.skipped[0].reason
+        );
+    }
+
+    #[test]
+    fn two_good_prearm_paths_pin_together() {
+        // Healthy twin: full coverage unchanged when every path pins.
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.so");
+        let second = dir.path().join("second.so");
+        std::fs::copy("/bin/sh", &first).unwrap();
+        std::fs::copy("/bin/sh", &second).unwrap();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let pinning =
+            pin_prearm_objects_in_views_with_budget(&[first, second], &[], None, 0, 0, &mut budget)
+                .expect("two good prearm paths pin");
+        assert_eq!(pinning.pins.pinned().count(), 2);
+        assert_eq!(pinning.inputs.len(), 2);
+        assert!(pinning.skipped.is_empty());
     }
 }

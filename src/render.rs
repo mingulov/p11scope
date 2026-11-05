@@ -1514,6 +1514,9 @@ const LOADER_CONTEXT_CAPACITY_EXHAUSTED: &str = "loader context capacity 256 is 
 const LOADER_SCAN_LEDGER_EXCEEDED: &str =
     "a deferred loader memory scan exceeded the bounded loader-context ledger";
 const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was full";
+const MANIFEST_OBJECT_UNAVAILABLE: &str = "manifest object unavailable";
+const PREARM_OBJECT_UNAVAILABLE: &str = "prearm object unavailable";
+const DISCOVERY_TRANSPORT_UNAVAILABLE: &str = "discovery transport unavailable";
 
 /// The engine's view-capacity sentence with its configured limit value
 /// still in place: exact prefix, ASCII digits, exact suffix, whole string
@@ -1607,6 +1610,14 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             .contains("no function table was found in its file-backed data")
     {
         TABLE_UNAVAILABLE
+    } else if s.reason.starts_with("manifest object unavailable") {
+        MANIFEST_OBJECT_UNAVAILABLE
+    } else if s.reason.starts_with("prearm object unavailable") {
+        PREARM_OBJECT_UNAVAILABLE
+    } else if s.reason.starts_with("discovery transport unavailable")
+        || (s.subject == "live discovery transport" && s.reason.contains("transport failure"))
+    {
+        DISCOVERY_TRANSPORT_UNAVAILABLE
     } else {
         DISCOVERY_UNAVAILABLE
     };
@@ -1659,6 +1670,38 @@ fn physical_gap_category_requires_exact_internal_subject_and_description() {
                     .contains("PRIVATE_")
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn never_stop_gaps_project_to_finite_reasons_without_paths() {
+    for (subject, reason, expected) in [
+        (
+            "/opt/secret/provider.so",
+            "manifest object unavailable: cannot open the file now (os error 13)",
+            "manifest object unavailable",
+        ),
+        (
+            "/opt/secret/prearm.so",
+            "prearm object unavailable: the pre-arm file locator no longer resolves",
+            "prearm object unavailable",
+        ),
+        (
+            "live discovery transport",
+            "discovery transport unavailable: dequeue failed after 2 records",
+            "discovery transport unavailable",
+        ),
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject");
+        assert_eq!(projected.reason, expected);
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("/opt/secret"), "{json}");
+        assert!(!json.contains("os error"), "{json}");
     }
 }
 

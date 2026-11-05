@@ -21,9 +21,8 @@ use crate::discovery::identity::test_fixture::{
     view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
-    ManifestPinError, ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object,
-    pin_manifest_objects, pin_manifest_objects_deferred, pin_scanned_objects,
-    reconcile_scanned_modules,
+    ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object, pin_manifest_objects,
+    pin_manifest_objects_deferred, pin_scanned_objects, reconcile_scanned_modules,
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
@@ -32579,16 +32578,23 @@ fn discovery_open_stale_manifest_object_uses_only_the_exact_scanned_replacement(
     assert_eq!(discovered.counters.uncorroborated, 1);
     assert_eq!(discovered.discovery.manifest_object_fallbacks.len(), 1);
 
-    let error = remove_stale_views(&mut discovered, &[stale_view])
-        .expect_err("fallback must be recomputed from the surviving pristine views");
+    // Never-stop: losing the replacement view gaps the stale object instead
+    // of aborting the rebuild.
+    remove_stale_views(&mut discovered, &[stale_view])
+        .expect("stale fallback loss gaps the object");
     assert!(
-        error.to_string().contains("stale manifest object"),
-        "{error:#}"
+        discovered.plan.slots.is_empty(),
+        "no replacement leaves nothing to attach: {:?}",
+        discovered.plan.slots
+    );
+    assert!(
+        !discovered.counters.object_skips.is_empty(),
+        "the lost replacement is a recorded gap"
     );
 }
 
 #[test]
-fn discovery_identity_stale_object_with_invalid_offset_is_fatal_before_fallback() {
+fn discovery_identity_stale_object_with_invalid_offset_is_skipped_before_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let provider = dir.path().join("provider.so");
     std::fs::copy("/bin/sh", &provider).unwrap();
@@ -32602,15 +32608,17 @@ fn discovery_identity_stale_object_with_invalid_offset_is_fatal_before_fallback(
         *file_offset = 0xdead_beef;
     }
     std::fs::copy("/bin/true", &provider).unwrap();
-    let error = pin_manifest_objects_deferred(&manifest)
-        .expect_err("invalid executable offsets stay fatal before stale fallback");
+    // Never-stop: invalid offsets gap the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred(&manifest)
+        .expect("invalid offsets gap the object before stale fallback");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(
-            &error,
-            ManifestPinError::Fatal(problems)
-                if problems.iter().any(|problem| problem.contains("outside every executable"))
-        ),
-        "{error:?}"
+        pinning.skipped[0]
+            .reason
+            .contains("outside every executable"),
+        "{:?}",
+        pinning.skipped
     );
 }
 
@@ -33058,7 +33066,7 @@ fn discovery_fallback_binding_rejects_a_proof_table_lost_during_reconciliation()
 }
 
 #[test]
-fn discovery_open_stale_sole_source_is_fatal_after_scan_availability_is_known() {
+fn discovery_open_stale_sole_source_is_gapped_after_scan_availability_is_known() {
     let dir = tempfile::tempdir().unwrap();
     let provider = dir.path().join("provider.so");
     std::fs::copy("/bin/sh", &provider).unwrap();
@@ -33068,10 +33076,12 @@ fn discovery_open_stale_sole_source_is_fatal_after_scan_availability_is_known() 
     let mut discovered = lifecycle_discovered(Vec::new());
     discovered.manifest_inputs.push(input);
 
-    let error = rebuild_discovered(&mut discovered).expect_err("no scan replacement is fatal");
+    // Never-stop: no scan replacement gaps the stale object, siblings continue.
+    rebuild_discovered(&mut discovered).expect("sole stale source gaps");
+    assert!(discovered.plan.slots.is_empty());
     assert!(
-        error.to_string().contains("stale manifest object"),
-        "{error:#}"
+        !discovered.counters.object_skips.is_empty(),
+        "the stale sole source is a recorded gap"
     );
 }
 
@@ -33113,9 +33123,13 @@ fn discovery_mixed_manifest_cannot_hide_a_stale_sole_source_object() {
     );
     discovered.manifest_inputs.push(input);
 
-    let error = rebuild_discovered(&mut discovered)
-        .expect_err("the second stale object has no scanned replacement");
-    assert!(error.to_string().contains("object 2"), "{error:#}");
+    // Never-stop: the sole object without a replacement gaps while the
+    // replaced object still falls back to its scanned table.
+    rebuild_discovered(&mut discovered).expect("sole stale gaps, replaced falls back");
+    assert!(
+        !discovered.counters.object_skips.is_empty(),
+        "the stale sole source is a recorded gap"
+    );
 }
 
 #[derive(Debug)]

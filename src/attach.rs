@@ -2135,6 +2135,9 @@ pub(crate) enum DetachQuarantine {
     /// A static slot whose detach failed; refuses only that slot index.
     Slot(u32),
     /// A dynamic hook whose detach failed; refuses only that identity.
+    /// The key omits program/ABI by design, so entry/return (and a loader
+    /// hook with an identical tuple) share it; over-refusal only,
+    /// fail-closed, never a double attach.
     Dynamic {
         context: u16,
         object: PinnedObjectId,
@@ -2262,6 +2265,77 @@ pub(crate) fn attachment_admission_for(
         }
         ProposedAttachment::Diagnostic => Ok(()),
     }
+}
+
+/// Quarantines attach units under one reason into owned collections (first
+/// reason per unit wins). Shared by the record path and the unattributed
+/// worker path; production `Session::quarantine_units` delegates here.
+fn quarantine_units_into(
+    quarantine: &mut BTreeSet<DetachQuarantine>,
+    reasons: &mut BTreeMap<DetachQuarantine, String>,
+    keys: Vec<DetachQuarantine>,
+    reason: &str,
+) {
+    for key in keys {
+        reasons
+            .entry(key.clone())
+            .or_insert_with(|| reason.to_string());
+        quarantine.insert(key);
+    }
+}
+
+/// Records one detach failure into owned quarantine collections: the message
+/// plus the quarantined units. Production `Session::record_detach_failure`
+/// delegates here; tests call this directly (no Session/BPF needed).
+fn record_detach_quarantine(
+    quarantine: &mut BTreeSet<DetachQuarantine>,
+    reasons: &mut BTreeMap<DetachQuarantine, String>,
+    failures: &mut Vec<String>,
+    keys: Vec<DetachQuarantine>,
+    message: String,
+) {
+    quarantine_units_into(quarantine, reasons, keys, &message);
+    failures.push(message);
+}
+
+/// Partitions proposed slot indices by quarantine: quarantined indices are
+/// returned separately for per-slot failure records while unrelated targets
+/// proceed; a global quarantine refuses the whole batch, as before.
+fn partition_slots(
+    quarantine: &BTreeSet<DetachQuarantine>,
+    reasons: &BTreeMap<DetachQuarantine, String>,
+    proposed: &[u32],
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    if proposed.is_empty() {
+        attachment_admission_for(quarantine, reasons, &ProposedAttachment::None)?;
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if quarantine.contains(&DetachQuarantine::Global) {
+        // Whole-batch, as before: reuse the exact global refusal.
+        return attachment_admission_for(
+            quarantine,
+            reasons,
+            &ProposedAttachment::Slots(proposed.to_vec()),
+        )
+        .map(|()| (Vec::new(), Vec::new()));
+    }
+    let mut admitted = Vec::new();
+    let mut quarantined = Vec::new();
+    for slot in proposed {
+        if quarantine.contains(&DetachQuarantine::Slot(*slot)) {
+            quarantined.push(*slot);
+        } else {
+            admitted.push(*slot);
+        }
+    }
+    Ok((admitted, quarantined))
+}
+
+/// Whether the quarantine stops all future attachment: only a global
+/// quarantine does (unattributed failures keep the session-wide refusal);
+/// per-target Slot/Dynamic quarantines admit unrelated targets.
+fn is_quarantine_stopped(quarantine: &BTreeSet<DetachQuarantine>) -> bool {
+    quarantine.contains(&DetachQuarantine::Global)
 }
 
 /// Refuse fresh attachment once the Session is stopping or detached: a
@@ -7841,7 +7915,7 @@ impl Session {
         self.stop_gate.stop_requested()
             || self.producer_detach.started()
             || self.producers_detached
-            || !self.detach_failures.is_empty()
+            || is_quarantine_stopped(&self.detach_quarantine)
             || self.pid_health.terminal()
             || self
                 .pid_lifecycle
@@ -8206,11 +8280,19 @@ impl Session {
         targets: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<()> {
-        self.admit_slots(&targets.iter().map(|slot| slot.index).collect::<Vec<_>>())?;
+        // Quarantined indices split out for per-slot failure records at
+        // attach; only admitted targets preflight here. A global quarantine
+        // refuses the whole batch, as before.
+        let (admitted, _) = partition_slots(
+            &self.detach_quarantine,
+            &self.quarantine_reasons,
+            &targets.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+        )?;
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!("a pinned provider object changed before live attachment");
         }
-        for target in targets {
+        let admitted: BTreeSet<u32> = admitted.into_iter().collect();
+        for target in targets.iter().filter(|slot| admitted.contains(&slot.index)) {
             objects
                 .attach_path_for(target.object)
                 .map_err(anyhow::Error::msg)?;
@@ -8569,34 +8651,39 @@ impl Session {
         }
         self.pid_pairs.retarget_gap(targets, objects);
         self.global_retirements.select(targets, objects);
-        if let Err(error) =
-            self.admit_slots(&targets.iter().map(|slot| slot.index).collect::<Vec<_>>())
-        {
-            // Quarantined indices fail per slot, with their reason, into
-            // the same attach-failures evidence ordinary attach failures
-            // use; a global quarantine refuses without per-slot records.
-            for slot in targets {
-                let key = DetachQuarantine::Slot(slot.index);
-                if self.detach_quarantine.contains(&key) {
-                    let reason = self
-                        .quarantine_reasons
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_else(|| "unknown detach failure".to_string());
-                    self.attach_failures.push((
-                        slot.index,
-                        format!(
-                            "slot {} quarantined after detach failure: {reason}",
-                            slot.index
-                        ),
-                    ));
-                }
-            }
-            return Err(error);
+        // Quarantined indices fail per slot, with their reason, into the
+        // same attach-failures evidence ordinary attach failures use, while
+        // unrelated targets proceed; a global quarantine refuses the whole
+        // batch, as before.
+        let (admitted, quarantined) = partition_slots(
+            &self.detach_quarantine,
+            &self.quarantine_reasons,
+            &targets.iter().map(|slot| slot.index).collect::<Vec<_>>(),
+        )?;
+        let mut quarantined_failed: Vec<u32> = Vec::new();
+        for index in &quarantined {
+            let key = DetachQuarantine::Slot(*index);
+            let reason = self
+                .quarantine_reasons
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| "unknown detach failure".to_string());
+            self.attach_failures.push((
+                *index,
+                format!("slot {index} quarantined after detach failure: {reason}"),
+            ));
+            quarantined_failed.push(*index);
         }
-        if targets.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+        if admitted.is_empty() {
+            return Ok((quarantined_failed, Vec::new()));
         }
+        let admitted_set: BTreeSet<u32> = admitted.into_iter().collect();
+        let admitted_targets: Vec<Slot> = targets
+            .iter()
+            .filter(|slot| admitted_set.contains(&slot.index))
+            .cloned()
+            .collect();
+        let targets: &[Slot] = &admitted_targets;
         let attach_targets: BTreeMap<_, _> = targets
             .iter()
             // By capture-local pinned ID only. There is deliberately no by-path
@@ -8803,7 +8890,8 @@ impl Session {
             pid_continuity::comparable_monotonic_ns,
         );
         self.successful_static.extend(successful);
-        let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
+        let mut failed: Vec<_> = quarantined_failed;
+        failed.extend(failures.iter().map(|(slot, _)| *slot));
         self.attach_failures.extend(failures);
         reexec_diagnostic::observe!(self, |diag| {
             let sides = self.current_static_sides();
@@ -10441,35 +10529,30 @@ impl Session {
     /// per unit wins, so a unit's refusal names the failure that
     /// quarantined it.
     fn quarantine_units(&mut self, keys: Vec<DetachQuarantine>, reason: &str) {
-        for key in keys {
-            self.quarantine_reasons
-                .entry(key.clone())
-                .or_insert_with(|| reason.to_string());
-            self.detach_quarantine.insert(key);
-        }
+        quarantine_units_into(
+            &mut self.detach_quarantine,
+            &mut self.quarantine_reasons,
+            keys,
+            reason,
+        );
     }
 
     /// Records one detach failure's message and quarantines its attach
     /// units under it.
     fn record_detach_failure(&mut self, keys: Vec<DetachQuarantine>, message: String) {
-        self.quarantine_units(keys, &message);
-        self.detach_failures.push(message);
+        record_detach_quarantine(
+            &mut self.detach_quarantine,
+            &mut self.quarantine_reasons,
+            &mut self.detach_failures,
+            keys,
+            message,
+        );
     }
 
     /// Records an unattributed detach failure (terminal transfer, worker
     /// drive): the message plus a global quarantine.
     fn record_global_detach_failure(&mut self, message: String) {
         self.record_detach_failure(vec![DetachQuarantine::Global], message);
-    }
-
-    /// Admits static slot indices against the detach quarantine.
-    fn admit_slots(&self, proposed: &[u32]) -> Result<()> {
-        let proposal = if proposed.is_empty() {
-            ProposedAttachment::None
-        } else {
-            ProposedAttachment::Slots(proposed.to_vec())
-        };
-        attachment_admission_for(&self.detach_quarantine, &self.quarantine_reasons, &proposal)
     }
 
     /// Admits one dynamic hook identity against the detach quarantine.
@@ -14571,6 +14654,309 @@ mod tests {
         .expect("hooks admit with no failures");
         attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Diagnostic)
             .expect("diagnostics admit with no failures");
+    }
+
+    /// A dummy aya uprobe link id for identity-projection tests. Never
+    /// attached or detached; only `DetachQuarantine::of_link` (which ignores
+    /// the id) reads these links.
+    /// SAFETY: `UProbeLinkId` (aya 0.14.0-p2) is a plain id value: nested
+    /// enums over `RawFd` integers, no `Drop`, no kernel ownership. All-zero
+    /// bytes select each enum's first variant (`One`/`FdLinkId`) with fd 0,
+    /// a valid (if meaningless) value that is safe to create, match, and
+    /// drop. These dummies never reach real attach/detach.
+    fn dummy_uprobe_link_id() -> UProbeLinkId {
+        unsafe { std::mem::MaybeUninit::<UProbeLinkId>::zeroed().assume_init() }
+    }
+
+    /// A dummy aya raw-tracepoint link id, same contract as
+    /// [`dummy_uprobe_link_id`]: `RawTracePointLinkId` wraps `FdLinkId`
+    /// (`RawFd`), so all-zero bytes are the valid id 0.
+    fn dummy_raw_link_id() -> RawTracePointLinkId {
+        unsafe { std::mem::MaybeUninit::<RawTracePointLinkId>::zeroed().assume_init() }
+    }
+
+    /// A dummy aya btf-tracepoint link id, same contract as
+    /// [`dummy_uprobe_link_id`]: `BtfTracePointLinkId` wraps `FdLinkId`
+    /// (`RawFd`), so all-zero bytes are the valid id 0.
+    fn dummy_btf_link_id() -> BtfTracePointLinkId {
+        unsafe { std::mem::MaybeUninit::<BtfTracePointLinkId>::zeroed().assume_init() }
+    }
+
+    #[test]
+    fn quarantine_of_link_maps_a_single_uprobe_to_its_slot() {
+        let link = RegisteredLink::UProbe {
+            program: "p11_return",
+            slot: 7,
+            id: dummy_uprobe_link_id(),
+            registration: None,
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&link),
+            vec![DetachQuarantine::Slot(7)]
+        );
+    }
+
+    #[test]
+    fn quarantine_of_link_maps_a_dynamic_hook_to_its_identity() {
+        let link = RegisteredLink::DynamicUProbe {
+            program: "function_list_entry",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: Some(HookAbi::FunctionList),
+            id: dummy_uprobe_link_id(),
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&link),
+            vec![DetachQuarantine::Dynamic {
+                context: 1,
+                object: PinnedObjectId(3),
+                file_offset: 0x1000,
+                cookie: 0x5555,
+            }]
+        );
+    }
+
+    #[test]
+    fn quarantine_of_link_shares_one_identity_across_loader_and_export_programs() {
+        // Entry/return and loader/export programs at the same hook tuple
+        // share one quarantine identity: the key omits program/ABI by
+        // design (fail-closed; see `DetachQuarantine::Dynamic`).
+        let loader = RegisteredLink::DynamicUProbe {
+            program: "dl_debug_state",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: None,
+            id: dummy_uprobe_link_id(),
+        };
+        let export = RegisteredLink::DynamicUProbe {
+            program: "function_list_return",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: Some(HookAbi::FunctionList),
+            id: dummy_uprobe_link_id(),
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&loader),
+            DetachQuarantine::of_link(&export)
+        );
+    }
+
+    #[test]
+    fn quarantine_of_link_maps_unattributed_links_globally() {
+        let diagnostic = RegisteredLink::DiagnosticUProbe {
+            program: "p11_entry",
+            id: dummy_uprobe_link_id(),
+        };
+        let raw = RegisteredLink::RawTracePoint {
+            program: "sched_process_exec",
+            id: dummy_raw_link_id(),
+        };
+        let btf = RegisteredLink::BtfTracePoint {
+            program: "task_newtask",
+            id: dummy_btf_link_id(),
+        };
+        for link in [&diagnostic, &raw, &btf] {
+            assert_eq!(
+                DetachQuarantine::of_link(link),
+                vec![DetachQuarantine::Global],
+                "unattributed links quarantine globally"
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_partition_splits_mixed_proposals() {
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Slot(7)].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            DetachQuarantine::Slot(7),
+            "detaching p11_return: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        // Mixed: the quarantined index splits out, unrelated proceed.
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[7, 8])
+            .expect("a mixed proposal partitions instead of refusing");
+        assert_eq!(admitted, vec![8]);
+        assert_eq!(quarantined, vec![7]);
+        // All quarantined: nothing admitted, all listed.
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[7])
+            .expect("an all-quarantined proposal partitions");
+        assert!(admitted.is_empty());
+        assert_eq!(quarantined, vec![7]);
+        // Empty and healthy proposals pass through.
+        let (admitted, quarantined) =
+            partition_slots(&quarantine, &reasons, &[]).expect("an empty proposal partitions");
+        assert!(admitted.is_empty() && quarantined.is_empty());
+        let (admitted, quarantined) =
+            partition_slots(&quarantine, &reasons, &[8, 9]).expect("a healthy proposal partitions");
+        assert_eq!(admitted, vec![8, 9]);
+        assert!(quarantined.is_empty());
+    }
+
+    #[test]
+    fn quarantine_partition_keeps_global_whole_batch() {
+        let quarantine: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Global].into_iter().collect();
+        let reasons: std::collections::BTreeMap<DetachQuarantine, String> = [(
+            DetachQuarantine::Global,
+            "closing selected native admission: link not found".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        // A global quarantine refuses every non-empty batch, as before.
+        assert!(
+            partition_slots(&quarantine, &reasons, &[7, 8]).is_err(),
+            "global stays whole-batch"
+        );
+        // An empty proposal still admits (idempotent no-op).
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[])
+            .expect("an empty proposal admits under global quarantine");
+        assert!(admitted.is_empty() && quarantined.is_empty());
+    }
+
+    #[test]
+    fn quarantine_record_then_partition_refuses_only_the_failed_slot() {
+        // Production wiring (no Session/BPF): the failed link's identity
+        // records through the shared record path, then the batch partitions.
+        let link = RegisteredLink::UProbe {
+            program: "p11_return",
+            slot: 7,
+            id: dummy_uprobe_link_id(),
+            registration: None,
+        };
+        let keys = DetachQuarantine::of_link(&link);
+        let mut quarantine = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            keys,
+            "detaching p11_return: link not found".to_string(),
+        );
+        assert_eq!(failures.len(), 1, "the failure message is kept");
+        let (admitted, quarantined) = partition_slots(&quarantine, &reasons, &[7, 8])
+            .expect("the mixed batch partitions around the failed slot");
+        assert_eq!(admitted, vec![8]);
+        assert_eq!(quarantined, vec![7]);
+        let refused =
+            attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+                .unwrap_err()
+                .to_string();
+        assert!(refused.contains("slot 7"), "{refused}");
+        assert!(refused.contains("detaching p11_return"), "{refused}");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![8]))
+            .expect("the unrelated slot admits");
+    }
+
+    #[test]
+    fn quarantine_record_then_admit_refuses_only_the_failed_dynamic_hook() {
+        let link = RegisteredLink::DynamicUProbe {
+            program: "dl_debug_state",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: None,
+            id: dummy_uprobe_link_id(),
+        };
+        let keys = DetachQuarantine::of_link(&link);
+        let mut quarantine = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            keys,
+            "detaching dl_debug_state: link not found".to_string(),
+        );
+        let same = ProposedAttachment::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+        };
+        let refused = attachment_admission_for(&quarantine, &reasons, &same)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("quarantined"), "{refused}");
+        assert!(refused.contains("detaching dl_debug_state"), "{refused}");
+        let other_cookie = ProposedAttachment::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5556,
+        };
+        attachment_admission_for(&quarantine, &reasons, &other_cookie)
+            .expect("an unrelated hook admits");
+        attachment_admission_for(&quarantine, &reasons, &ProposedAttachment::Slots(vec![7]))
+            .expect("slots admit beside a dynamic quarantine");
+    }
+
+    #[test]
+    fn quarantine_stop_flags_only_a_global_quarantine() {
+        let empty: std::collections::BTreeSet<DetachQuarantine> = std::collections::BTreeSet::new();
+        assert!(!is_quarantine_stopped(&empty), "empty never stops");
+        let slot: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Slot(7)].into_iter().collect();
+        assert!(
+            !is_quarantine_stopped(&slot),
+            "a per-slot quarantine admits unrelated targets"
+        );
+        let dynamic: std::collections::BTreeSet<DetachQuarantine> = [DetachQuarantine::Dynamic {
+            context: 1,
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+        }]
+        .into_iter()
+        .collect();
+        assert!(
+            !is_quarantine_stopped(&dynamic),
+            "a per-hook quarantine admits unrelated targets"
+        );
+        let global: std::collections::BTreeSet<DetachQuarantine> =
+            [DetachQuarantine::Global].into_iter().collect();
+        assert!(
+            is_quarantine_stopped(&global),
+            "a global quarantine keeps the session-wide refusal"
+        );
+    }
+
+    #[test]
+    fn quarantine_record_keeps_the_first_reason_per_unit() {
+        let mut quarantine = std::collections::BTreeSet::new();
+        let mut reasons = std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            vec![DetachQuarantine::Slot(7)],
+            "first failure".to_string(),
+        );
+        record_detach_quarantine(
+            &mut quarantine,
+            &mut reasons,
+            &mut failures,
+            vec![DetachQuarantine::Slot(7)],
+            "second failure".to_string(),
+        );
+        assert_eq!(failures.len(), 2, "every message is kept");
+        assert_eq!(
+            reasons.get(&DetachQuarantine::Slot(7)).map(String::as_str),
+            Some("first failure"),
+            "the first reason wins"
+        );
     }
 
     #[test]

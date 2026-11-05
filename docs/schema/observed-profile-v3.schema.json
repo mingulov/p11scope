@@ -454,7 +454,10 @@
                   "capture process-view capacity was exhausted; remaining generations were not scanned",
                   "loader context capacity 256 is exhausted",
                   "a deferred loader memory scan exceeded the bounded loader-context ledger",
-                  "the bounded loader-arm catch-up ledger was full"
+                  "the bounded loader-arm catch-up ledger was full",
+                  "manifest object unavailable",
+                  "prearm object unavailable",
+                  "discovery transport unavailable"
                 ]
               }
             }

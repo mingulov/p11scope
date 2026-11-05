@@ -656,6 +656,24 @@ The v3 profile evidence object and v3-metrics evidence object each have a
 closed exact key set. Unknown fields are rejected. Historical v2-metrics
 documents retain their old closed key set and do not contain the new counter.
 
+## Never-stop gap reasons
+
+`evidence.skipped[]` gains three finite reasons (in addition to the v2 list).
+Each record is `{name: "discovery subject", reason}` with `reason` exactly one
+of:
+
+- `manifest object unavailable`: one `--manifest` object could not be pinned
+  (unreadable, changed during hash, identity-mismatched with no scanned
+  replacement, out-of-segment offset, or over the shared byte budget). Good
+  sibling objects still pin; the capture continues and reads `PARTIAL`.
+- `prearm object unavailable`: one `--prearm-module` path could not be pinned.
+  Good sibling paths still pin; the capture continues and reads `PARTIAL`.
+- `discovery transport unavailable`: one live discovery-ring dequeue failed
+  after a prefix was already pulled. The prefix is applied, the failure is
+  counted here, and the capture continues to the next tick.
+
+Counts are array lengths; no path, PID, or error chain leaves diagnostics.
+
 ## Migration
 
 Consumers must migrate live profile dispatch from

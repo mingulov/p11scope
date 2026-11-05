@@ -1448,7 +1448,7 @@ fn proc_root_manifest_uses_its_exact_retained_process_view() {
 
 #[test]
 fn proc_root_manifest_rejects_ambiguous_spellings() {
-    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
 
     let d = tmpdir("manifest_pinning_proc_root_ambiguous");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1474,12 +1474,18 @@ fn proc_root_manifest_rejects_ambiguous_spellings() {
     for path in spellings {
         let mut manifest = base.clone();
         retarget_manifest(&mut manifest, path.clone());
-        let error = pin_manifest_objects_deferred_in_views(&manifest, std::slice::from_ref(&view))
-            .expect_err("ambiguous proc-root spelling must fail closed");
+        // Never-stop: an ambiguous spelling becomes a gap, not an abort.
+        let pinning =
+            pin_manifest_objects_deferred_in_views(&manifest, std::slice::from_ref(&view))
+                .expect("ambiguous spelling gaps the object");
+        assert_eq!(pinning.pins.pinned().count(), 0, "{path}");
+        assert_eq!(pinning.skipped.len(), 1, "{path}");
         assert!(
-            matches!(error, ManifestPinError::Fatal(ref errors)
-                if errors.iter().any(|error| error.contains("canonical /proc/<pid>/root"))),
-            "{path}: {error:?}"
+            pinning.skipped[0]
+                .reason
+                .contains("canonical /proc/<pid>/root"),
+            "{path}: {:?}",
+            pinning.skipped
         );
     }
 }
@@ -1525,7 +1531,7 @@ fn proc_root_prefix_alias_cannot_hide_an_erased_view_boundary() {
 
 #[test]
 fn proc_root_manifest_rejects_a_pid_not_in_the_retained_views() {
-    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
 
     let d = tmpdir("manifest_pinning_proc_root_wrong_view");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1538,20 +1544,25 @@ fn proc_root_manifest_rejects_a_pid_not_in_the_retained_views() {
     let manifest = manifest_for(&locator);
     let observer = ProcessView::open(ProcessViewId(19), std::process::id()).unwrap();
 
-    let error = pin_manifest_objects_deferred_in_views(&manifest, &[observer])
-        .expect_err("a different retained pid cannot authorize this locator");
+    // Never-stop: an unauthorized locator gaps the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[observer])
+        .expect("wrong-view locator gaps the object");
     child.kill().unwrap();
     child.wait().unwrap();
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("no exact retained process view"))),
-        "{error:?}"
+        pinning.skipped[0]
+            .reason
+            .contains("no exact retained process view"),
+        "{:?}",
+        pinning.skipped
     );
 }
 
 #[test]
 fn proc_root_manifest_rejects_a_stale_retained_process_view() {
-    use p11scope::discovery::identity::{ManifestPinError, pin_manifest_objects_deferred_in_views};
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views;
 
     let d = tmpdir("manifest_pinning_proc_root_stale_view");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1566,12 +1577,15 @@ fn proc_root_manifest_rejects_a_stale_retained_process_view() {
     child.kill().unwrap();
     child.wait().unwrap();
 
-    let error = pin_manifest_objects_deferred_in_views(&manifest, &[view])
-        .expect_err("a stale retained process generation must fail closed");
+    // Never-stop: a stale view gaps the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred_in_views(&manifest, &[view])
+        .expect("stale view gaps the object");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("exited"))),
-        "{error:?}"
+        pinning.skipped[0].reason.contains("exited"),
+        "{:?}",
+        pinning.skipped
     );
 }
 
@@ -1591,9 +1605,7 @@ fn ordinary_host_manifest_behavior_is_unchanged_with_retained_views() {
 
 #[test]
 fn ordinary_host_manifest_forwards_mountinfo_budget() {
-    use p11scope::discovery::identity::{
-        ManifestPinError, pin_manifest_objects_deferred_in_views_with_budget,
-    };
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views_with_budget;
 
     let d = tmpdir("manifest_pinning_host_mountinfo_budget");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1602,21 +1614,22 @@ fn ordinary_host_manifest_forwards_mountinfo_budget() {
         per_object_bytes: u64::MAX,
         total_bytes: 0,
     });
-    let error = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[], &mut budget)
-        .expect_err("observer mountinfo must share the exhausted capture budget");
+    // Never-stop: budget exhaustion gaps the object, siblings continue.
+    let pinning = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[], &mut budget)
+        .expect("exhausted budget gaps the object");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("attempted-I/O ceiling"))),
-        "{error:?}"
+        pinning.skipped[0].reason.contains("attempted-I/O ceiling"),
+        "{:?}",
+        pinning.skipped
     );
     assert_eq!(budget.attempted_io_bytes(), 0);
 }
 
 #[test]
 fn retained_view_manifest_forwards_mountinfo_budget() {
-    use p11scope::discovery::identity::{
-        ManifestPinError, pin_manifest_objects_deferred_in_views_with_budget,
-    };
+    use p11scope::discovery::identity::pin_manifest_objects_deferred_in_views_with_budget;
 
     let d = tmpdir("manifest_pinning_retained_mountinfo_budget");
     let so = cc_so(&d, "provider", "int f(void){return 1;}\n");
@@ -1628,18 +1641,22 @@ fn retained_view_manifest_forwards_mountinfo_budget() {
         per_object_bytes: u64::MAX,
         total_bytes: 0,
     });
-    let error = pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[view], &mut budget)
-        .expect_err("retained mountinfo must share the exhausted capture budget");
+    // Never-stop: budget exhaustion gaps the object, siblings continue.
+    let pinning =
+        pin_manifest_objects_deferred_in_views_with_budget(&manifest, &[view], &mut budget)
+            .expect("exhausted budget gaps the object");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
     assert!(
-        matches!(error, ManifestPinError::Fatal(ref errors)
-            if errors.iter().any(|error| error.contains("attempted-I/O ceiling"))),
-        "{error:?}"
+        pinning.skipped[0].reason.contains("attempted-I/O ceiling"),
+        "{:?}",
+        pinning.skipped
     );
     assert_eq!(budget.attempted_io_bytes(), 0);
 }
 
 #[test]
-fn a_missing_locator_is_stale_but_malformed_and_other_open_failures_are_fatal() {
+fn a_missing_locator_is_stale_but_malformed_is_invalid_and_other_open_failures_are_gapped() {
     use p11scope::discovery::identity::{
         ManifestPinError, ManifestStaleReason, pin_manifest_objects_deferred,
     };
@@ -1665,10 +1682,10 @@ fn a_missing_locator_is_stale_but_malformed_and_other_open_failures_are_fatal() 
     non_regular.module_path = directory.display().to_string();
     non_regular.objects[0].path = directory.display().to_string();
     non_regular.provenance_objects[0].path = directory.display().to_string();
-    assert!(matches!(
-        pin_manifest_objects_deferred(&non_regular),
-        Err(ManifestPinError::Fatal(_))
-    ));
+    // Never-stop: a non-regular object gaps, siblings continue.
+    let pinning = pin_manifest_objects_deferred(&non_regular).expect("non-regular object gaps");
+    assert_eq!(pinning.pins.pinned().count(), 0);
+    assert_eq!(pinning.skipped.len(), 1);
 }
 
 #[test]

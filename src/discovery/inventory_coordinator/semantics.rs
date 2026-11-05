@@ -273,7 +273,7 @@ impl SemanticInputs {
             let mut refusals = Vec::new();
             let mut budget = CaptureWorkBudget::default();
             for path in &self.paths {
-                let accepted = (|| -> Result<ManifestInput> {
+                let accepted = (|| -> Result<(ManifestInput, bool)> {
                     let manifest = read_manifest_file(path)?;
                     let pinning = pin_manifest_objects_deferred_in_views_with_prior(
                         &manifest,
@@ -283,15 +283,25 @@ impl SemanticInputs {
                         prior_bytes,
                     )
                     .map_err(|_| anyhow!("manifest pinning refused"))?;
-                    Ok(ManifestInput {
-                        path: path.clone(),
-                        manifest,
-                        pins: pinning.pins,
-                        stale: pinning.stale,
-                    })
+                    let skipped = !pinning.skipped.is_empty();
+                    Ok((
+                        ManifestInput {
+                            path: path.clone(),
+                            manifest,
+                            pins: pinning.pins,
+                            stale: pinning.stale,
+                        },
+                        skipped,
+                    ))
                 })();
                 match accepted {
-                    Ok(input) => inputs.push(input),
+                    // Never-stop: per-object skips keep the good pins and
+                    // record one manifest-input refusal for the bad objects.
+                    Ok((input, true)) => {
+                        inputs.push(input);
+                        refusals.push(SemanticRefusal::ManifestInput);
+                    }
+                    Ok((input, false)) => inputs.push(input),
                     Err(_) => refusals.push(SemanticRefusal::ManifestInput),
                 }
             }

@@ -6917,6 +6917,20 @@ fn discover_plan(
                 path.display()
             )
         })?;
+        // Never-stop: per-object pin failures become gaps, good pins continue.
+        // Structurally invalid and whole-budget refusals still bail above.
+        for skip in &pinning.skipped {
+            eprintln!(
+                "p11scope: discovery skipped {} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason)
+            );
+            attribution::note(skip);
+        }
+        discovered
+            .base_counters
+            .object_skips
+            .extend(pinning.skipped.clone());
         discovered.manifest_inputs.push(ManifestInput {
             path: path.clone(),
             manifest,
@@ -6958,6 +6972,20 @@ fn discover_plan(
             }
             anyhow!("--prearm-module inputs are not usable trusted inputs; refusing to attach")
         })?;
+        // Never-stop: per-path failures become gaps naming the bad path;
+        // good pins continue and the capture reads PARTIAL.
+        for skip in &pinning.skipped {
+            eprintln!(
+                "p11scope: discovery skipped {} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason)
+            );
+            attribution::note(skip);
+        }
+        discovered
+            .base_counters
+            .object_skips
+            .extend(pinning.skipped.clone());
         eprintln!(
             "p11scope: pre-armed {} provider file(s) before any mapping",
             pinning.inputs.len()
@@ -7063,12 +7091,9 @@ fn build_current_plan(
         }
     }
     counters.uncorroborated = uncorroborated_count(&plan, identity_mismatches, manifest_fallbacks);
-    if identity_mismatches + manifest_fallbacks > 0 && plan.slots.is_empty() {
-        bail!(
-            "{} stale --manifest input object(s) had no usable planned replacement, and no discovery source found a function table",
-            identity_mismatches + manifest_fallbacks
-        );
-    }
+    // Never-stop: an empty plan with stale inputs is a PARTIAL report with
+    // gaps (uncorroborated above, plus object_skips), not an abort. The
+    // capture still runs and reports what the scan proved (possibly nothing).
     // A named capture that a capacity refusal left with nothing to attach
     // has nothing to observe (an unpublished closure alone is not one, see
     // `refusal_error`). A shared-scope capture still starts: its refusals are published and
@@ -8104,17 +8129,31 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         let mut stale_candidates = Vec::new();
         let manifest_number = u32::try_from(manifest_index)
             .map_err(|_| anyhow!("too many --manifest inputs to identify fallback evidence"))?;
+        let mut manifest_skipped_without_replacement = false;
         for stale in &input.stale {
             let Some(candidate) =
                 scanned_replacement(&manifest, stale, &scan_modules, &pinned, manifest_pins)
             else {
-                counters.report_notes();
-                bail!(
-                    "stale manifest object {} from {} ({}) has no exact, complete scanned replacement table",
-                    stale.object,
-                    input.path.display(),
-                    stale.reason.label(),
+                // Never-stop: a stale object with no scanned replacement
+                // becomes a gap, not an abort. Siblings continue.
+                let skip = Skipped {
+                    subject: stale.path.clone(),
+                    reason: format!(
+                        "manifest object unavailable: stale manifest object {} ({}) has no scanned replacement",
+                        stale.object,
+                        stale.reason.label(),
+                    ),
+                };
+                eprintln!(
+                    "p11scope: discovery skipped {} — {}",
+                    crate::render::escape_controls(&skip.subject),
+                    crate::render::escape_controls(&skip.reason)
                 );
+                attribution::note(&skip);
+                counters.object_skips.push(skip);
+                stale_ids.insert(stale.object);
+                manifest_skipped_without_replacement = true;
+                continue;
             };
             if pending_fallbacks.len() >= crate::manifest_input::MAX_OBJECTS {
                 bail!(
@@ -8164,9 +8203,24 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
                 .map(|module| OutcomeOwner::Scan(ScanOutcomeLocator::module(module)))
                 .collect();
             if owners.is_empty() {
-                bail!(
-                    "stale manifest module had no exact scanned object instance to bind after reconciliation"
-                );
+                // Never-stop: a stale module with no bindable replacement
+                // becomes a gap (already recorded when the replacement was
+                // missing, or recorded here when reconciliation lost it).
+                if !manifest_skipped_without_replacement {
+                    let skip = Skipped {
+                        subject: input.path.display().to_string(),
+                        reason: "manifest object unavailable: stale manifest module has no bindable scanned replacement"
+                            .into(),
+                    };
+                    eprintln!(
+                        "p11scope: discovery skipped {} — {}",
+                        crate::render::escape_controls(&skip.subject),
+                        crate::render::escape_controls(&skip.reason)
+                    );
+                    attribution::note(&skip);
+                    counters.object_skips.push(skip);
+                }
+                continue;
             }
             pending_outcomes.push(PendingCorroboration {
                 owners,
@@ -8174,8 +8228,24 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
             });
             continue;
         }
-        if !stale_ids.is_empty() {
-            filter_manifest_fallbacks(&mut manifest, &stale_ids)?;
+        if !stale_ids.is_empty()
+            && let Err(error) = filter_manifest_fallbacks(&mut manifest, &stale_ids)
+        {
+            // Never-stop: filtering that would invalidate the manifest
+            // (e.g. every object stale without a replacement) skips this
+            // manifest with a gap instead of aborting siblings.
+            let skip = Skipped {
+                subject: input.path.display().to_string(),
+                reason: format!("manifest object unavailable: {error}"),
+            };
+            eprintln!(
+                "p11scope: discovery skipped {} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason)
+            );
+            attribution::note(&skip);
+            counters.object_skips.push(skip);
+            continue;
         }
         let view = scan_view(&manifest, &scan_modules, &pinned, manifest_pins);
         let scan_targets = view

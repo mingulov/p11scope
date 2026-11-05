@@ -480,6 +480,10 @@ struct ScriptedLane {
     /// post-last-pass coverage fixture): popped per service call, so the
     /// first service drains the head entry. Empty: no EXEC records.
     staged_execs: VecDeque<Vec<u32>>,
+    /// EXEC (pid, task ticket) pairs each discovery service returns, in
+    /// service order (the pid-reuse twin of the fixture above): popped
+    /// per service call. Empty: no ticketed EXEC records.
+    staged_ticketed_execs: VecDeque<Vec<(u32, u64)>>,
     /// The DISCOVERY ring-loss counter each read reports, in read order
     /// (the last one repeats; empty: 0).
     ring_loss: VecDeque<u64>,
@@ -539,6 +543,7 @@ impl ScriptedLane {
             service_stamps: Rc::default(),
             records_per_service: 0,
             staged_execs: VecDeque::new(),
+            staged_ticketed_execs: VecDeque::new(),
             ring_loss: VecDeque::new(),
             malformed: VecDeque::new(),
             failed_services: HashSet::new(),
@@ -660,6 +665,18 @@ impl CaptureLane<Pin> for ScriptedLane {
             record.pid_tgid = ((pid as u64) << 32) | (pid as u64);
             record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
             record.hook_ts_ns = self.stamps.next();
+            records.push(record);
+        }
+        // Staged ticketed EXEC hooks: same, with a scripted producer
+        // task ticket (within the identity limit), so pid reuse across
+        // the window carries distinct task identities.
+        for (pid, ticket) in self.staged_ticketed_execs.pop_front().unwrap_or_default() {
+            // SAFETY: as above.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = ((pid as u64) << 32) | (pid as u64);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            record.hook_ts_ns = self.stamps.next();
+            record.binding_id = ticket;
             records.push(record);
         }
         let mut batch = DiscoveryBatch::scripted(self.domain, records, self.stamps.next());
@@ -7721,6 +7738,76 @@ mod publication_progress_tests {
             assert!(
                 reason.contains("pids 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, and 2 more"),
                 "the list names ten and counts the rest, got: {reason}"
+            );
+        }
+
+        // Twin: the same pid hooking as two tasks (pid reuse: the first
+        // exits, the number is reused) counts twice — the producer task
+        // ticket, not the pid number, is the counted identity.
+        #[test]
+        fn post_pass_exec_reused_pid_counts_each_task() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_ticketed_execs.push_back(vec![(9, 101), (9, 102)]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("two post-pass tasks must mark unknown coverage");
+            assert!(
+                reason.starts_with("2 process(es)"),
+                "each reused task counts, got: {reason}"
+            );
+            assert!(
+                reason.contains("pids 9"),
+                "the gap names the reused pid, got: {reason}"
+            );
+        }
+
+        // Twin: the same pid hooking twice as one task (a re-exec keeps
+        // its task ticket) counts once — tickets dedupe re-execs while
+        // separating reuse.
+        #[test]
+        fn post_pass_exec_same_ticket_reexec_counts_once() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_ticketed_execs.push_back(vec![(9, 101), (9, 101)]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("a re-execing newcomer must mark unknown coverage");
+            assert!(
+                reason.starts_with("1 process(es)"),
+                "one task counts once, got: {reason}"
+            );
+            assert!(
+                reason.contains("pids 9"),
+                "the gap names the pid, got: {reason}"
             );
         }
 

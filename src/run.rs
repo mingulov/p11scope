@@ -4145,6 +4145,12 @@ fn run_owned_inner_with_host(
     if owned.still_running {
         emit_capture_diagnostic(&format_handoff_note(owned.pid));
     }
+    // A nonzero child status is named on stderr: the observer exits
+    // with it, and that exit must never be silent about whose status
+    // it is. A clean exit needs no line; a handed-back child has none.
+    if let Some(line) = child_exit_status_line(owned.exit_code) {
+        emit_capture_diagnostic(&line);
+    }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
         requested_timeout_kill: owned.requested_kill,
@@ -5256,6 +5262,16 @@ fn target_exit_cleanup_pending_line(tripped: bool) -> Option<String> {
     })
 }
 
+/// The owned child's nonzero status, named on stderr beside the
+/// capture's own diagnostics. `None` for a clean exit or a
+/// handed-back child, which need no line.
+fn child_exit_status_line(exit_code: Option<i32>) -> Option<String> {
+    match exit_code {
+        Some(code) if code != 0 => Some(format!("command exited with status {code}")),
+        _ => None,
+    }
+}
+
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
 pub(crate) const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
@@ -5635,7 +5651,7 @@ fn capture_profile(
         );
     }
     let cancellation = CaptureCancellation::default();
-    let live_display = LiveDisplay::for_stdout();
+    let live_display = LiveDisplay::for_capture(owned.is_some());
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
@@ -7790,10 +7806,13 @@ struct LiveDisplay {
 }
 
 impl LiveDisplay {
-    fn for_stdout() -> Self {
+    /// An owned run never clears: the child's own output shares the
+    /// terminal, so per-frame redraws are suppressed and the final
+    /// frame prints once, as plain text.
+    fn for_capture(owned: bool) -> Self {
         use std::io::IsTerminal as _;
         Self {
-            terminal: std::io::stdout().is_terminal(),
+            terminal: !owned && std::io::stdout().is_terminal(),
         }
     }
 
@@ -17577,6 +17596,41 @@ mod tests {
             )
         );
         assert_eq!(target_exit_cleanup_pending_line(false), None);
+    }
+
+    /// CLI text: an owned run never clears the screen — the child's own
+    /// output shares the terminal — so no per-frame redraws happen and
+    /// the final frame prints once, as plain text without escapes.
+    #[test]
+    fn owned_run_display_never_clears_and_prints_final_once() {
+        let frame = "p11scope — PID scope — up 00:00:01 — mode profile — /bin/false\n";
+        let owned = LiveDisplay::for_capture(true);
+        assert_eq!(owned.frame_bytes(frame, false), None);
+        assert_eq!(owned.frame_bytes(frame, true).as_deref(), Some(frame));
+        assert!(
+            !owned
+                .frame_bytes(frame, true)
+                .expect("final frame")
+                .contains('\x1b'),
+            "owned final frame must carry no escape"
+        );
+    }
+
+    /// CLI text: `run` names a nonzero child status on stderr, so a
+    /// nonzero observer exit is never silent about whose status it is.
+    /// A clean exit and a handed-back child stay silent.
+    #[test]
+    fn nonzero_child_status_renders_its_exit_line() {
+        assert_eq!(
+            child_exit_status_line(Some(1)).as_deref(),
+            Some("command exited with status 1")
+        );
+        assert_eq!(
+            child_exit_status_line(Some(127)).as_deref(),
+            Some("command exited with status 127")
+        );
+        assert_eq!(child_exit_status_line(Some(0)), None);
+        assert_eq!(child_exit_status_line(None), None);
     }
 
     /// The sink watches the same observation the loop polls: the first

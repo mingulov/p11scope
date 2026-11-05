@@ -1526,6 +1526,8 @@ fn sleep_interruptibly(total: Duration, worker: &CleanupWorker, second_signal: &
 /// returns `Interrupted`; the caller exits and the kernel finishes the
 /// remaining closes at exit. Sleeps are sliced so expiry is observed
 /// within ~10 ms even under the 1 s production cadence.
+/// Test handle: production drives through [`drive_cleanup_with_progress`].
+#[cfg(test)]
 pub(crate) fn drive_cleanup(
     worker: CleanupWorker,
     second_signal: impl Fn() -> bool,

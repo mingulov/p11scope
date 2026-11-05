@@ -387,7 +387,6 @@ struct TraceSlot {
     /// `plan::presented_label`: names, or `unknown#<ordinal>` when unnamed.
     label: String,
     semantics: p11scope_ebpf_common::SlotSemantics,
-    semantic_authorized: bool,
 }
 
 fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
@@ -400,7 +399,6 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
         slots[index] = Some(TraceSlot {
             label: plan.label_of(slot),
             semantics: plan.effective_semantics(slot),
-            semantic_authorized: slot.semantic_authorized,
         });
     }
     slots

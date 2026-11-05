@@ -2627,12 +2627,18 @@ mod tests {
 
     /// The global scan promise bounds its late edge: inventory
     /// rescans in passes, and a process that starts after its last
-    /// pass is reported, not scanned.
+    /// pass is reported, not scanned. The promise names its scopes:
+    /// cgroup coverage is transactional, not pass-based, so the
+    /// reported-not-scanned bound holds for system and pid scopes.
     #[test]
     fn global_help_bounds_late_process_scanning() {
         assert!(
             USAGE.contains("a process that starts after its last pass is reported, not scanned"),
             "{USAGE}"
+        );
+        assert!(
+            USAGE.contains("is reported, not scanned (system and pid scopes)"),
+            "the late-process bound must name the scopes it covers: {USAGE}"
         );
     }
 

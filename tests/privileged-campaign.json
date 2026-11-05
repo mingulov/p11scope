@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 215,
+  "default_floor": 216,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -216,6 +216,7 @@
     "attach::prearm_witness::tests::privileged_start_activates_on_host",
     "attach::prearm_witness::tests::privileged_finalize_clears_clean_start",
     "attach::prearm_witness::tests::privileged_finalize_settles_under_churn",
+    "output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker",
     "attach::tests::full_root_load_refusal_is_classified"
   ],
   "alternative_cells": [

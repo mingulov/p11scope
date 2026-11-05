@@ -686,6 +686,29 @@ fn uid_has_account(uid: u32) -> bool {
     status == 0 && !result.is_null()
 }
 
+/// Parses one `SUDO_*` identity value: all digits, non-empty, and a
+/// non-root id below `u32::MAX`. Anything else (unset, blank,
+/// non-numeric, root, `u32::MAX`) is not an invoker.
+fn parse_sudo_id(_value: &OsStr) -> Option<u32> {
+    // RED stub: implemented with the sudo-output handover.
+    None
+}
+
+/// Whether a newly created output file is handed to the sudo invoker
+/// (`fchown` on the open fd, mode stays `0600`): only as root, only
+/// when `SUDO_UID`/`SUDO_GID` name the validated invoker, and only
+/// when the output path's parent directory is owned by that user.
+/// Any missing condition hands nothing over. Never called for a
+/// pre-existing file, and never acts when not root.
+fn sudo_output_target(
+    _euid: u32,
+    _invoker: Option<(u32, u32)>,
+    _parent_owner: u32,
+) -> Option<(u32, u32)> {
+    // RED stub: implemented with the sudo-output handover.
+    None
+}
+
 /// Opens the trace target without truncating it, and says how its file
 /// reaches the name: the existing file first; for an absent name an
 /// unnamed `O_TMPFILE` file in the directory when `unnamed` and the
@@ -1567,6 +1590,184 @@ mod tests {
             }
         } else {
             drop(AtomicFile::create(&path).unwrap());
+        }
+    }
+
+    #[test]
+    fn sudo_output_target_hands_new_files_to_the_invoker_only_as_root_with_sudo_and_an_owned_parent()
+     {
+        // Healthy: root + a validated sudo pair + a parent the invoker owns.
+        assert_eq!(
+            sudo_output_target(0, Some((1000, 1000)), 1000),
+            Some((1000, 1000))
+        );
+        // Failure twins: any missing condition hands nothing over.
+        assert_eq!(sudo_output_target(1000, Some((1000, 1000)), 1000), None);
+        assert_eq!(sudo_output_target(0, None, 1000), None);
+        assert_eq!(sudo_output_target(0, Some((1000, 1000)), 0), None);
+        assert_eq!(sudo_output_target(0, Some((1000, 1000)), 1001), None);
+    }
+
+    #[test]
+    fn sudo_id_parsing_accepts_only_non_root_ids() {
+        assert_eq!(parse_sudo_id(OsStr::new("1000")), Some(1000));
+        for bad in [
+            "",
+            "0",
+            "4294967295",
+            "4294967296",
+            "abc",
+            "10x",
+            "-1",
+            " 1000",
+            "1000 ",
+        ] {
+            assert_eq!(
+                parse_sudo_id(OsStr::new(bad)),
+                None,
+                "{bad:?} must not parse"
+            );
+        }
+    }
+
+    /// Independent `SUDO_UID`/`SUDO_GID` reading for the privileged cell:
+    /// digits, non-root, and the pair names one existing account
+    /// (`getpwuid` uid has primary gid gid). Mirrors the product rule
+    /// without calling it, so the cell's expectation stays independent.
+    fn sudo_pair_from_environment() -> Option<(u32, u32)> {
+        let parse = |name: &str| {
+            let value = std::env::var_os(name)?;
+            let bytes = value.as_bytes();
+            if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let id: u32 = value.to_str()?.parse().ok()?;
+            if id == 0 || id == u32::MAX {
+                return None;
+            }
+            Some(id)
+        };
+        let uid = parse("SUDO_UID")?;
+        let gid = parse("SUDO_GID")?;
+        let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0; 16 * 1024];
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut account,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status != 0 || result.is_null() || account.pw_gid != gid {
+            return None;
+        }
+        Some((uid, gid))
+    }
+
+    #[test]
+    #[ignore = "privileged: sudo -o ownership cell (root via sudo; invoker-owned reports in an invoker-owned dir, root-owned elsewhere)"]
+    fn privileged_sudo_output_reports_are_owned_by_the_invoker() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let euid = unsafe { libc::geteuid() };
+        assert_eq!(
+            euid, 0,
+            "this cell must run as root (the privileged campaign runs it via sudo -n)"
+        );
+        let invoker = sudo_pair_from_environment();
+        if invoker.is_none() {
+            eprintln!("no valid SUDO_UID/SUDO_GID pair: asserting root-owned outputs only");
+        }
+
+        let dir = private_tempdir();
+        // Negative twin, always: a root-owned parent never hands files over.
+        let root_report = dir.path().join("root.json");
+        let mut report = AtomicFile::create(&root_report).unwrap();
+        std::io::Write::write_all(report.file(), b"{\"root\":true}").unwrap();
+        report.commit().unwrap();
+        let metadata = std::fs::metadata(&root_report).unwrap();
+        assert_eq!(
+            metadata.uid(),
+            0,
+            "a root-owned parent keeps root ownership"
+        );
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "a root-owned report stays private"
+        );
+
+        let Some((uid, gid)) = invoker else {
+            return;
+        };
+        // Positive: an invoker-owned parent hands every new sink file over.
+        let user_dir = dir.path().join("user");
+        std::fs::create_dir(&user_dir).unwrap();
+        std::fs::set_permissions(&user_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = CString::new(user_dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(path.as_ptr(), uid, gid) }, 0);
+
+        let assert_handed = |path: &Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            assert_eq!(metadata.uid(), uid, "{} owner", path.display());
+            assert_eq!(metadata.gid(), gid, "{} group", path.display());
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                0o600,
+                "{} mode",
+                path.display()
+            );
+        };
+
+        let report_path = user_dir.join("report.json");
+        let mut report = AtomicFile::create(&report_path).unwrap();
+        std::io::Write::write_all(report.file(), b"{\"ok\":true}").unwrap();
+        report.commit().unwrap();
+        assert_eq!(std::fs::read(&report_path).unwrap(), b"{\"ok\":true}");
+        assert_handed(&report_path);
+
+        let stream_path = user_dir.join("trace.log");
+        let mut stream = create_private_stream(&stream_path)
+            .unwrap()
+            .begin()
+            .unwrap();
+        std::io::Write::write_all(&mut stream, b"line\n").unwrap();
+        drop(stream);
+        assert_handed(&stream_path);
+
+        // Event-log sibling: create, rotate past max_files, evict. Every
+        // file is handed over, and eviction of handed-over rotations is
+        // accepted.
+        let events_path = user_dir.join("events.jsonl");
+        let mut writer =
+            crate::inventory_events::EventWriter::create(&events_path, 512, 2).unwrap();
+        for seq in 0..10u64 {
+            writer
+                .append("test", serde_json::json!({"seq": seq}), seq)
+                .unwrap();
+        }
+        assert!(
+            writer.rotations() >= 2,
+            "expected rotations, got {}",
+            writer.rotations()
+        );
+        assert!(
+            writer.evicted_events() > 0,
+            "expected a retention eviction to be accepted"
+        );
+        assert_handed(&events_path);
+        for entry in std::fs::read_dir(&user_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("events.jsonl.")
+            {
+                assert_handed(&entry.path());
+            }
         }
     }
 

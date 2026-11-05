@@ -531,6 +531,9 @@ attach::prearm_witness::tests::privileged_cgroup_id_matches_kernfs_id
 attach::prearm_witness::tests::privileged_start_activates_on_host
 attach::prearm_witness::tests::privileged_finalize_clears_clean_start
 attach::prearm_witness::tests::privileged_finalize_settles_under_churn
+# sudo -o ownership: reports created in an invoker-owned directory are
+# handed to SUDO_UID:SUDO_GID (0600); elsewhere they stay root-owned.
+output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the

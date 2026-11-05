@@ -1922,6 +1922,12 @@
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses",
       "reason": "root: loop overlay mounts drive the sweep-side witness cell",
       "cell": "privileged"
+    },
+    {
+      "file": "src/output.rs",
+      "path": "output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker",
+      "reason": "privileged: sudo -o ownership cell (root via sudo; invoker-owned reports in an invoker-owned dir, root-owned elsewhere)",
+      "cell": "privileged"
     }
   ]
 }

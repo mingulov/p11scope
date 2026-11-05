@@ -713,9 +713,13 @@ instance; per-caller call totals are unaffected. Finalizing and
 re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
 is also one instance.
 
-This version reports no key operations, so the `key operations:`
-line always reads `not reported by this version (planned for 0.6.0)`;
-mechanisms and API results are reported as before. An ordinary native-retirement
+Per-key tracking is opt-in: without `inventory --key-operations`
+(needs `--capture auto` or `native`) the `key operations:` line reads
+`not reported (per-key tracking is off)`; mechanisms and API results
+are reported as before. Rows need p11scope to see the process start,
+or the provider load, after capture begins, may lag their calls, and
+tracking may not start at all; plain counts are unaffected and a named
+gap says so. An ordinary native-retirement
 refusal during a `--manifest` capture ends the first stop with an incomplete
 report and a nonzero exit. Uncertain native ownership stays retained and
 replacement admission stays blocked; the refusal is not proof of clean detach.

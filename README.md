@@ -67,6 +67,11 @@ sudo p11scope inventory --system --duration 30s
 sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 ```
 
+Terminal text is concise by default — main results, one coverage line, and a
+hint. Add `-v` / `--verbose` for full detail (every gap and reason, evidence,
+timing) or `--quiet` for the summary head; `--json` and `-o` are always
+complete. See [output verbosity](docs/usage.md#text-output-concise-by-default--v-for-detail).
+
 Inventory holds up to 131,072 physical endpoint IDs with
 `--max-endpoints`; `inventory --system` on hosts with uprobe_multi defaults
 to 32,768. An endpoint is a provider object plus function

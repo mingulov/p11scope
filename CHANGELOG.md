@@ -111,6 +111,16 @@ User-facing limits live in
   32,768 endpoints on hosts with uprobe_multi, and `--max-endpoints`
   raises any inventory capture to 131,072. A host with several p11-kit
   copies (about 20,000 endpoints) is covered with no flag.
+- Terminal text is concise by default on every user-facing command
+  (`inspect`, `inventory`, `profile`, `run`): the main results, one
+  coverage status line, and a `run with -v for details` hint.
+  `-v` / `--verbose` shows the full detail (every gap and reason,
+  evidence, per-slot data, timing) plus informational stderr notes, and
+  `--quiet` prints only the summary head. `--json` and `-o` are always
+  complete. Default gap names are plain words; the machine names stay in
+  JSON, and in `-v` beside the plain words. Informational stderr notes
+  are suppressed by default; errors, actionable warnings, and the
+  one-line readiness/outcome signals stay.
 - Births under `--pid` are bound to the target's kernel start time, not
   the PID number, so a later process reusing the same PID gains no
   marker row or charge. Lifecycle records stay admitted by PID number by

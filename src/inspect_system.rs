@@ -3628,30 +3628,110 @@ pub(crate) struct ProbeDir {
 }
 
 impl ProbeDir {
-    /// A fresh unpredictable 0700 probe dir under the temp dir, named
-    /// `{prefix}-…`. The prefix is one plain segment: anything that could
-    /// escape the temp dir fails closed instead of joining.
+    /// A fresh unpredictable 0700 probe dir, named `{prefix}-…`, under
+    /// the first exec-capable root: the temp dir, else `/var/tmp`. The
+    /// probe child maps its fixtures `PROT_EXEC`, so a noexec root (a
+    /// kind node mounts /tmp noexec) is unusable; a root that fails to
+    /// create or to exec-map is dropped and the next is tried. The
+    /// prefix is one plain segment: anything that could escape the
+    /// root fails closed instead of joining.
     pub(crate) fn create(prefix: &str) -> Result<Self, IdentityUnavailable> {
         if prefix.is_empty() || prefix.contains('/') || prefix.contains('\0') {
             return Err(IdentityUnavailable::ProbeFailed);
         }
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Unpredictable as well as unique: a local squatter cannot
-        // precreate the probe path of a privileged run.
-        let seed = std::collections::hash_map::RandomState::new();
-        let random = {
-            use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
-            let mut hasher = seed.build_hasher();
-            std::process::id().hash(&mut hasher);
-            id.hash(&mut hasher);
-            hasher.finish()
+        let temp = std::env::temp_dir();
+        let fallback = std::path::PathBuf::from("/var/tmp");
+        let mut roots = vec![temp];
+        if roots[0] != fallback {
+            roots.push(fallback);
+        }
+        for (nth, root) in roots.iter().enumerate() {
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Unpredictable as well as unique: a local squatter cannot
+            // precreate the probe path of a privileged run.
+            let seed = std::collections::hash_map::RandomState::new();
+            let random = {
+                use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+                let mut hasher = seed.build_hasher();
+                std::process::id().hash(&mut hasher);
+                id.hash(&mut hasher);
+                hasher.finish()
+            };
+            let path = root.join(format!(
+                "{prefix}-{pid}-{id}-{random:016x}",
+                pid = std::process::id()
+            ));
+            let dir = match Self::create_at(&path) {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+            if dir.supports_exec_map() {
+                if nth > 0 {
+                    eprintln!(
+                        "p11scope: probe dir fell back to {} ({} is not exec-capable)",
+                        root.display(),
+                        roots[0].display(),
+                    );
+                }
+                return Ok(dir);
+            }
+            // Not exec-capable: dropping removes the empty just-created
+            // dir (the check unlinked its test file first), then the
+            // next root is tried.
+        }
+        Err(IdentityUnavailable::ProbeFailed)
+    }
+
+    /// Whether a fresh file in this dir maps `PROT_EXEC` (the probe
+    /// child's fixture shape). False on any failure; the test file is
+    /// unlinked on every path so the dir stays empty for `Drop`.
+    fn supports_exec_map(&self) -> bool {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let name = c"probe-exec-check";
+        // SAFETY: `openat` under the held verified directory fd;
+        // `O_EXCL` fails on any pre-existing name instead of opening it.
+        let raw = unsafe {
+            libc::openat(
+                self.dirfd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
         };
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{id}-{random:016x}",
-            std::process::id()
-        ));
-        Self::create_at(&path)
+        if raw < 0 {
+            return false;
+        }
+        // SAFETY: the successful `openat` returned a new owned fd.
+        let file = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `ftruncate` on a live fd with a plain length.
+        let mut ok = unsafe { libc::ftruncate(file.as_raw_fd(), 4096) } == 0;
+        if ok {
+            // SAFETY: private executable mapping of the 4096-byte file
+            // just created; unmapped below.
+            let addr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            ok = addr != libc::MAP_FAILED;
+            if ok {
+                // SAFETY: the successful `mmap` above returned this range.
+                ok = unsafe { libc::munmap(addr, 4096) } == 0;
+            }
+        }
+        drop(file);
+        // SAFETY: `unlinkat` of the static name on the live held dirfd;
+        // flags 0 never unlinks directories.
+        unsafe {
+            libc::unlinkat(self.dirfd.as_raw_fd(), name.as_ptr(), 0);
+        }
+        ok
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {

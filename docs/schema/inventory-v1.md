@@ -207,7 +207,7 @@ non-null values needs a new allowlist row.
   `{from, to, at_ns}` in order (`[]` while the first verdict stands, at
   most two entries), and each rise is also a `module admission changed`
   gap. The verdict is judged against the Inventory
-  endpoint budget (`--max-endpoints`, default 4096, range 1..=8192), not the 512-slot detailed ceiling
+  endpoint budget (`--max-endpoints`, default 32768, range 1..=131072), not the 512-slot detailed ceiling
   `inspect --system` reports, so the two can disagree either way: an
   object `inspect` refuses can read `admitted` here, and one it admits
   can read `refused` here. Each pass lowers under that budget. An
@@ -688,7 +688,7 @@ non-null values needs a new allowlist row.
   endpoint counts), `inventory_endpoints` (additive within v1:
   `{limit, occupied}` — the run's Inventory attach set, whose
   capture-lifetime endpoint budget the admission verdicts are judged
-  against (`--max-endpoints`, default 4096), and the endpoints it holds;
+  against (`--max-endpoints`, default 32768), and the endpoints it holds;
   the limit is separate from the summed per-module endpoint census.
   IDs are never reused, so
   occupancy only grows, and its refusals are the

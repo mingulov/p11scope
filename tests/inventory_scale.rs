@@ -223,7 +223,7 @@ fn invalid_inventory_endpoint_budget_precedes_every_sink() {
     let events = dir.join("events.jsonl");
     let diagnostics = dir.join("diagnostics");
     let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
-        .args(["inventory", "--system", "--max-endpoints", "8193"])
+        .args(["inventory", "--system", "--max-endpoints", "131073"])
         .arg("-o")
         .arg(&report)
         .arg("--event-log")
@@ -235,7 +235,7 @@ fn invalid_inventory_endpoint_budget_precedes_every_sink() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("--max-endpoints") && stderr.contains("1..=8192"),
+        stderr.contains("--max-endpoints") && stderr.contains("1..=131072"),
         "a policy error names the selected endpoint range: {stderr}"
     );
     assert!(output.stdout.is_empty());

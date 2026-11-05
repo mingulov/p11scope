@@ -109,6 +109,20 @@ integration may still move them; the candidate pass confirms the numbers.
   a cgroup scope) and then launching the application also works; no
   restart is needed either way. Call counts, mechanisms and the rest
   of the inventory still work in every case.
+- Inventory accepts `--max-endpoints` from 1 through 131072, with a
+  32768 default, so a host with several p11-kit copies (about 20K
+  endpoints) is covered by `inventory --system` with no flag. This is
+  a finite, capture-lifetime physical endpoint budget; unloading does
+  not refund IDs. The values are measured on uprobe_multi hosts (the
+  only hosts where live capture runs): the endpoint maps cost 8 bytes
+  per endpoint of payload, attach costs about 256 bytes of kernel
+  memory per attached endpoint, and per-hit cost does not grow with
+  the endpoint count. Detailed per-call capture keeps its separate
+  512-slot budget (2112 in the wide build) and counter modes keep
+  their 8192 planner ceiling, because their per-CPU maps scale with
+  slot count times CPU count and are not equally cheap to raise.
+  Caller-pair, discovery-owner and work limits stay separate, and
+  selecting a larger endpoint budget does not increase them.
 
 Under a saturating multi-threaded flood (twelve threads spinning PKCS#11
 calls for 5 s, about 190,000 calls/s), the userspace drain can lose ring

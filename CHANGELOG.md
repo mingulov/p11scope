@@ -134,6 +134,12 @@ User-facing limits live in
   real provider that still does not fit is admitted on the leading
   prefix that fits, with a named partial gap, and refused whole only
   when not even its strongest table fits.
+- Inventory's endpoint budget rises to a 32768 default and a 131072
+  maximum (`--max-endpoints`, 1..=131072), so a host with several
+  p11-kit copies (about 20K endpoints) is covered by
+  `inventory --system` with no flag. The raise is measured on
+  uprobe_multi hosts; Detailed's 512-slot budget and the counter
+  modes' 8192 planner ceiling are unchanged.
 - A discovery pass that cannot yet scan a caller (usually one with no
   observed call yet) now reports a `semantic admission deferred` note
   instead of a refusal: tracking starts at a later pass and waiting

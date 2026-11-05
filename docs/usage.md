@@ -1229,7 +1229,7 @@ Limits that matter in pods:
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in
   `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
-  selects the capture-lifetime physical endpoint budget (up to 131,072;
+  selects the capture-lifetime physical endpoint budget (1..=131072;
   `inventory --system` on hosts with uprobe_multi defaults to 32,768),
   before output files or native maps are opened. The same
   limit applies to scan, native and auto fallback, including the dashboard.
@@ -1239,7 +1239,8 @@ Limits that matter in pods:
   reports this physical limit; `budgets.endpoints` is the separate summed
   per-module census limit. Pair and discovery-work limits stay independent.
   The 131,072 ceiling rests on attach/detach and per-endpoint memory
-  measurements; the freeze campaign confirms the system-scale cells at the
+  measurements on uprobe_multi hosts (the only hosts where live capture
+  runs); the freeze campaign confirms the system-scale cells at the
   new budget, and never ships below 8,192; see
   [known limitations](known-limitations.md).
   A target no scan inventoried is a

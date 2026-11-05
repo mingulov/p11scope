@@ -190,7 +190,7 @@ pub struct InventoryArgs {
     pub max_scan_pids: Option<usize>,
     /// `--max-gaps`: retained gap history bound; None ⇒ 1024 default.
     pub max_gaps: Option<usize>,
-    /// `--max-endpoints`: capture-lifetime physical endpoint IDs; None ⇒ 4096.
+    /// `--max-endpoints`: capture-lifetime physical endpoint IDs; None ⇒ 32768.
     pub max_endpoints: Option<u64>,
     /// `--duration`: keep observing (rescanning) until the deadline;
     /// None ⇒ a single snapshot pass (or, with `--dashboard`, until quit).
@@ -633,7 +633,7 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 In this version it adds per-key operation rows once tracking starts; mechanisms and API results are reported with or without it.
 Subset preparation preserves broad physical counting; positive instance delivery awaits runtime activation.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
---max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
+--max-endpoints selects capture-lifetime physical endpoint IDs: 1..=131072, default 32768; unloading does not refund IDs.
 --capture scan disables usage BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
 System inventory selects its identity backend separately; --identity-backend auto may load identity BPF even with --capture scan.
 For system inventory that loads no BPF, use: p11scope inventory --system --capture scan --identity-backend userspace
@@ -2468,12 +2468,12 @@ mod tests {
 
     #[test]
     fn inventory_endpoint_policy_refuses_invalid_and_duplicate_values() {
-        for value in ["0", "8193", "4294967296", "18446744073709551615"] {
+        for value in ["0", "131073", "4294967296", "18446744073709551615"] {
             assert!(
                 matches!(
                     parse(args(&["inventory", "--system", "--max-endpoints", value])),
                     Err(CliError::Usage { message, .. })
-                        if message.contains("--max-endpoints") && message.contains("1..=8192")
+                        if message.contains("--max-endpoints") && message.contains("1..=131072")
                 ),
                 "out-of-policy endpoint budget {value} names the accepted range"
             );
@@ -2509,25 +2509,19 @@ mod tests {
             Err(CliError::Usage { message, .. }) if message.contains("--max-endpoints")
         ));
         assert!(INVENTORY_HELP.contains("[--max-endpoints <n>]"));
-        assert!(INVENTORY_HELP.contains("1..=8192") && INVENTORY_HELP.contains("4096"));
+        assert!(INVENTORY_HELP.contains("1..=131072") && INVENTORY_HELP.contains("32768"));
     }
 
     #[test]
     fn inventory_endpoint_policy_admits_the_raised_ceiling() {
         for endpoints in [20_000_u64, 32_768, 131_072] {
             let value = endpoints.to_string();
-            let parsed = parse(args(&[
-                "inventory",
-                "--system",
-                "--max-endpoints",
-                &value,
-            ]));
+            let parsed = parse(args(&["inventory", "--system", "--max-endpoints", &value]));
             let Ok(Command::Inventory(parsed)) = parsed else {
                 panic!("raised endpoint budget {endpoints}: {parsed:?}");
             };
             assert_eq!(parsed.max_endpoints, Some(endpoints));
-            let budget =
-                crate::capacity::inventory_endpoint_budget(parsed.max_endpoints).unwrap();
+            let budget = crate::capacity::inventory_endpoint_budget(parsed.max_endpoints).unwrap();
             assert_eq!(budget.endpoint_limit(), endpoints);
         }
         assert!(matches!(

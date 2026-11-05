@@ -28,22 +28,26 @@ Phase 1 report for the full matrix.
 
 ## Route A: attach what was actually returned
 
-Attach only the function tables that standard
-`C_GetFunctionList` / `C_GetInterface` / `C_GetInterfaceList` calls
-actually return to the application. The observer already lowers every
-live return of those exports (`process_export_record`, heap wrappers
-included). Route A makes that the *only* way a forwarding layer's tables
-attach in Detailed captures:
+Attach only the function tables with publication evidence: a live
+return of a standard `C_GetFunctionList` / `C_GetInterface` /
+`C_GetInterfaceList` call to the application, interface linkage, a
+manifest, or export agreement (the established
+`table_observation_authorized` meaning). The observer already lowers
+every live return of those exports (`process_export_record`, heap
+wrappers included). Route A makes publication evidence the *only* way a
+forwarding layer's tables attach in Detailed captures:
 
 1. Scan still discovers every provider file and attaches each real
    provider's own scanned table as today (route B). A forwarding layer
    is any object whose unresolved lookalike count exceeds
    `MAX_TABLES_PER_OBJECT` (today's generic `ClosureArray` class) — no
    names, no layouts.
-2. The layer's own tables attach only when a live return publishes
-   them: the exact table address the application received, decoded at
-   that address, attached once per distinct table. Tables never
-   returned never attach and never consume slots.
+2. The layer's own tables attach only with publication evidence: a
+   live return publishes the exact table address the application
+   received, decoded at that address, attached once per distinct
+   table; interface linkage, a manifest, or export agreement
+   authorizes the same way. Tables with no publication evidence
+   never attach and never consume slots.
 3. Late-start (tables obtained before the capture began, the
    `--system` / `--pid` path): attach only the published-table sets
    that live tables in each process actually reference, found by

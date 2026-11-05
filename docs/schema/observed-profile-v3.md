@@ -46,7 +46,10 @@ object. Its exact keys are `mode`, `generation`, `read_window`, `status`,
 `health`, `discontinuity`, and `failure`, plus an optional additive
 `bank_gaps` object (`failed_slots` count with `health_failed`/`kernel_failed`
 flags) that appears only when one bank's cells or evidence reads failed.
-Exact counter reads omit `bank_gaps`. This is a v3-additive disclosure
+Exact counter reads omit `bank_gaps`. A gap read publishes the last good
+snapshot as stale with the gap counts; only the first read of a generation
+publishes its current rows, with zeros as unknown for the failed slots.
+This is a v3-additive disclosure
 that introduces no new schema revision. Mode and positive generation identify
 the accepted native read. `read_window` is either the measured monotonic
 `{started_ns, finished_ns}` interval or null when that interval is unavailable;

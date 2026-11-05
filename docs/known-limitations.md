@@ -132,8 +132,11 @@ past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
 saturation is reported in the collection health. One bank's unreadable cell
 gaps only its slots with a `bank_gaps` count, and a health or kernel read
-failure degrades the evidence without voiding the folded rows; the readable
-banks stay exact and the report reads PARTIAL. A legacy aggregate read
+failure degrades the evidence with a named flag. A gap read publishes the
+last good values (stale) until the next exact read telescopes, except the
+first read of a generation, which publishes its current rows with zeros as
+unknown for the failed slots; either way the report reads PARTIAL.
+A legacy aggregate read
 that cannot read one slot's counters reports zero for that slot as unknown
 with a `legacy_collection` gap, and one unread kernel-evidence cell reads 0
 as unknown with its name; the rest stays exact and the report reads PARTIAL.

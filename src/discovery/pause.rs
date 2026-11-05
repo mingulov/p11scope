@@ -10241,6 +10241,8 @@ mod tests {
     ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
         let args = crate::cli::RunArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: Vec::new(),
             exclude_modules: vec![],

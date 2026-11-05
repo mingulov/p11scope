@@ -242,8 +242,13 @@ fn the_final_sweep_makes_the_replayed_edges_equal_the_snapshot() {
         assert_eq!(without_states(&replayed[&key]), *edge, "{key:?}");
     }
     // The derived states equal the presentation's (the third consumer, the
-    // pager text, renders them from the same view).
-    let text = String::from_utf8(text).unwrap();
+    // pager text, renders them from the same view). Full detail: the
+    // per-edge lines are verbose-only since CLI-1.
+    let _ = String::from_utf8(text).unwrap();
+    let text = crate::inventory_present::render_snapshot_with_verbosity(
+        &last,
+        crate::cli::TextVerbosity::Verbose,
+    );
     for edge in &last.edges {
         let event = &replayed[&(edge.caller.label(), edge.module.label())];
         assert_eq!(event["presence"], edge.presence.label());

@@ -46,6 +46,29 @@ fn print_stdout(text: std::fmt::Arguments<'_>) -> Result<i32> {
     }
 }
 
+/// RAII guard arming the run-scoped text verbosity for one command, so
+/// the deep run wrappers need no new display parameter. Restored on
+/// drop; `--json` and `-o` never consult it.
+struct VerbosityGuard {
+    previous: cli::TextVerbosity,
+}
+
+impl VerbosityGuard {
+    fn arm(verbose: bool, quiet: bool) -> Self {
+        let level = cli::TextVerbosity::resolve(verbose, quiet)
+            .expect("parse refuses --quiet beside --verbose");
+        Self {
+            previous: cli::set_text_verbosity(level),
+        }
+    }
+}
+
+impl Drop for VerbosityGuard {
+    fn drop(&mut self) {
+        cli::set_text_verbosity(self.previous);
+    }
+}
+
 fn run() -> Result<i32> {
     // Before any handler installs: the owned command inherits exactly the
     // dispositions captured here for every signal the observer changes.
@@ -58,6 +81,7 @@ fn run() -> Result<i32> {
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
         Ok(Command::Profile(a) | Command::Trace(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
@@ -76,6 +100,7 @@ fn run() -> Result<i32> {
         // by a requested `--kill-on-timeout` kill, is a success for the
         // observer, so it exits 0.
         Ok(Command::Run(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
@@ -93,6 +118,7 @@ fn run() -> Result<i32> {
         // not be read at all": one line here, exit 1, never a panic. A
         // fully-unreadable machine fails the same way under `--system`.
         Ok(Command::Inspect(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
                 let _ = p11scope::try_stderr_line(&format!(
                     "{message}\n{}",
@@ -120,6 +146,7 @@ fn run() -> Result<i32> {
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))

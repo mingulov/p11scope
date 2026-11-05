@@ -226,7 +226,7 @@ fn key_ops_line_unavailable_names_reason() {
         .expect("coverage line");
     assert_eq!(
         lines[coverage + 1],
-        "key operations: unavailable (bootstrap_unavailable)",
+        "key operations: not available — per-key tracking never started, so no key can be named yet",
         "the unavailable line sits directly after coverage:\n{snapshot}"
     );
     assert_eq!(
@@ -337,7 +337,7 @@ fn key_ops_line_stale_shows_reason() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: rev 9 stale (publication_budget_exhausted); \
+        "key operations: rev 9 stale (key publication hit its budget; plain counts are unaffected); \
          0 sessions, 0 objects; no key operations observed",
         "stale names its reason:\n{snapshot}"
     );
@@ -605,5 +605,85 @@ fn presentation_with_registered_instance_and_no_calls_names_bootstrap_gap() {
             .iter()
             .any(|gap| gap.reason == "joint_birth_unoffered"),
         "a registered instance with no calls is still owed a name"
+    );
+}
+
+/// CLI-1/KEY-2: an unavailable key-operations section names its reason
+/// in plain words; verbose pairs the machine reason beside it.
+#[test]
+fn unavailable_key_operations_name_plain_reason_with_machine_code() {
+    for (reason, plain) in [
+        (
+            "bootstrap_unavailable",
+            "per-key tracking never started, so no key can be named yet",
+        ),
+        (
+            "authority_lost",
+            "per-key tracking stopped; plain counts are unaffected",
+        ),
+        (
+            "row_budget_exhausted",
+            "per-key rows hit their budget; plain counts are unaffected",
+        ),
+    ] {
+        let presentation = key_ops_presentation(ObjectObservations::unavailable(3, reason));
+        let concise =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains(&format!("key operations: not available — {plain}")),
+            "{reason}: {concise}"
+        );
+        assert!(!concise.contains(reason), "{reason} leaked: {concise}");
+        let verbose =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains(plain), "{reason}: {verbose}");
+        assert!(
+            verbose.contains(&format!("(reason: {reason})")),
+            "{reason}: {verbose}"
+        );
+    }
+}
+
+/// CLI-1/KEY-3: the Joint birth gap renders in plain words with the
+/// machine subject and reason beside it.
+#[test]
+fn joint_birth_gap_renders_plain_words_with_machine_reason() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "Joint key operations unavailable; retained S1".into(),
+        reason: "joint_birth_unoffered".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+        reason: "joint_birth_unoffered".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("Per-key tracking did not start for this process"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains("no key session was offered to track"),
+        "{verbose}"
+    );
+    assert!(verbose.contains("(joint_birth_unoffered)"), "{verbose}");
+    assert!(
+        verbose.contains("(Joint key operations unavailable; retained S1)"),
+        "{verbose}"
+    );
+    assert!(
+        verbose.contains("(Joint birth unavailable; retained S1)"),
+        "{verbose}"
     );
 }

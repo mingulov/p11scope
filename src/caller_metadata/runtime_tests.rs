@@ -317,7 +317,13 @@ fn immutable_frame_projection_agrees_across_json_identity_text_and_stream() {
         view.caller_metadata.metadata(observed.id).unwrap(),
         view.ended_ns,
     );
-    assert!(crate::inventory_present::render_snapshot(&view).contains(&detail));
+    assert!(
+        crate::inventory_present::render_snapshot_with_verbosity(
+            &view,
+            crate::cli::TextVerbosity::Verbose
+        )
+        .contains(&detail)
+    );
 
     let file = tempfile::tempfile().unwrap();
     let mut reader = file.try_clone().unwrap();

@@ -1056,6 +1056,8 @@ fn system_sweep_releases_its_pins() {
         .count();
     let args = crate::cli::CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -1365,7 +1367,14 @@ fn separate_budgets_refuse_by_name_without_erasing_evidence() {
     assert_eq!(gap["budget"]["limit"], 4);
     assert_eq!(gap["budget"]["requested"], 5);
     // The text summary carries the refusal too.
-    let text = crate::inventory::render_text(callers.coordinator(), "workload", 0, now, 2);
+    let text = crate::inventory::render_text_with_verbosity(
+        callers.coordinator(),
+        "workload",
+        0,
+        now,
+        2,
+        crate::cli::TextVerbosity::Verbose,
+    );
     assert!(
         text.contains("(budget callers: limit 4, requested 5)"),
         "text refusal names resource, limit, requested:\n{text}"
@@ -2377,9 +2386,16 @@ fn retention_overflow_marks_eviction_never_silent_completeness() {
     assert_eq!(document["budgets"]["retained_history"]["retained"], 1024,);
     assert_eq!(document["budgets"]["retained_history"]["suppressed"], 476,);
     assert_settled(&document, 476);
-    let text = crate::inventory::render_text(harness.coordinator(), "workload", 0, now, 2);
+    let text = crate::inventory::render_text_with_verbosity(
+        harness.coordinator(),
+        "workload",
+        0,
+        now,
+        2,
+        crate::cli::TextVerbosity::Verbose,
+    );
     assert!(
-        text.contains("gaps suppressed: 476"),
+        text.contains("more gaps not shown: 476"),
         "the text summary marks the eviction:\n{text}"
     );
     // No silent completeness claim: no key anywhere names completeness.

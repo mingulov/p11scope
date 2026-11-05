@@ -76,6 +76,9 @@ const DOC_ID: &str = "p11scope/inspect-system/v1";
 /// so plainly instead of reading as a capture promise.
 pub(crate) const SCAN_ONLY_NOTE: &str =
     "scan-only admission: manifest corroboration was not consulted";
+/// The same disclaimer in TEXT words: names below come from the files
+/// themselves. JSON keeps [`SCAN_ONLY_NOTE`] verbatim.
+const TEXT_SCAN_ONLY_NOTE: &str = "scan only: names below come from the files themselves";
 pub(crate) const COUNT_MANIFEST_NOTE: &str =
     "count admission includes explicit manifest targets validated against the mapped provider";
 
@@ -133,10 +136,10 @@ fn run_with_writer(
 }
 
 /// The scan stages' progress lines on stderr ("enumerating…",
-/// "deep-scanning…"): on by default. The interactive inventory dashboard
-/// turns them off while it owns the terminal (C5.3): its own pass lines
-/// say the same, and one line per scanned process would flood its bounded
-/// log tail.
+/// "deep-scanning…"): verbose-only, so default and `--quiet` runs stay
+/// silent. The interactive inventory dashboard turns them off while it
+/// owns the terminal (C5.3): its own pass lines say the same, and one
+/// line per scanned process would flood its bounded log tail.
 static PROGRESS_LINES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Turns the scan progress lines on or off; returns the previous setting.
@@ -148,7 +151,9 @@ pub(crate) fn set_progress_lines(on: bool) -> bool {
 /// argument evaluation stay inside the enabled branch (see [`set_progress_lines`]).
 macro_rules! progress {
     ($($arg:tt)*) => {
-        if PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst) {
+        if $crate::cli::text_is_verbose()
+            && PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst)
+        {
             let line = format!($($arg)*);
             let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&line));
         }
@@ -2983,38 +2988,63 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
 /// Renders the catalog as human-readable text: the same facts as the JSON
 /// (identities, states, totals, gaps) in pid-inspect's layout. Plain
 /// stdout; pager design is not this command's job.
+/// Renders at the run-scoped verbosity; see [`render_text_with_verbosity`].
 fn render_text(catalog: &Catalog) -> String {
+    render_text_with_verbosity(catalog, crate::cli::text_verbosity())
+}
+
+/// [`render_text`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps the header, one short block per provider,
+/// folded skips, coverage and the `-v` hint; verbose is the full
+/// per-table listing; quiet keeps the header and coverage only.
+fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerbosity) -> String {
+    use crate::cli::TextVerbosity;
+    let verbose = verbosity == TextVerbosity::Verbose;
     let mut out = String::new();
-    let word = if catalog.objects.len() == 1 {
-        "object"
+    let files = if catalog.objects.len() == 1 {
+        "provider file"
     } else {
-        "objects"
+        "provider files"
+    };
+    // The scan split in words: the full three-way count only when the
+    // scan actually mixed methods.
+    let detail = if catalog.maps_matched == 0 && catalog.scanned == catalog.enumerated {
+        format!("all {} checked in detail", catalog.enumerated)
+    } else {
+        format!(
+            "{} checked in detail, {} matched from maps, of {} found",
+            catalog.scanned, catalog.maps_matched, catalog.enumerated
+        )
     };
     let _ = writeln!(
         out,
-        "system — {} PKCS#11 {word} in {} processes ({} deep-scanned and {} maps-matched of {} \
-         enumerated, cap {}; scan {}ms, {})",
+        "system — {} {files} mapped in {} processes ({detail}; cap {}; scan took {} ms; {})",
         catalog.objects.len(),
         catalog.processes.len(),
-        catalog.scanned,
-        catalog.maps_matched,
-        catalog.enumerated,
         catalog.cap,
         catalog.scan_ms,
         catalog.scan_status,
     );
-    out.push_str("Mapped objects are scan evidence; activity was not captured by inspect.\n");
+    out.push_str("Mapped files are scan evidence; activity was not captured by inspect.\n");
     out.push('\n');
+    if verbosity == TextVerbosity::Quiet {
+        render_excluded(&mut out, catalog);
+        if let Some(explanation) = &catalog.explanation {
+            let _ = writeln!(out, "{explanation}");
+        }
+        render_coverage(&mut out, catalog);
+        return out;
+    }
     let processes: BTreeMap<u32, &ProcessRecord> = catalog
         .processes
         .iter()
         .map(|process| (process.pid, process))
         .collect();
     for (index, object) in catalog.objects.iter().enumerate() {
-        render_object(&mut out, index, object, &processes);
+        render_object(&mut out, index, object, &processes, verbosity);
         out.push('\n');
     }
-    if !catalog.relationships.is_empty() {
+    if verbose && !catalog.relationships.is_empty() {
         out.push_str("relationships:\n");
         for relationship in &catalog.relationships {
             match relationship {
@@ -3063,14 +3093,43 @@ fn render_text(catalog: &Catalog) -> String {
         }
         out.push('\n');
     }
-    render_process_summary(&mut out, catalog);
-    render_skipped(&mut out, &catalog.skipped);
-    render_gaps(&mut out, "notes", &catalog.notes);
+    render_process_summary(&mut out, catalog, verbosity);
+    render_gaps(&mut out, "skipped", &catalog.skipped, verbose);
+    render_gaps(&mut out, "notes", &catalog.notes, verbose);
     render_excluded(&mut out, catalog);
     if let Some(explanation) = &catalog.explanation {
         let _ = writeln!(out, "{explanation}");
     }
+    render_coverage(&mut out, catalog);
+    if verbosity == crate::cli::TextVerbosity::Concise {
+        let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);
+    }
     out
+}
+
+/// One coverage status line: complete only when collection finished
+/// and nothing was skipped.
+fn render_coverage(out: &mut String, catalog: &Catalog) {
+    let mut parts: Vec<String> = Vec::new();
+    if !catalog.skipped.is_empty() {
+        parts.push(format!(
+            "{} item{} skipped",
+            catalog.skipped.len(),
+            if catalog.skipped.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if catalog.scan_status != "complete" {
+        parts.push("scan incomplete".to_string());
+    }
+    if parts.is_empty() {
+        let _ = writeln!(out, "coverage: complete");
+    } else {
+        let _ = writeln!(
+            out,
+            "coverage: partial — {} (--json has every item)",
+            parts.join("; ")
+        );
+    }
 }
 
 fn render_object(
@@ -3078,21 +3137,25 @@ fn render_object(
     index: usize,
     object: &CatalogObject,
     processes: &BTreeMap<u32, &ProcessRecord>,
+    verbosity: crate::cli::TextVerbosity,
 ) {
+    let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
     let _ = writeln!(
         out,
         "object[{index}]  {}",
         crate::render::escape_controls(&object.path)
     );
-    let _ = writeln!(
-        out,
-        "  identity   sha256 {}  build-id {}  dev {}:{}  ino {}",
-        object.sha256.as_deref().unwrap_or("-"),
-        object.build_id.as_deref().unwrap_or("-"),
-        object.key.device.major,
-        object.key.device.minor,
-        object.key.inode,
-    );
+    if verbose {
+        let _ = writeln!(
+            out,
+            "  identity   sha256 {}  build-id {}  dev {}:{}  ino {}",
+            object.sha256.as_deref().unwrap_or("-"),
+            object.build_id.as_deref().unwrap_or("-"),
+            object.key.device.major,
+            object.key.device.minor,
+            object.key.inode,
+        );
+    }
     let mappings: Vec<String> = object
         .mappings
         .iter()
@@ -3108,22 +3171,46 @@ fn render_object(
             }
         })
         .collect();
-    let _ = writeln!(out, "  mapped by  {}", mappings.join(", "));
+    if verbose || mappings.len() <= 3 {
+        let _ = writeln!(out, "  mapped by  {}", mappings.join(", "));
+    } else {
+        let _ = writeln!(
+            out,
+            "  mapped by  {}, and {} more (--json lists every process)",
+            mappings[..3].join(", "),
+            mappings.len() - 3,
+        );
+    }
     match &object.admission {
         AdmissionRecord::Admitted { class, endpoints } => {
-            let _ = writeln!(
-                out,
-                "  admission  admitted ({class}, {endpoints} endpoints; {SCAN_ONLY_NOTE})"
-            );
+            if verbose {
+                let _ = writeln!(
+                    out,
+                    "  admission  admitted ({class}, {endpoints} endpoints; {SCAN_ONLY_NOTE})"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  admission  admitted ({endpoints} endpoints; {SCAN_ONLY_NOTE})"
+                );
+            }
         }
         AdmissionRecord::Partial { class, reason, .. } => {
             // The reason already carries the attached-vs-needed
             // counts; the line mirrors the refused shape.
-            let _ = writeln!(
-                out,
-                "  admission  partial ({class}): {} [{SCAN_ONLY_NOTE}]",
-                crate::render::escape_controls(reason),
-            );
+            if verbose {
+                let _ = writeln!(
+                    out,
+                    "  admission  partial ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  admission  partial: {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
+                );
+            }
         }
         AdmissionRecord::Refused {
             class,
@@ -3132,8 +3219,8 @@ fn render_object(
         } => {
             if *kind == crate::plan::RefusalKind::AwaitingPublication {
                 // By-design refusal: the proxy alone admits nothing until
-                // its providers publish. One plain line; JSON keeps the
-                // full planner reason.
+                // its providers publish. One plain line; verbose pairs
+                // the machine class, JSON keeps the full planner reason.
                 let proxy = if std::path::Path::new(&object.path)
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().contains("p11-kit"))
@@ -3142,15 +3229,29 @@ fn render_object(
                 } else {
                     "proxy closure array"
                 };
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "  admission  refused ({class}): {proxy} not attached by design; the providers \
+                         it forwards to attach when they load (--json shows the full reason)"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "  admission  refused (proxy): {proxy} not attached by design; the providers \
+                         it forwards to attach when they load"
+                    );
+                }
+            } else if verbose {
                 let _ = writeln!(
                     out,
-                    "  admission  refused ({class}): {proxy} not attached by design; the providers \
-                     it forwards to attach when they load (--json shows the full reason)"
+                    "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    "  admission  refused: {} [{SCAN_ONLY_NOTE}]",
                     crate::render::escape_controls(reason),
                 );
             }
@@ -3159,11 +3260,16 @@ fn render_object(
             for reason in reasons {
                 let _ = writeln!(
                     out,
-                    "  admission  unresolved: {}",
+                    "  admission  undecided: {}",
                     crate::render::escape_controls(reason),
                 );
             }
         }
+    }
+    if !verbose {
+        // Concise stops here: identity, per-process observations and
+        // interfaces are verbose-only.
+        return;
     }
     for observation in &object.observations {
         if observation.evidence == ObservationEvidence::MapsMatch {
@@ -3187,7 +3293,6 @@ fn render_object(
         );
         let table_lines = observation.tables.iter().map(|table| {
             let count = table.entries.len();
-            let entry_word = if count == 1 { "entry" } else { "entries" };
             let nulls = if table.null_entries.is_empty() {
                 String::new()
             } else {
@@ -3199,8 +3304,10 @@ fn render_object(
                 format!("  (unpinned: {})", table.unpinned.len())
             };
             format!(
-                "    table      {}.{}  {}  {count} {entry_word}{nulls}{unpinned}",
-                table.version.0, table.version.1, table.walk
+                "    table      {}.{}, {}{nulls}{unpinned}",
+                table.version.0,
+                table.version.1,
+                crate::inspect::table_walk_words(table.walk, count)
             )
         });
         crate::inspect::push_collapsed_lines(out, table_lines);
@@ -3229,14 +3336,40 @@ fn render_object(
     }
 }
 
-fn render_process_summary(out: &mut String, catalog: &Catalog) {
+/// One member status in plain words (text only; JSON keeps the
+/// label). Unknown labels pass through verbatim.
+fn member_status_words(status: &str) -> &str {
+    match status {
+        "scanned" => "checked in detail",
+        "maps_matched" => "matched from maps",
+        "exited" => "exited",
+        "memory_unavailable" => "memory unreadable",
+        "unreadable" => "unreadable",
+        "not_selected" => "past the scan cap",
+        other => other,
+    }
+}
+
+fn render_process_summary(
+    out: &mut String,
+    catalog: &Catalog,
+    verbosity: crate::cli::TextVerbosity,
+) {
+    let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for process in &catalog.processes {
         *counts.entry(process.status.label()).or_default() += 1;
     }
     let parts: Vec<String> = counts
         .iter()
-        .map(|(status, count)| format!("{count} {status}"))
+        .map(|(status, count)| {
+            let plain = member_status_words(status);
+            if verbose && plain != *status {
+                format!("{count} {plain} ({status})")
+            } else {
+                format!("{count} {plain}")
+            }
+        })
         .collect();
     let _ = writeln!(out, "processes: {}", parts.join(", "));
     let mut unlisted = 0usize;
@@ -3253,9 +3386,11 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         // Kernel threads and other processes with nothing to report are
         // counted below; listing each would bury the few that matter. A
         // process with an object, a reason or its own gap record
-        // (skipped or note) is always listed, so the folded line may
-        // only claim no object was found or attributed, never that a
-        // folded process maps none.
+        // (skipped or note) is always listed in verbose text, so the
+        // folded line may only claim no object was found or attributed,
+        // never that a folded process maps none. Concise text folds
+        // every process: the `processes:` line above carries the status
+        // split, mapped-by previews name callers, and --json lists each.
         if process.objects.is_empty()
             && process.status.reason().is_none()
             && !with_gaps.contains(&process.pid)
@@ -3271,6 +3406,10 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
                 MemberStatus::Exited => unlisted_exited += 1,
                 _ => {}
             }
+            continue;
+        }
+        if !verbose {
+            unlisted += 1;
             continue;
         }
         let objects = process
@@ -3298,59 +3437,99 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         }
     }
     if unlisted > 0 {
-        let _ = writeln!(
-            out,
-            "  {unlisted} other {} not listed: no PKCS#11 object found or attributed \
-             ({unlisted_scanned} deep-scanned, {unlisted_past_cap} past the deep-scan cap, \
-             {unlisted_exited} exited); --json lists every process",
-            if unlisted == 1 {
-                "process is"
-            } else {
-                "processes are"
-            },
-        );
+        if verbose {
+            let _ = writeln!(
+                out,
+                "  {unlisted} other {} not listed: no PKCS#11 object found or attributed \
+                 ({unlisted_scanned} checked in detail, {unlisted_past_cap} past the scan cap, \
+                 {unlisted_exited} exited); --json lists every process",
+                if unlisted == 1 {
+                    "process is"
+                } else {
+                    "processes are"
+                },
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  {unlisted} {} not listed individually; --json lists every process",
+                if unlisted == 1 {
+                    "process is"
+                } else {
+                    "processes are"
+                },
+            );
+        }
     }
+    render_admission_summary(out, catalog, verbose);
+}
+
+/// The admission totals in words: admitted/partial/refused/unresolved, the
+/// unconfirmed-function count with its ordinary-scan gloss, and the
+/// scan-only disclaimer. Verbose pairs the machine counters.
+fn render_admission_summary(out: &mut String, catalog: &Catalog, verbose: bool) {
+    let uncorroborated = catalog.admission.uncorroborated_candidates;
+    let ambiguous = catalog.admission.module_ambiguous;
+    let mut parts: Vec<String> = Vec::new();
+    if uncorroborated > 0 || verbose {
+        let mut part =
+            format!("{uncorroborated} possible functions not yet confirmed from a second source");
+        if verbose {
+            part.push_str(" (uncorroborated_candidates)");
+        } else {
+            part.push_str("; this is normal for a scan");
+        }
+        parts.push(part);
+    }
+    if ambiguous > 0 || verbose {
+        let mut part = format!("{ambiguous} functions claimed by two providers");
+        if verbose {
+            part.push_str(" (module_ambiguous)");
+        }
+        parts.push(part);
+    }
+    parts.push(TEXT_SCAN_ONLY_NOTE.to_string());
     let _ = writeln!(
         out,
-        "admission: {} admitted, {} partial, {} refused, {} unresolved ({} uncorroborated candidates, {} \
-         module-ambiguous; {SCAN_ONLY_NOTE})",
+        "admission: {} admitted, {} partial, {} refused, {} unresolved ({})",
         catalog.admission.admitted,
         catalog.admission.partial,
         catalog.admission.refused,
         catalog.admission.unresolved,
-        catalog.admission.uncorroborated_candidates,
-        catalog.admission.module_ambiguous,
+        parts.join("; "),
     );
 }
 
-fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
-    for gap in gaps {
-        match gap.pid {
-            Some(pid) => {
-                let _ = writeln!(
-                    out,
-                    "{title}: pid {pid} {} — {}",
-                    crate::render::escape_controls(&gap.subject),
-                    crate::render::escape_controls(&gap.reason)
-                );
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "{title}: {} — {}",
-                    crate::render::escape_controls(&gap.subject),
-                    crate::render::escape_controls(&gap.reason)
-                );
+/// Skipped records and notes in text. Verbose lists every record —
+/// the full per-gap detail `-v` promises. Concise folds member records
+/// by reason — a lone record keeps its pid and subject, a repeated
+/// reason folds to one counted line — then scope-level records print
+/// verbatim (the split already deduped them). JSON keeps every record;
+/// see `render_json`.
+fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
+    if verbose {
+        for gap in gaps {
+            match gap.pid {
+                Some(pid) => {
+                    let _ = writeln!(
+                        out,
+                        "{title}: pid {pid} {} — {}",
+                        crate::render::escape_controls(&gap.subject),
+                        crate::render::escape_controls(&gap.reason)
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "{title}: {} — {}",
+                        crate::render::escape_controls(&gap.subject),
+                        crate::render::escape_controls(&gap.reason)
+                    );
+                }
             }
         }
+        return;
     }
-}
-
-/// Skipped records in text: member gaps group by reason — a lone gap keeps
-/// its pid and subject, a repeated reason folds to one counted line — then
-/// scope-level gaps print verbatim (the split already deduped them). JSON
-/// keeps every record; see `render_json`.
-fn render_skipped(out: &mut String, gaps: &[PidGap]) {
     let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();
     for gap in gaps.iter().filter(|gap| gap.pid.is_some()) {
         by_reason.entry(gap.reason.as_str()).or_default().push(gap);
@@ -3360,7 +3539,7 @@ fn render_skipped(out: &mut String, gaps: &[PidGap]) {
             let gap = group[0];
             let _ = writeln!(
                 out,
-                "skipped: pid {} {} — {}",
+                "{title}: pid {} {} — {}",
                 gap.pid.expect("member gap carries its pid"),
                 crate::render::escape_controls(&gap.subject),
                 crate::render::escape_controls(&gap.reason),
@@ -3370,7 +3549,7 @@ fn render_skipped(out: &mut String, gaps: &[PidGap]) {
         let processes: BTreeSet<u32> = group.iter().filter_map(|gap| gap.pid).collect();
         let _ = writeln!(
             out,
-            "skipped ({} gap{} in {} process{}): {} (--json lists each)",
+            "{title} ({} gap{} in {} process{}): {} (--json lists each)",
             group.len(),
             if group.len() == 1 { "" } else { "s" },
             processes.len(),
@@ -3381,7 +3560,7 @@ fn render_skipped(out: &mut String, gaps: &[PidGap]) {
     for gap in gaps.iter().filter(|gap| gap.pid.is_none()) {
         let _ = writeln!(
             out,
-            "skipped: {} — {}",
+            "{title}: {} — {}",
             crate::render::escape_controls(&gap.subject),
             crate::render::escape_controls(&gap.reason)
         );
@@ -6218,7 +6397,7 @@ mod tests {
             let catalog = catalog_for(member);
             (
                 render_json(&catalog),
-                render_text(&catalog),
+                render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose),
                 before.path.unwrap(),
             )
         }
@@ -6353,7 +6532,7 @@ mod tests {
                 catalog.objects.clear();
                 catalog.processes[0].objects.clear();
                 let json = render_json(&catalog);
-                let text = render_text(&catalog);
+                let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
                 assert_eq!(json["processes"][0]["application_status"], "not_examined");
                 assert!(json["processes"][0]["application"].is_null());
                 assert!(text.contains(&format!("Unknown executable (PID {})", view.pid())));
@@ -6500,7 +6679,7 @@ mod tests {
             catalog.processes[0].application = confirmed("/opt/a/app", 2);
             catalog.processes[1].application = confirmed("/opt/b/app", 3);
             let json = render_json(&catalog);
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert_eq!(json["processes"][0]["application"]["path"], "/opt/a/app");
             assert_eq!(json["processes"][1]["application"]["path"], "/opt/b/app");
             assert_eq!(json["objects"].as_array().unwrap().len(), 2);
@@ -7537,12 +7716,15 @@ mod tests {
                 .unwrap()
                 .clone();
             assert_eq!(mapping["view"], serde_json::Value::Null);
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
-                text.contains("2 deep-scanned and 299 maps-matched of 448"),
+                text.contains("2 checked in detail, 299 matched from maps, of 448 found"),
                 "{text}"
             );
-            assert!(text.contains("299 maps_matched"), "{text}");
+            assert!(
+                text.contains("299 matched from maps (maps_matched)"),
+                "{text}"
+            );
         }
 
         #[test]
@@ -7626,7 +7808,7 @@ mod tests {
                 .find(|process| process.pid == 20_005)
                 .unwrap();
             assert_eq!(process.status, MemberStatus::NotSelected { loss: None });
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
                 text.contains("(PID 20005) — not_selected"),
                 "unexamined unmatched pid must stay listed: {text}"
@@ -7664,7 +7846,7 @@ mod tests {
                 gap.reason.contains("no maps snapshot"),
                 "unexpected gap reason: {gap:?}"
             );
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
                 text.contains("(PID 20006) — not_selected"),
                 "unavailable pid must stay listed: {text}"
@@ -8300,7 +8482,7 @@ mod tests {
             "{document}"
         );
         let text = render_text(&catalog);
-        assert!(text.contains("0 PKCS#11 objects"), "{text}");
+        assert!(text.contains("0 provider files"), "{text}");
         assert!(text.contains("deep-scanned 2 of 2"), "{text}");
     }
 
@@ -8317,8 +8499,8 @@ mod tests {
                 kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
-        let text = render_text(&catalog);
-        assert!(text.contains("system — 1 PKCS#11 object"), "{text}");
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(text.contains("system — 1 provider file"), "{text}");
         assert!(text.contains("/opt/provider.so"), "{text}");
         assert!(text.contains("sha256 aa"), "{text}");
         assert!(
@@ -8329,10 +8511,13 @@ mod tests {
             text.contains("refused (closure_array): module needs 388 more"),
             "{text}"
         );
-        assert!(text.contains(SCAN_ONLY_NOTE), "{text}");
+        assert!(text.contains(TEXT_SCAN_ONLY_NOTE), "{text}");
         assert!(text.contains("2.40"), "{text}");
         assert!(text.contains("PKCS 11"), "{text}");
-        assert!(text.contains("processes: 2 scanned"), "{text}");
+        assert!(
+            text.contains("processes: 2 checked in detail (scanned)"),
+            "{text}"
+        );
         assert!(
             text.contains("0 admitted, 0 partial, 1 refused, 0 unresolved"),
             "{text}"
@@ -8364,12 +8549,13 @@ mod tests {
         let text = render_text(&catalog);
         assert!(
             text.contains(
-                "refused (closure_array): p11-kit proxy not attached by design; the providers \
-                 it forwards to attach when they load (--json shows the full reason)"
+                "refused (proxy): p11-kit proxy not attached by design; the providers it forwards \
+                 to attach when they load"
             ),
             "{text}"
         );
         assert!(!text.contains("lookalike"), "{text}");
+        assert!(!text.contains("closure_array"), "{text}");
         let document = render_json(&catalog);
         assert_eq!(
             document["objects"][0]["admission"]["reason"].as_str(),
@@ -8403,11 +8589,12 @@ mod tests {
         let text = render_text(&catalog);
         assert!(
             text.contains(
-                "refused (closure_array): proxy closure array not attached by design; the \
-                 providers it forwards to attach when they load (--json shows the full reason)"
+                "refused (proxy): proxy closure array not attached by design; the providers it \
+                 forwards to attach when they load"
             ),
             "{text}"
         );
+        assert!(!text.contains("closure_array"), "{text}");
     }
 
     /// A capacity closure refusal keeps its full text: the demand it states
@@ -8432,9 +8619,7 @@ mod tests {
         )]);
         let text = render_text(&catalog);
         assert!(
-            text.contains(&format!(
-                "refused (closure_array): {reason} [{SCAN_ONLY_NOTE}]"
-            )),
+            text.contains(&format!("refused: {reason} [{SCAN_ONLY_NOTE}]")),
             "{text}"
         );
     }
@@ -8478,6 +8663,141 @@ mod tests {
             Some(20),
             "{document}"
         );
+    }
+
+    /// Verbose lists every skipped record: `-v` is the full per-gap
+    /// detail, never a fold.
+    #[test]
+    fn text_lists_every_skipped_gap_in_verbose() {
+        let mut catalog = catalog_with(Vec::new());
+        for pid in [639, 640] {
+            for index in 0..10 {
+                catalog.skipped.push(PidGap::member(
+                    pid,
+                    Skipped {
+                        subject: format!("/proc/{pid}/root/usr/lib/object{index}.so"),
+                        reason: "opening object within retained target root: No such file or \\
+                             directory (os error 2)"
+                            .into(),
+                    },
+                ));
+            }
+        }
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("skipped: pid"))
+                .count(),
+            20,
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("skipped (")),
+            "verbose never folds: {text}"
+        );
+    }
+
+    /// Repeated per-pid notes fold to one counted line in concise
+    /// text, like skipped gaps; JSON still lists every record.
+    #[test]
+    fn text_folds_repeated_notes_to_one_counted_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for pid in [639, 640] {
+            for index in 0..5 {
+                catalog.notes.push(PidGap::member(
+                    pid,
+                    Skipped {
+                        subject: format!("/usr/lib/object{index}.so (deleted)"),
+                        reason: "deleted mapping".into(),
+                    },
+                ));
+            }
+        }
+        let text = render_text(&catalog);
+        assert!(
+            text.contains("notes (10 gaps in 2 processes): deleted mapping (--json lists each)"),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("notes"))
+                .count(),
+            1,
+            "{text}"
+        );
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["notes"].as_array().map(Vec::len),
+            Some(10),
+            "{document}"
+        );
+    }
+
+    /// CLI-1: concise system inspect keeps the plain header, one
+    /// short block per provider, the folded lines, coverage and the
+    /// `-v` hint; per-table observations are verbose-only.
+    #[test]
+    fn concise_system_inspect_keeps_providers_coverage_and_hint() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+            },
+        )]);
+        let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(out.contains("1 provider file"), "{out}");
+        assert!(out.contains("/opt/provider.so"), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains("observed   pid"), "{out}");
+        assert!(!out.contains("PKCS 11"), "{out}");
+        assert!(!out.contains("closure_array"), "{out}");
+        assert!(!out.contains("uncorroborated"), "{out}");
+        assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: verbose system inspect pairs machine names with the plain
+    /// words and keeps the per-table observations.
+    #[test]
+    fn verbose_system_inspect_pairs_machine_names_with_plain_words() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+            },
+        )]);
+        let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(out.contains("observed   pid"), "{out}");
+        assert!(out.contains("PKCS 11"), "{out}");
+        assert!(out.contains("closure_array"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: quiet system inspect is the header and coverage only.
+    #[test]
+    fn quiet_system_inspect_keeps_header_and_coverage_only() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+            },
+        )]);
+        let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Quiet);
+        assert!(out.contains("1 provider file"), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains("/opt/provider.so"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
     }
 
     /// A lone skip keeps its pid and subject: there is nothing to fold.
@@ -8524,7 +8844,7 @@ mod tests {
         proxy.observations[0].tables = tables;
         let catalog = catalog_with(vec![proxy]);
 
-        let text = render_text(&catalog);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         let lines: Vec<&str> = text
             .lines()
             .filter(|line| line.trim_start().starts_with("table "))
@@ -8532,9 +8852,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "    table      3.2  known_prefix  68 entries",
-                "    table      3.2  full  104 entries  (×65 identical)",
-                "    table      3.2  known_prefix  68 entries  (×2 identical)",
+                "    table      3.2, 68 known functions (newer functions unknown)",
+                "    table      3.2, 104 functions (fully walked)  (×65 identical)",
+                "    table      3.2, 68 known functions (newer functions unknown)  (×2 identical)",
             ],
             "{text}"
         );
@@ -8606,7 +8926,7 @@ mod tests {
             ),
         ]);
 
-        let text = render_text(&catalog);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
             text.contains("Unknown executable (PID 100) — scanned"),
             "{text}"
@@ -8632,7 +8952,7 @@ mod tests {
         assert!(
             text.contains(
                 "  3 other processes are not listed: no PKCS#11 object found or attributed \
-                 (1 deep-scanned, 1 past the deep-scan cap, 1 exited); --json lists every process"
+                 (1 checked in detail, 1 past the scan cap, 1 exited); --json lists every process"
             ),
             "{text}"
         );
@@ -8659,11 +8979,11 @@ mod tests {
                 endpoints: 68,
             },
         )]);
-        let text = render_text(&catalog);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
             text.contains(
                 "  1 other process is not listed: no PKCS#11 object found or attributed \
-                 (1 deep-scanned, 0 past the deep-scan cap, 0 exited); --json lists every process"
+                 (1 checked in detail, 0 past the scan cap, 0 exited); --json lists every process"
             ),
             "{text}"
         );

@@ -193,9 +193,9 @@ no slots, so the layer can never crowd out a real provider and is never
 refused outright. Calls it forwards are counted at the attached backend
 providers, named with counts on the gap line; calls the layer answers
 itself are not counted. The terminal report names each refused or
-partially covered module with its reason: `run` and `profile` print a
-`Module gaps` section with the first five and an "and K more" line, and
-`inventory` prints the admission reason under each refused module. A
+partially covered module with its reason: with `-v`, `run` and `profile`
+print a `Module gaps` section with the first five and an "and K more" line,
+and `inventory` prints the admission reason under each refused module. A
 capture whose only mapped provider is the forwarding layer (a process that
 has not loaded the providers below it yet) starts with the layer named as
 a `PARTIAL` gap — nothing of it is published yet — and attaches each
@@ -212,8 +212,10 @@ return values and latency. Standard names require a typed legacy return, an
 exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
 the provider's own `.dynsym` and every retained non-NULL target
 (`discovery[].tables[].linkage: "exports"`). `inspect` reports each table's
-raw decoder walk, so a 3.x-labelled prefix that `run` proves `full` still reads
-`known_prefix` in `inspect` output. Without name evidence, rows read
+decoder walk in words — a fully walked table reads "fully walked", a
+known-prefix table reads "known functions (newer functions unknown)" — while
+JSON keeps the raw `walk` (`full`/`known_prefix`) and `version`. Without name
+evidence, rows read
 `unknown#<ordinal>` in the live table and trace (`functions[].ordinals` and
 `functions[].target` in JSON), never a guessed name. Missing mechanism or
 session evidence does not mean the application used none. For those
@@ -239,6 +241,26 @@ sudo p11scope profile --system --duration 60 -o system-profile.json
 sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
+
+### Text output: concise by default, `-v` for detail
+
+Terminal text is short by default: the main results (providers, callers,
+functions and mechanisms, key-operation rows), one coverage status line
+(`complete`, or `partial` with gap counts), and a `run with -v for details`
+hint. `-v` / `--verbose` shows the full detail — every gap and limitation
+with reasons, evidence, per-slot or per-table data, timing — plus the
+informational stderr notes. `--quiet` prints only the summary head, for
+scripts. `--json` and `-o` are always complete at every verbosity. Gap
+names in default text are plain words; the machine names stay in JSON, and
+in `-v` beside the plain words. `trace` streams one line per event at every
+level; `-v` only adds its stderr notes.
+
+Informational stderr notes (scan progress, later-pass lines, timing detail)
+are suppressed by default. Errors and actionable warnings stay, as do the
+one-line readiness and outcome signals that scripts and shell gates match:
+`p11scope: capturing:`, the first pass headline (`p11scope: pass 0:`), the
+`p11scope: discovery:` completion summary, the `capture ended:` markers,
+the semantic-lane seal, and the stop summaries.
 
 Trace rows show an executable label when p11scope can establish which process
 image made that call. Otherwise they say `Unknown executable` and retain the
@@ -676,15 +698,19 @@ C_DigestInit                       50      0     2.0µs     4.1µs    65.5µs   
 Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-flight → COMPLETE
 ```
 
-A current capture's evidence line names why it is `PARTIAL`, grouped by the
-same classes `evidence.gap_classes` publishes, for example
-`→ PARTIAL: attribution withheld (68 semantics-unverified/count-only slots)`
-for a clean scan-only capture (`verdict_detail: "attribution_only"`: counts
-are exact, only semantic interpretation is withheld), or
-`→ PARTIAL: observation lossy (12 events lost)` for a lossy one
-(`"concrete_gap"`). `→ PARTIAL: terminal drain unproven` means nothing
-concrete is behind the verdict (`"clean_but_unproven"`): the stop gate did
-not prove the final drain (see `evidence.stop_quiescence`).
+A current capture's coverage line names why it is `PARTIAL`, grouped by the
+same classes `evidence.gap_classes` publishes, in plain words: for example
+`Coverage PARTIAL: names withheld (68 functions counted but not named)` for
+a clean scan-only capture (`verdict_detail: "attribution_only"`: counts are
+exact, only semantic interpretation is withheld), or
+`Coverage PARTIAL: calls may be missing (12 call records lost)` for a lossy
+one (`"concrete_gap"`). `Coverage PARTIAL: end of capture not fully confirmed
+(last calls may be missing)` means nothing concrete is behind the verdict
+(`"clean_but_unproven"`): the stop gate did not prove the final drain (see
+`evidence.stop_quiescence`). With `-v`, each plain reason is paired with its
+machine cause name, and the `Evidence:` line repeats the same verdict
+reasons after the probe and slot counts. A `COMPLETE` verdict reads
+`Coverage COMPLETE (nothing known was lost)`.
 
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —
@@ -1021,9 +1047,11 @@ Limits that matter in pods:
   Operations the observer cannot attribute with certainty are counted
   in named `not attributed` reasons instead of ending the view. A
   linked capture whose key-operation tracking never starts reads
-  `key operations: unavailable (bootstrap_unavailable)`. Without the
-  opt-in, or on a build without the journal object, the line reads
-  `key operations: not reported (per-key tracking is off)`.
+  `key operations: not available — per-key tracking never started, so no
+  key can be named yet` (with `-v`, the machine reason follows in
+  parentheses; `--json` keeps it as `object_observations.reason`).
+  Without the opt-in, or on a build without the journal object, the line
+  reads `key operations: not reported (per-key tracking is off)`.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.
@@ -1042,9 +1070,11 @@ Limits that matter in pods:
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
   report requires a file). Text output is concise by default: the main
-  results, one coverage line, and the hint `run with -v for details`.
-  `-v`/`--verbose` shows the full detail, `--quiet` prints only the
-  summary head (totals plus application/module edges) and silences scan
+  results, one coverage line, a `limits:` line, and the hint
+  `run with -v for details`. `-v`/`--verbose` shows the full detail
+  (every gap and reason, per-caller/module/edge data, budgets, timing)
+  plus informational stderr notes, `--quiet` prints only the summary
+  head (totals plus application/module edges) and silences scan
   progress, and `--json`, `-o`, and logs are unchanged and always
   complete.
 

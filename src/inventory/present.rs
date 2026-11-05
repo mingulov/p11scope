@@ -1034,14 +1034,15 @@ fn semantics_view(state: Option<&EdgeSemantics>, claimed_children: bool) -> Edge
 /// edge holds claims — every mechanism row (verbatim id, name,
 /// categories, counts, recency, provenance) and the operation
 /// aggregates. Unknown edges render the bare label, exactly as U0.
-fn snapshot_semantics(edge: &EdgeView) -> String {
-    snapshot_semantics_view(&edge.semantics)
+fn snapshot_semantics_at(edge: &EdgeView, now_ns: u64) -> String {
+    snapshot_semantics_view_at(&edge.semantics, now_ns)
 }
 
-fn snapshot_semantics_view(semantics: &EdgeSemanticsView) -> String {
+fn snapshot_semantics_view_at(semantics: &EdgeSemanticsView, now_ns: u64) -> String {
     let Some(operations) = semantics.operations.as_ref() else {
         return semantics.label.to_string();
     };
+    let ago = |then_ns: u64| crate::render::fmt_ns(Some(now_ns.saturating_sub(then_ns)));
     let mut mechs = Vec::with_capacity(semantics.mechanisms.len());
     for mech in &semantics.mechanisms {
         let id = match mech.name {
@@ -1056,11 +1057,11 @@ fn snapshot_semantics_view(semantics: &EdgeSemanticsView) -> String {
             .collect::<Vec<_>>()
             .join(",");
         mechs.push(format!(
-            "[{id} {} calls={} errors={} last={} by=[{by}] rv=[{rv}]{}]",
+            "[{id} {} calls={} errors={} last={} ago by=[{by}] rv=[{rv}]{}]",
             mech.operations.join(","),
             mech.calls,
             mech.errors,
-            mech.last_seen_ns,
+            ago(mech.last_seen_ns),
             if mech.truncated { " truncated" } else { "" },
         ));
     }
@@ -1072,7 +1073,7 @@ fn snapshot_semantics_view(semantics: &EdgeSemanticsView) -> String {
         .join(",");
     let evidence = operations.evidence;
     format!(
-        "{} mechs {} ops [calls={} started={} completed={} cancelled={} failed={} unknown={} orphans={} dropped={} last={}] active [{active}] evidence [state_reconciliations={} session_cancel_ambiguities={} session_cancel_unknown_flags={} operation_state_imports={} auth_state_ambiguities={} semantic_capture_failures={} async_duplicates={} async_evictions={} unmatched_closes={}]",
+        "{} mechs {} ops [calls={} started={} completed={} cancelled={} failed={} unknown={} orphans={} dropped={} last={} ago] active [{active}] evidence [state_reconciliations={} session_cancel_ambiguities={} session_cancel_unknown_flags={} operation_state_imports={} auth_state_ambiguities={} semantic_capture_failures={} async_duplicates={} async_evictions={} unmatched_closes={}]",
         semantics.label,
         mechs.join(" "),
         operations.calls,
@@ -1083,7 +1084,7 @@ fn snapshot_semantics_view(semantics: &EdgeSemanticsView) -> String {
         operations.unknown,
         operations.orphans,
         operations.dropped,
-        operations.last_seen_ns,
+        ago(operations.last_seen_ns),
         evidence.state_reconciliations,
         evidence.session_cancel_ambiguities,
         evidence.session_cancel_unknown_flags,
@@ -1100,27 +1101,37 @@ fn snapshot_semantics_view(semantics: &EdgeSemanticsView) -> String {
 /// and dashboard frames (JSON carries the structured
 /// `entries.coverage`). Never says "observed" for a zero it cannot
 /// prove: witnessed use is "used", an unknown names its reason.
-pub(crate) fn coverage_label(coverage: &UseCoverage) -> String {
+/// Instants render relative to `now_ns` with units — raw monotonic
+/// nanoseconds never reach text (JSON keeps `*_ns` with its unit).
+pub(crate) fn coverage_label_at(coverage: &UseCoverage, now_ns: u64) -> String {
+    let ago = |then_ns: u64| crate::render::fmt_ns(Some(now_ns.saturating_sub(then_ns)));
     match coverage {
         UseCoverage::Counted {
             since_ns,
             lossy: false,
-        } => format!("counted since {since_ns}"),
+        } => format!("counted exactly for the last {}", ago(*since_ns)),
         UseCoverage::Counted {
             since_ns,
             lossy: true,
-        } => format!("counted since {since_ns} (lossy)"),
+        } => format!(
+            "counted for the last {} (lossy: some records dropped)",
+            ago(*since_ns)
+        ),
         UseCoverage::Witnessed { first_ns } => {
-            format!("used, count unavailable (first {first_ns})")
+            format!("used, count unavailable (first use {} ago)", ago(*first_ns))
         }
         UseCoverage::WatchedNoUse {
             since_ns,
             until_ns: None,
-        } => format!("no use since {since_ns}"),
+        } => format!("no use for the last {}", ago(*since_ns)),
         UseCoverage::WatchedNoUse {
             since_ns,
             until_ns: Some(until_ns),
-        } => format!("no use from {since_ns} to {until_ns}"),
+        } => format!(
+            "no use for {} (watch ended {} ago)",
+            crate::render::fmt_ns(Some(until_ns.saturating_sub(*since_ns))),
+            ago(*until_ns)
+        ),
         UseCoverage::Unknown(reason) => format!("unknown ({})", reason.text()),
     }
 }
@@ -1143,17 +1154,19 @@ pub(crate) fn entries_display(edge: &EdgeView) -> String {
     }
 }
 
-/// One module's admission history in words (`refused->admitted@200`),
-/// empty when the first verdict still stands.
-pub(crate) fn admission_history_label(history: &[AdmissionChange]) -> String {
+/// One module's admission history in words
+/// (`refused->admitted@32.10s ago`), empty when the first verdict still
+/// stands. `now_ns` anchors the relative wording; raw monotonic
+/// nanoseconds never reach text.
+pub(crate) fn admission_history_label_at(history: &[AdmissionChange], now_ns: u64) -> String {
     history
         .iter()
         .map(|change| {
             format!(
-                "{}->{}@{}",
+                "{}->{}@{} ago",
                 change.from.label(),
                 change.to.label(),
-                change.at_ns
+                crate::render::fmt_ns(Some(now_ns.saturating_sub(change.at_ns)))
             )
         })
         .collect::<Vec<_>>()
@@ -1217,7 +1230,8 @@ pub(crate) fn module_label(presentation: &Presentation, module: ModuleId) -> Str
 }
 
 /// Human explanation of existing evidence, with positive history first.
-pub(crate) fn observation_label(edge: &EdgeView) -> String {
+/// `now_ns` anchors the relative coverage wording; see [`coverage_label_at`].
+pub(crate) fn observation_label_at(edge: &EdgeView, now_ns: u64) -> String {
     if edge.entry_count > 0 {
         let mut label = format!("At least {} entries observed", edge.entry_count);
         if edge.entry_saturated {
@@ -1245,7 +1259,7 @@ pub(crate) fn observation_label(edge: &EdgeView) -> String {
         UseCoverage::Unknown(_) => {
             format!(
                 "Activity unknown; {}",
-                escape_controls(&coverage_label(&edge.coverage))
+                escape_controls(&coverage_label_at(&edge.coverage, now_ns))
             )
         }
     }
@@ -1368,13 +1382,26 @@ pub(crate) fn snapshot_summary_only() -> bool {
 /// Sorted, total-first, with the same identities, states, totals, and
 /// gaps the JSON carries — pin equivalence with tests, not eyeballing.
 /// Target-controlled strings are control-escaped; JSON is unaffected.
-/// Under `--quiet` this renders the summary head only; see
-/// [`render_snapshot_summary`].
+/// Renders at the run-scoped verbosity; see [`render_snapshot_with_verbosity`].
 pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
-    render_snapshot_inner(
-        presentation,
-        SNAPSHOT_SUMMARY_ONLY.load(std::sync::atomic::Ordering::SeqCst),
-    )
+    let verbosity = if snapshot_summary_only() {
+        crate::cli::TextVerbosity::Quiet
+    } else {
+        crate::cli::text_verbosity()
+    };
+    render_snapshot_with_verbosity(presentation, verbosity)
+}
+
+/// [`render_snapshot`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps the summary head, the limits line and the
+/// `-v` hint; verbose is the full snapshot with the `Details:` tail;
+/// quiet keeps the summary head only.
+pub(crate) fn render_snapshot_with_verbosity(
+    presentation: &Presentation,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
+    let summary_only = verbosity == crate::cli::TextVerbosity::Quiet;
+    render_snapshot_inner(presentation, summary_only, verbosity)
 }
 
 /// The `--quiet` summary head: header, coverage, key operations, and every
@@ -1384,11 +1411,84 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
 /// switch; this direct entry is the tests' race-free handle.
 #[cfg(test)]
 pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
-    render_snapshot_inner(presentation, true)
+    render_snapshot_inner(presentation, true, crate::cli::TextVerbosity::Quiet)
 }
 
-fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> String {
+/// The concise limits line (INV-1): the headline budgets in words.
+/// The full budget dump stays verbose-only; `--json` carries `budgets`.
+fn render_limits_line(out: &mut String, budgets: &BudgetView) {
     use std::fmt::Write as _;
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let _ = writeln!(
+        out,
+        "limits: {} caller{}, {} provider file{}, {} link{} ({} refused); {} function{} watched of {} ({} refused). Full budget detail: -v or --json.",
+        budgets.callers_occupied,
+        plural(budgets.callers_occupied),
+        budgets.modules_occupied,
+        plural(budgets.modules_occupied),
+        budgets.edges_occupied,
+        plural(budgets.edges_occupied),
+        budgets.refusals(),
+        budgets.endpoints_occupied,
+        plural(budgets.endpoints_occupied),
+        budgets.endpoints_limit,
+        budgets.endpoints_refused,
+    );
+}
+
+/// One key-observation machine reason in plain words (text only; JSON
+/// keeps the frozen reason). Unknown reasons pass through verbatim so
+/// a new reason always surfaces.
+fn key_observation_plain_reason(reason: &str) -> &str {
+    match reason {
+        "bootstrap_unavailable" => "per-key tracking never started, so no key can be named yet",
+        "proof_refused_fallback" => "key proof refused; plain counts only",
+        "authority_lost" => "per-key tracking stopped; plain counts are unaffected",
+        "row_budget_exhausted" => "per-key rows hit their budget; plain counts are unaffected",
+        "publication_budget_exhausted" => {
+            "key publication hit its budget; plain counts are unaffected"
+        }
+        "serialization_refused" => "key rows could not be encoded; plain counts are unaffected",
+        "sink_failed" => "key rows could not be written; plain counts are unaffected",
+        other => other,
+    }
+}
+
+/// One gap subject in plain words (text only; JSON keeps the stored
+/// subject). Both Joint birth subjects map — the disclosed refusal
+/// and the silent-bootstrap one; everything else passes through
+/// verbatim.
+fn gap_plain_subject(subject: &str) -> &str {
+    match subject {
+        "Joint key operations unavailable; retained S1" | JOINT_BIRTH_UNAVAILABLE_SUBJECT => {
+            "Per-key tracking did not start for this process; function counts above are unaffected"
+        }
+        other => other,
+    }
+}
+
+/// One gap reason in plain words (text only; JSON keeps the stored
+/// reason). Unknown reasons pass through verbatim so a new gap lane
+/// always surfaces.
+fn gap_plain_reason(reason: &str) -> &str {
+    match reason {
+        "joint_birth_unoffered" => "no key session was offered to track",
+        "joint_image_refused" | "joint_birth_claim_ImageTainted" => {
+            "process image changed before tracking could start"
+        }
+        "joint_birth_no_admission" => "process was not admitted for tracking",
+        "foreign_or_unproven_caller" => "caller not confirmed",
+        other => other,
+    }
+}
+
+fn render_snapshot_inner(
+    presentation: &Presentation,
+    summary_only: bool,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
+    use std::fmt::Write as _;
+    let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
     let mut out = String::new();
     let budgets = &presentation.budgets;
     let _ = writeln!(
@@ -1416,13 +1516,20 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             "s"
         },
     );
-    let _ = writeln!(
-        out,
-        "coverage: {} gaps, {} refusals, {} suppressed",
-        presentation.gaps.len(),
-        budgets.refusals(),
-        presentation.gaps_suppressed,
-    );
+    if presentation.gaps.is_empty() && budgets.refusals() == 0 && presentation.gaps_suppressed == 0
+    {
+        let _ = writeln!(out, "coverage: COMPLETE (nothing known was lost)");
+    } else {
+        let gaps = presentation.gaps.len();
+        let _ = writeln!(
+            out,
+            "coverage: PARTIAL — {} gap{}, {} refused, {} more not shown",
+            gaps,
+            if gaps == 1 { "" } else { "s" },
+            budgets.refusals(),
+            presentation.gaps_suppressed,
+        );
+    }
     // Key-operation summary: revision, status, row counts and
     // per-category terminal counts from the shared projection.
     // Counts and the fixed category/unit/status vocabulary only —
@@ -1434,20 +1541,47 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             // No journal producer is linked (the default without
             // --key-operations, or a build without the journal object):
             // say plainly that per-key tracking is off (OD33/R-50).
-            // Other reasons keep the generic unavailable wording.
+            // Other reasons name the cause in plain words, with the
+            // machine reason beside it in verbose text (JSON keeps it).
             if observations.reason == "journal_unavailable" {
-                let _ = writeln!(
-                    out,
-                    "key operations: not reported (per-key tracking is off)"
-                );
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "key operations: not reported (per-key tracking is off; \
+                         reason: journal_unavailable)"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "key operations: not reported (per-key tracking is off)"
+                    );
+                }
             } else {
-                let _ = writeln!(out, "key operations: unavailable ({})", observations.reason);
+                let plain = key_observation_plain_reason(observations.reason);
+                if verbose && plain != observations.reason {
+                    let _ = writeln!(
+                        out,
+                        "key operations: not available — {plain} (reason: {})",
+                        observations.reason
+                    );
+                } else {
+                    let _ = writeln!(out, "key operations: not available — {plain}");
+                }
             }
         } else {
             let status = if observations.reason == "none" {
                 observations.status.label().to_string()
             } else {
-                format!("{} ({})", observations.status.label(), observations.reason)
+                let plain = key_observation_plain_reason(observations.reason);
+                if verbose && plain != observations.reason {
+                    format!(
+                        "{} ({plain}; reason: {})",
+                        observations.status.label(),
+                        observations.reason
+                    )
+                } else {
+                    format!("{} ({plain})", observations.status.label())
+                }
             };
             let sessions = observations.sessions.len();
             let objects = observations.objects.len();
@@ -1533,7 +1667,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             application_label(presentation, edge.caller),
             module_label(presentation, edge.module),
             edge.module.label(),
-            observation_label(edge),
+            observation_label_at(edge, presentation.ended_ns),
         );
         if let Some(lifecycle) = caller.and_then(caller_lifecycle_label) {
             let _ = write!(out, "; {lifecycle}");
@@ -1553,7 +1687,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             let _ = write!(
                 out,
                 "; coverage {}",
-                escape_controls(&coverage_label(&edge.coverage))
+                escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns))
             );
         }
         out.push('\n');
@@ -1564,7 +1698,17 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             "No application/module associations observed; this does not prove that no PKCS#11 activity occurred."
         );
     }
+    render_excluded_lines(
+        &mut out,
+        &presentation.excluded_modules,
+        &presentation.unmatched_excludes,
+    );
     if summary_only {
+        return out;
+    }
+    if verbosity == crate::cli::TextVerbosity::Concise {
+        render_limits_line(&mut out, budgets);
+        let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);
         return out;
     }
     let _ = writeln!(
@@ -1642,7 +1786,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
         } else {
             format!(
                 " admission history {}",
-                admission_history_label(&module.admission_history)
+                admission_history_label_at(&module.admission_history, presentation.ended_ns)
             )
         };
         let _ = writeln!(
@@ -1708,8 +1852,8 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             edge.presence.label(),
             edge.capture.label(),
             edge.activity.label(),
-            snapshot_semantics(edge),
-            escape_controls(&coverage_label(&edge.coverage)),
+            snapshot_semantics_at(edge, presentation.ended_ns),
+            escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns)),
         );
         for child in presentation.semantic_children(edge.caller, edge.module) {
             let instance = child.instance;
@@ -1724,7 +1868,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                     .map_or_else(|| "unknown".into(), |n| n.to_string()),
                 if child.saturated { " (saturated)" } else { "" },
                 child.historical_only_returns,
-                snapshot_semantics_view(&child.semantics),
+                snapshot_semantics_view_at(&child.semantics, presentation.ended_ns),
                 child.lossy,
                 child.reasons.join(","),
             );
@@ -1733,8 +1877,18 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
     for gap in &presentation.gaps {
         // Subjects and reasons carry target-controlled strings (paths,
         // error text): escaped like every other snapshot field (DR-11).
-        let subject = escape_controls(&gap.subject);
-        let reason = escape_controls(&gap.reason);
+        // Known machine subjects/reasons render in plain words with the
+        // machine token beside them (JSON keeps the stored strings).
+        let plain_subject = gap_plain_subject(&gap.subject);
+        let plain_reason = gap_plain_reason(&gap.reason);
+        let mut subject = escape_controls(plain_subject).into_owned();
+        if plain_subject != gap.subject {
+            subject = format!("{subject} ({})", escape_controls(&gap.subject));
+        }
+        let mut reason = escape_controls(plain_reason).into_owned();
+        if plain_reason != gap.reason {
+            reason = format!("{reason} ({})", escape_controls(&gap.reason));
+        }
         match gap.budget {
             Some(refusal) => {
                 let _ = writeln!(
@@ -1749,15 +1903,23 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
         }
     }
     if presentation.gaps_suppressed > 0 {
-        let _ = writeln!(out, "gaps suppressed: {}", presentation.gaps_suppressed);
+        let _ = writeln!(out, "more gaps not shown: {}", presentation.gaps_suppressed);
     }
-    if !presentation.excluded_modules.is_empty() {
-        let _ = writeln!(
-            out,
-            "Excluded by you ({} files):",
-            presentation.excluded_modules.len()
-        );
-        for excluded in &presentation.excluded_modules {
+    out
+}
+
+/// The operator's own exclusions, echoed at every verbosity: an
+/// exclusion changes what the coverage above means, so it is never
+/// silent — not even under `--quiet`.
+fn render_excluded_lines(
+    out: &mut String,
+    excluded_modules: &[crate::render::ExcludedOut],
+    unmatched_excludes: &[String],
+) {
+    use std::fmt::Write as _;
+    if !excluded_modules.is_empty() {
+        let _ = writeln!(out, "Excluded by you ({} files):", excluded_modules.len());
+        for excluded in excluded_modules {
             let _ = writeln!(
                 out,
                 "  {}: excluded by you (device {} inode {}, {} processes mapped it); calls into this file were not observed",
@@ -1768,20 +1930,18 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
             );
         }
     }
-    if !presentation.unmatched_excludes.is_empty() {
+    if !unmatched_excludes.is_empty() {
         let _ = writeln!(
             out,
             "Unmatched exclusions ({}): {}",
-            presentation.unmatched_excludes.len(),
-            presentation
-                .unmatched_excludes
+            unmatched_excludes.len(),
+            unmatched_excludes
                 .iter()
                 .map(|input| escape_controls(input))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     }
-    out
 }
 
 #[cfg(test)]

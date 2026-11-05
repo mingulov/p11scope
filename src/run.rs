@@ -3908,6 +3908,8 @@ fn run_owned_inner_with_host(
     let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
         track_short_lived: args.track_short_lived,
+        verbose: false,
+        quiet: false,
         kind: args.kind,
         modules: args.modules.clone(),
         exclude_modules: args.exclude_modules.clone(),
@@ -6681,9 +6683,7 @@ fn capture_profile(
         render::apply_legacy_gaps(&mut ev, &snapshot);
         let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
-        for summary in &summaries {
-            let _ = crate::sink::try_stderr_line(summary);
-        }
+        emit_timing_summaries(&summaries);
 
         poll_terminal_cancellation();
         if let Some(mut out_file) = context.5.take() {
@@ -7581,9 +7581,7 @@ fn capture_trace(
                     });
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
-                    for summary in &summaries {
-                        let _ = crate::sink::try_stderr_line(summary);
-                    }
+                    emit_timing_summaries(&summaries);
                     Ok(evidence)
                 },
             )
@@ -8401,6 +8399,24 @@ fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::R
         end: resource_sample_of(&timeline.end),
         last_periodic: resource_sample_of(&timeline.last_periodic),
     }
+}
+
+/// Emits the Phase-2 timing summary: the newcomer-queue line always
+/// (the stop-race oracle cross-checks stderr pending against the
+/// report), the rest verbose-only.
+fn emit_timing_summaries(summaries: &[String]) {
+    for summary in timing_summaries_to_emit(summaries, crate::cli::text_is_verbose()) {
+        let _ = crate::sink::try_stderr_line(summary);
+    }
+}
+
+/// The [`emit_timing_summaries`] gate as a pure predicate, so tests
+/// pin it without capturing stderr.
+fn timing_summaries_to_emit(summaries: &[String], verbose: bool) -> Vec<&String> {
+    summaries
+        .iter()
+        .filter(|summary| summary.contains("timing: newcomer queue:") || verbose)
+        .collect()
 }
 
 /// The concise operator-visible timing summary (Phase 2): stage totals,
@@ -9278,6 +9294,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    /// CLI-1: default runs emit only the newcomer-queue timing line
+    /// (the oracle's cross-check); `-v` emits every timing line.
+    #[test]
+    fn timing_summaries_emit_only_the_newcomer_queue_by_default() {
+        let summaries = vec![
+            "p11scope: timing: stages: scan 6ms".to_string(),
+            "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 0 (oldest -), dropped 0 (max age -)".to_string(),
+        ];
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, false),
+            vec![&summaries[1]],
+        );
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, true),
+            vec![&summaries[0], &summaries[1]],
+        );
+    }
 
     /// The timing summary wraps to short prefixed stderr lines: every line
     /// stays greppable under `p11scope: timing:`, every token of the old
@@ -14220,6 +14254,8 @@ mod tests {
                 counter_mode: None,
                 select_endpoint: None,
                 track_short_lived: false,
+                verbose: false,
+                quiet: false,
                 duration: None,
                 out: None,
                 max_events: None,
@@ -14447,6 +14483,8 @@ mod tests {
             counter_mode: None,
             select_endpoint: None,
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             duration: None,
             out: None,
             max_events: None,
@@ -14543,6 +14581,8 @@ mod tests {
             counter_mode: None,
             select_endpoint: None,
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             duration: None,
             out: None,
             max_events: None,
@@ -14632,6 +14672,8 @@ mod tests {
             counter_mode: None,
             select_endpoint: None,
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             duration: None,
             out: None,
             max_events: None,
@@ -14702,6 +14744,8 @@ mod tests {
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             exclude_modules: vec![],
@@ -14754,6 +14798,8 @@ mod tests {
     fn capture_args(scope: ScopeArg) -> CaptureArgs {
         CaptureArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             exclude_modules: vec![],

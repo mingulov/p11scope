@@ -54,7 +54,21 @@ const INITIAL_MAPS_REFUSAL: &str = "memory scan refused: initial mapping validat
 
 /// Renders a completed scan. Pure: takes the scan result and the pinned identities,
 /// returns the text — so the layout is unit-testable without a target process.
+/// Renders at the run-scoped verbosity; see [`render_text_with_verbosity`].
 pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> String {
+    render_text_with_verbosity(pid, outcome, pinned, crate::cli::text_verbosity())
+}
+
+/// [`render_text`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps the header, one line per provider, folded
+/// skips, coverage and the `-v` hint; verbose is the full per-table
+/// listing; quiet keeps the header and coverage only.
+pub fn render_text_with_verbosity(
+    pid: u32,
+    outcome: &ScanOutcome,
+    pinned: &PinnedObjects,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
     render_text_with_application(
         pid,
         outcome,
@@ -62,6 +76,7 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
         &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         &[],
         &[],
+        verbosity,
     )
 }
 
@@ -72,7 +87,11 @@ fn render_text_with_application(
     application: &InspectApplicationResult,
     excluded: &[crate::render::ExcludedOut],
     unmatched: &[String],
+    verbosity: crate::cli::TextVerbosity,
 ) -> String {
+    use crate::cli::TextVerbosity;
+    let verbose = verbosity == TextVerbosity::Verbose;
+    let quiet = verbosity == TextVerbosity::Quiet;
     let modules = outcome.modules();
     let word = if modules.len() == 1 {
         "module"
@@ -87,48 +106,67 @@ fn render_text_with_application(
     let _ = write!(out, "pid {pid} — {} PKCS#11 {word} mapped", modules.len());
     match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
-            let _ = writeln!(out, " (scan {scan_ms}ms)");
+            if verbose {
+                let _ = writeln!(out, " (scan {scan_ms}ms)");
+            } else {
+                out.push('\n');
+            }
         }
         ScanOutcome::Unavailable { reason, .. } => {
             out.push('\n');
-            if *reason == "ptrace" {
-                let _ = writeln!(
-                    out,
-                    "table scan unavailable: /proc/{pid}/mem is not readable (ptrace)."
-                );
-                let _ = writeln!(
-                    out,
-                    "  Same-uid targets need kernel.yama.ptrace_scope=0 or the target to be a \
-                     descendant;"
-                );
-                let _ = writeln!(
-                    out,
-                    "  otherwise CAP_SYS_PTRACE. Modules below come from /proc/{pid}/maps and \
-                     .dynsym only."
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "table scan unavailable: {reason}. Modules below come from /proc/{pid}/maps \
-                     and .dynsym only."
-                );
+            if !quiet {
+                if *reason == "ptrace" {
+                    let _ = writeln!(
+                        out,
+                        "table scan unavailable: /proc/{pid}/mem is not readable (ptrace)."
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  Same-uid targets need kernel.yama.ptrace_scope=0 or the target to be a \
+                         descendant;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  otherwise CAP_SYS_PTRACE. Modules below come from /proc/{pid}/maps and \
+                         .dynsym only."
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "table scan unavailable: {reason}. Modules below come from /proc/{pid}/maps \
+                         and .dynsym only."
+                    );
+                }
             }
         }
     }
     out.push_str("Mapped modules only; activity was not captured by inspect.\n\n");
 
-    for module in modules {
-        render_module(&mut out, module, pinned);
-        out.push('\n');
+    if verbose {
+        for module in modules {
+            render_module(&mut out, module, pinned);
+            out.push('\n');
+        }
+    } else if !quiet {
+        for module in modules {
+            render_module_summary(&mut out, module);
+        }
+        if !modules.is_empty() {
+            out.push('\n');
+        }
     }
 
-    for skipped in outcome.skipped() {
-        let _ = writeln!(
-            out,
-            "skipped: {} — {}",
-            crate::render::escape_controls(&skipped.subject),
-            crate::render::escape_controls(&skipped.reason)
-        );
+    if verbose {
+        for skipped in outcome.skipped() {
+            let _ = writeln!(
+                out,
+                "skipped: {} — {}",
+                crate::render::escape_controls(&skipped.subject),
+                crate::render::escape_controls(&skipped.reason)
+            );
+        }
+    } else if !quiet {
+        render_folded_skips(&mut out, outcome.skipped());
     }
     if !excluded.is_empty() {
         let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
@@ -159,7 +197,96 @@ fn render_text_with_application(
                 .join(", ")
         );
     }
+    render_coverage(&mut out, outcome);
+    if verbosity == crate::cli::TextVerbosity::Concise {
+        let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);
+    }
     out
+}
+
+/// One concise line per provider: path plus the walked-function total.
+fn render_module_summary(out: &mut String, module: &ScannedModule) {
+    let functions: usize = module
+        .tables
+        .iter()
+        .map(|table| table.entries.len().saturating_sub(table.null_entries.len()))
+        .sum();
+    let tables = module.tables.len();
+    let _ = writeln!(
+        out,
+        "module  {} — {functions} function{} ({} table{})",
+        crate::render::escape_controls(&module.path),
+        if functions == 1 { "" } else { "s" },
+        tables,
+        if tables == 1 { "" } else { "s" },
+    );
+}
+
+/// Concise skips: a lone skip verbatim, repeated reasons folded with a
+/// count; `--json` lists each.
+fn render_folded_skips(out: &mut String, skipped: &[Skipped]) {
+    if skipped.len() == 1 {
+        let _ = writeln!(
+            out,
+            "skipped: {} — {}",
+            crate::render::escape_controls(&skipped[0].subject),
+            crate::render::escape_controls(&skipped[0].reason)
+        );
+        return;
+    }
+    let mut groups: Vec<(&str, usize)> = Vec::new();
+    for skip in skipped {
+        match groups.iter_mut().find(|(reason, _)| *reason == skip.reason) {
+            Some((_, count)) => *count += 1,
+            None => groups.push((skip.reason.as_str(), 1)),
+        }
+    }
+    for (reason, count) in groups {
+        let _ = writeln!(
+            out,
+            "skipped: {count} item{} could not be read — {} (--json lists each)",
+            if count == 1 { "" } else { "s" },
+            crate::render::escape_controls(reason)
+        );
+    }
+}
+
+/// One coverage status line: complete only when the scan finished and
+/// nothing was skipped.
+fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
+    match outcome {
+        ScanOutcome::Unavailable { reason, .. } => {
+            let _ = writeln!(
+                out,
+                "coverage: partial — target memory unreadable ({})",
+                crate::render::escape_controls(reason)
+            );
+        }
+        ScanOutcome::Scanned { skipped, .. } if !skipped.is_empty() => {
+            let _ = writeln!(
+                out,
+                "coverage: partial — {} item{} skipped (--json lists each)",
+                skipped.len(),
+                if skipped.len() == 1 { "" } else { "s" },
+            );
+        }
+        ScanOutcome::Scanned { .. } => {
+            let _ = writeln!(out, "coverage: complete");
+        }
+    }
+}
+
+/// The table-walk outcome in words, not codes: a full walk covered
+/// every slot, a known-prefix walk covered the known legacy functions
+/// and says nothing about newer ones (JSON keeps `walk` and
+/// `version`). Shared by pid and system inspect.
+pub(crate) fn table_walk_words(walk: &str, count: usize) -> String {
+    let noun = if count == 1 { "function" } else { "functions" };
+    if walk == "full" {
+        format!("{count} {noun} (fully walked)")
+    } else {
+        format!("{count} known {noun} (newer functions unknown)")
+    }
 }
 
 fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObjects) {
@@ -182,15 +309,15 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
 
     let table_lines = module.tables.iter().map(|table| {
         let count = table.entries.len();
-        let entry_word = if count == 1 { "entry" } else { "entries" };
         let nulls = if table.null_entries.is_empty() {
             String::new()
         } else {
             format!("  (NULL: {})", table.null_entries.join(", "))
         };
+        let coverage = table_walk_words(table.walk, count);
         format!(
-            "  table      {}.{}  {}  {count} {entry_word}{nulls}",
-            table.version.0, table.version.1, table.walk
+            "  table      {}.{}, {coverage}{nulls}",
+            table.version.0, table.version.1
         )
     });
     push_collapsed_lines(out, table_lines);
@@ -588,7 +715,15 @@ fn emit_application_diagnosis(
         write!(
             out,
             "{}",
-            render_text_with_application(pid, &outcome, &pinned, &application, excluded, unmatched)
+            render_text_with_application(
+                pid,
+                &outcome,
+                &pinned,
+                &application,
+                excluded,
+                unmatched,
+                crate::cli::text_verbosity(),
+            )
         )?;
     }
     Ok(0)
@@ -983,6 +1118,7 @@ mod tests {
             &application,
             &excluded,
             &unmatched,
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(out.contains("Excluded by you (1 files):"), "{out}");
         assert!(
@@ -1007,14 +1143,16 @@ mod tests {
 
     #[test]
     fn text_names_the_module_version_counts_and_null_entries() {
-        let out = render_text(4242, &sample(), &PinnedObjects::empty());
+        let out = render_text_with_verbosity(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(out.contains("pid 4242"), "{out}");
         assert!(out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
         assert!(out.contains("2.40"), "{out}");
-        assert!(
-            out.contains("1 entry") || out.contains("1 entries"),
-            "{out}"
-        );
+        assert!(out.contains("1 function (fully walked)"), "{out}");
         assert!(
             out.contains("C_GetFunctionStatus"),
             "NULL slots are evidence: {out}"
@@ -1045,7 +1183,12 @@ mod tests {
         ];
         modules[0].interfaces.clear();
 
-        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
         let lines: Vec<&str> = out
             .lines()
             .filter(|line| line.trim_start().starts_with("table "))
@@ -1053,9 +1196,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)  (×3 identical)",
-                "  table      3.2  full  1 entry  (NULL: C_GetFunctionStatus)",
-                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)",
+                "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)  (×3 identical)",
+                "  table      3.2, 1 function (fully walked)  (NULL: C_GetFunctionStatus)",
+                "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)",
             ],
             "{out}"
         );
@@ -1069,7 +1212,12 @@ mod tests {
         };
         modules[0].interfaces[0].name_lossy = Some("quote\"\\\n\r\t\u{1b}".into());
 
-        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(out.contains(r#""quote\"\\\n\r\t\u{1b}""#), "{out:?}");
         assert!(
             !out.contains("quote\"\\\n"),
@@ -1496,5 +1644,120 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    /// CLI-1: concise pid-inspect keeps the header, one line per
+    /// provider, folded skips, a coverage line and the `-v` hint.
+    #[test]
+    fn concise_pid_inspect_keeps_providers_coverage_and_hint() {
+        let ScanOutcome::Scanned {
+            modules, scan_ms, ..
+        } = sample()
+        else {
+            panic!("sample is a completed scan");
+        };
+        let outcome = ScanOutcome::Scanned {
+            modules,
+            skipped: vec![
+                Skipped {
+                    subject: "object A".into(),
+                    reason: "gone".into(),
+                },
+                Skipped {
+                    subject: "object B".into(),
+                    reason: "gone".into(),
+                },
+            ],
+            scan_ms,
+        };
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("1 PKCS#11 module mapped"), "{out}");
+        assert!(out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(!out.contains("identity   sha256"), "{out}");
+        assert!(!out.contains("interface  ["), "{out}");
+        assert!(!out.contains("skipped: object A"), "{out}");
+        assert!(
+            out.contains("skipped: 2 items could not be read — gone (--json lists each)"),
+            "{out}"
+        );
+        assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: pid-inspect skip groups use the singular for a count of
+    /// one (two skips, two reasons, two "1 item" lines).
+    #[test]
+    fn concise_pid_inspect_skip_groups_use_singular_for_one() {
+        let ScanOutcome::Scanned {
+            modules, scan_ms, ..
+        } = sample()
+        else {
+            panic!("sample is a completed scan");
+        };
+        let outcome = ScanOutcome::Scanned {
+            modules,
+            skipped: vec![
+                Skipped {
+                    subject: "object A".into(),
+                    reason: "gone".into(),
+                },
+                Skipped {
+                    subject: "object B".into(),
+                    reason: "moved".into(),
+                },
+            ],
+            scan_ms,
+        };
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains("skipped: 1 item could not be read — gone (--json lists each)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("skipped: 1 item could not be read — moved (--json lists each)"),
+            "{out}"
+        );
+        assert!(!out.contains("1 items"), "{out}");
+    }
+
+    /// CLI-1: verbose pid-inspect keeps the full per-table listing.
+    #[test]
+    fn verbose_pid_inspect_keeps_full_per_table_detail() {
+        let out = render_text_with_verbosity(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("identity   sha256"), "{out}");
+        assert!(out.contains("table      2.40"), "{out}");
+        assert!(out.contains("interface  ["), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: quiet pid-inspect is the header and coverage only.
+    #[test]
+    fn quiet_pid_inspect_keeps_header_and_coverage_only() {
+        let out = render_text_with_verbosity(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Quiet,
+        );
+        assert!(out.contains("1 PKCS#11 module mapped"), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
     }
 }

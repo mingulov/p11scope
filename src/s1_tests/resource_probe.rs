@@ -259,7 +259,8 @@ fn native_semantic_resource_projection_agrees_and_freezes() {
             budget
         );
     }
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let compact = format!("semantic {limit}/{limit}B peak={limit} refused=0");
     assert!(snapshot.contains(&compact));
     let frame = crate::inventory_dashboard::DisplayFrame {

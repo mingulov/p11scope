@@ -132,7 +132,10 @@ fn a_pending_first_use_renders_unknown_not_quiet_or_not_covered() {
         Activity::for_edge(MappingState::Mapped, false, false, false, &pending),
         Activity::Unknown
     );
-    assert_eq!(coverage_label(&pending), "unknown (first use undecided)");
+    assert_eq!(
+        coverage_label_at(&pending, 2),
+        "unknown (first use undecided)"
+    );
     assert_eq!(pending.state(), "unknown");
     assert_eq!(UnknownReason::PendingFirstUse.code(), "pending_first_use");
 }
@@ -155,7 +158,8 @@ fn refused_but_quiet_renders_both_states_not_one_merged_label() {
     assert_eq!(edge.presence, Presence::Mapped);
     assert_eq!(edge.capture, Capture::Refused);
     assert_eq!(edge.activity, Activity::Uncovered);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let line = snapshot
         .lines()
         .find(|line| {
@@ -226,7 +230,8 @@ fn snapshot_names_a_refused_module_with_its_admission_reason() {
     let harness = varied_harness();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let lines: Vec<&str> = snapshot.lines().collect();
     let position = lines
         .iter()
@@ -294,7 +299,8 @@ fn quiet_is_not_unloaded() {
     // Unloaded edges never read as quiet: no live mapping, unknown
     // activity — the quiet/unloaded distinction.
     assert_eq!(presentation.edges[0].activity, Activity::Unknown);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(snapshot.contains("presence unloaded"), "{snapshot}");
     assert!(!snapshot.contains("activity quiet"), "{snapshot}");
 }
@@ -349,14 +355,16 @@ fn a_frozen_watch_renders_watch_ended_never_armed_or_quiet() {
     assert_eq!(edge.capture, Capture::WatchEnded);
     assert_eq!(edge.activity, Activity::Unknown);
     assert_eq!(entries_display(edge), "?");
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let line = edge_line(&snapshot, edge);
     assert!(
         line.contains("capture watch ended activity unknown "),
         "{line}"
     );
+    let ago = crate::render::fmt_ns(Some(presentation.ended_ns.saturating_sub(since + 10)));
     assert!(
-        line.contains(&format!("no use from {since} to {}", since + 10)),
+        line.contains(&format!("no use for 10ns (watch ended {ago} ago)")),
         "{line}"
     );
 }
@@ -503,9 +511,10 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
         let _ = caller_lifecycle_label(caller);
     }
     for edge in &presentation.edges {
-        let _ = observation_label(edge);
+        let _ = observation_label_at(edge, presentation.ended_ns);
     }
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let overview: Vec<_> = snapshot
         .lines()
         .filter(|line| line.starts_with("application "))
@@ -569,12 +578,7 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
     assert!(overview[0].contains("At least 128 entries observed"));
     assert_eq!(
         snapshot.lines().nth(1).unwrap(),
-        format!(
-            "coverage: {} gaps, {} refusals, {} suppressed",
-            presentation.gaps.len(),
-            presentation.budgets.refusals(),
-            presentation.gaps_suppressed
-        )
+        "coverage: COMPLETE (nothing known was lost)"
     );
     let marker = "Details: retained paths, identities, states and coverage follow.";
     assert!(snapshot.contains(&format!("\n{marker}\nbudgets: ")));
@@ -619,7 +623,8 @@ fn retained_labels_preserve_unknown_deleted_and_incarnation() {
             ..template.clone()
         })
         .collect();
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
         snapshot.contains(&format!(
             "application python3 [{} pid 4242 incarnation 0]",
@@ -748,6 +753,8 @@ fn overview_observations_preserve_evidence_meaning() {
         since_ns: 10,
         lossy,
     };
+    let ended = presentation.ended_ns;
+    let ago = |then_ns: u64| crate::render::fmt_ns(Some(ended.saturating_sub(then_ns)));
     let cases = [
         (
             128,
@@ -779,7 +786,7 @@ fn overview_observations_preserve_evidence_meaning() {
             UseCoverage::Unknown(UnknownReason::RetiredBeforeCoverage),
             MappingState::Ended,
             "At least 128 entries observed (counter saturated)",
-            Some("unknown (retired before coverage)"),
+            Some("unknown (retired before coverage)".to_string()),
         ),
         (
             0,
@@ -795,7 +802,7 @@ fn overview_observations_preserve_evidence_meaning() {
             counted(false),
             MappingState::Mapped,
             "No entries observed in counted interval",
-            Some("counted since 10"),
+            Some(format!("counted exactly for the last {}", ago(10))),
         ),
         (
             0,
@@ -803,7 +810,10 @@ fn overview_observations_preserve_evidence_meaning() {
             counted(true),
             MappingState::Mapped,
             "Activity unknown; capture incomplete",
-            Some("counted since 10 (lossy)"),
+            Some(format!(
+                "counted for the last {} (lossy: some records dropped)",
+                ago(10)
+            )),
         ),
         (
             0,
@@ -814,7 +824,7 @@ fn overview_observations_preserve_evidence_meaning() {
             },
             MappingState::Mapped,
             "No entries observed during the covered interval",
-            Some("no use since 10"),
+            Some(format!("no use for the last {}", ago(10))),
         ),
         (
             0,
@@ -825,7 +835,7 @@ fn overview_observations_preserve_evidence_meaning() {
             },
             MappingState::Ended,
             "No entries observed during the covered interval",
-            Some("no use from 10 to 20"),
+            Some(format!("no use for 10ns (watch ended {} ago)", ago(20))),
         ),
         (
             0,
@@ -833,7 +843,7 @@ fn overview_observations_preserve_evidence_meaning() {
             UseCoverage::Unknown(UnknownReason::PendingFirstUse),
             MappingState::Mapped,
             "Observation pending",
-            Some("unknown (first use undecided)"),
+            Some("unknown (first use undecided)".to_string()),
         ),
         (
             0,
@@ -841,7 +851,7 @@ fn overview_observations_preserve_evidence_meaning() {
             UseCoverage::Unknown(UnknownReason::ScanOnly),
             MappingState::Mapped,
             "Module mapped; activity not captured",
-            Some("unknown (scan only)"),
+            Some("unknown (scan only)".to_string()),
         ),
         (
             0,
@@ -849,7 +859,7 @@ fn overview_observations_preserve_evidence_meaning() {
             UseCoverage::Unknown(UnknownReason::ScanOnly),
             MappingState::Ended,
             "Activity not captured",
-            Some("unknown (scan only)"),
+            Some("unknown (scan only)".to_string()),
         ),
         (
             0,
@@ -857,7 +867,7 @@ fn overview_observations_preserve_evidence_meaning() {
             UseCoverage::Unknown(UnknownReason::Loss("bad\u{1b}[2J\u{7}\u{9b}\u{7f}".into())),
             MappingState::Mapped,
             "Activity unknown",
-            Some("unknown (loss: bad\\u{1b}[2J\\u{7}\\u{9b}\\u{7f})"),
+            Some("unknown (loss: bad\\u{1b}[2J\\u{7}\\u{9b}\\u{7f})".to_string()),
         ),
     ];
     for (count, saturated, coverage, mapping, explanation, interval) in cases {
@@ -870,7 +880,7 @@ fn overview_observations_preserve_evidence_meaning() {
             &presentation,
         ))
         .unwrap();
-        let label = observation_label(&presentation.edges[0]);
+        let label = observation_label_at(&presentation.edges[0], presentation.ended_ns);
         if matches!(
             presentation.edges[0].coverage,
             UseCoverage::Unknown(UnknownReason::Loss(_))
@@ -892,7 +902,7 @@ fn overview_observations_preserve_evidence_meaning() {
             "{overview}"
         );
         if let Some(interval) = interval {
-            assert!(overview.contains(interval), "{overview}");
+            assert!(overview.contains(interval.as_str()), "{overview}");
         }
         if explanation == "Observation pending"
             || explanation.starts_with("Activity unknown")
@@ -919,7 +929,8 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     let harness = varied_harness();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let lines: Vec<&str> = snapshot.lines().collect();
 
     // Header totals match the document arrays + pass count.
@@ -1101,7 +1112,7 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
         assert!(
             line.ends_with(&format!(
                 " coverage {}",
-                coverage_label(&edge_view.coverage)
+                coverage_label_at(&edge_view.coverage, presentation.ended_ns)
             )),
             "{line}"
         );
@@ -1158,7 +1169,7 @@ fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
         "varied fixture retains every gap"
     );
     assert!(
-        !snapshot.contains("gaps suppressed:"),
+        !snapshot.contains("more gaps not shown:"),
         "no suppression marker without suppression:\n{snapshot}"
     );
 }
@@ -1204,7 +1215,8 @@ fn mapping_columns_never_report_calls() {
     let harness = varied_harness();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let quiet_mapped: Vec<&EdgeView> = presentation
         .edges
         .iter()
@@ -1304,12 +1316,16 @@ fn a_witnessed_edge_is_never_idle_in_any_output_even_after_exit() {
         entries["last_seen_ns"].is_null(),
         "no recency from a witness"
     );
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let line = edge_line(&snapshot, witnessed);
     assert!(line.contains("activity used (recency unknown)"), "{line}");
     assert!(!line.contains("activity quiet"), "{line}");
+    let ago = crate::render::fmt_ns(Some(presentation.ended_ns.saturating_sub(now)));
     assert!(
-        line.contains(&format!("coverage used, count unavailable (first {now})")),
+        line.contains(&format!(
+            "coverage used, count unavailable (first use {ago} ago)"
+        )),
         "{line}"
     );
     assert_eq!(entries_display(witnessed), "?");
@@ -1386,7 +1402,8 @@ fn partial_attach_renders_no_use_since_and_unknown_side_by_side() {
     harness.commit();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let by_path = |path: &str| {
         let module = document["modules"]
             .as_array()
@@ -1411,7 +1428,10 @@ fn partial_attach_renders_no_use_since_and_unknown_side_by_side() {
     assert_eq!(attached_json["coverage"]["state"], "watched_no_use");
     assert_eq!(attached_json["coverage"]["since_ns"], since);
     assert!(
-        edge_line(&snapshot, attached).contains(&format!("coverage no use since {since}")),
+        edge_line(&snapshot, attached).contains(&format!(
+            "coverage no use for the last {}",
+            crate::render::fmt_ns(Some(presentation.ended_ns.saturating_sub(since)))
+        )),
         "{snapshot}"
     );
     assert_eq!(entries_display(attached), "0");
@@ -1502,10 +1522,12 @@ fn a_module_admitted_after_a_first_refusal_never_reads_refused() {
             .all(|edge| edge.capture != Capture::Refused),
         "an instrumented module never reads refused"
     );
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let ago = crate::render::fmt_ns(Some(presentation.ended_ns.saturating_sub(later)));
     assert!(
         snapshot.contains(&format!(
-            "({}) admission history refused->admitted@{later}",
+            "({}) admission history refused->admitted@{ago} ago",
             "admitted"
         )),
         "{snapshot}"
@@ -1538,7 +1560,8 @@ fn budgets_carry_the_inventory_attach_set_endpoints() {
         document["budgets"]["inventory_attach_modules"],
         serde_json::json!({"limit": 32768, "occupied": 0, "refused": 0})
     );
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let budgets = snapshot
         .lines()
         .find(|line| line.starts_with("budgets: "))
@@ -1589,7 +1612,8 @@ fn snapshot_gap_lines_escape_target_controlled_control_characters() {
     harness.commit();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     for raw in ['\u{1b}', '\u{7}', '\r', '\u{9b}'] {
         assert!(
             !snapshot.contains(raw),
@@ -1695,7 +1719,8 @@ fn uncovered_edges_read_neither_idle_nor_armed() {
         (scale_key(5), Capture::Armed, Activity::Used),
         (refused_key, Capture::Refused, Activity::Uncovered),
     ];
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     for (key, capture, activity) in expect {
         let edge = view(&key);
         assert_eq!(
@@ -1936,13 +1961,14 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
 
     presentation.render_index =
         PresentationRenderIndex::build(&presentation.instances, &presentation.semantic_edges);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert_eq!(
         snapshot,
         concat!(
             "inventory f7 (1 pass, 2 callers, 2 modules, 2 edges)\n",
-            "coverage: 1 gaps, 0 refusals, 0 suppressed\n",
-            "key operations: unavailable (bootstrap_unavailable)\n",
+            "coverage: PARTIAL — 1 gap, 0 refused, 0 more not shown\n",
+            "key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)\n",
             "application f7-app0 [c0 pid 70000 incarnation 0] -> module m0.so [m0]: At least 34 entries observed\n",
             "application f7-app1 [c1 pid 70001 incarnation 0] -> module m1.so [m1]: At least 55 entries observed\n",
             "Details: retained paths, identities, states and coverage follow.\n",
@@ -1951,10 +1977,10 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
             "caller c1 pid 70001 incarnation 0 mapped (/usr/bin/f7-app1)\n",
             "module m0 /scale/m0.so mapped (admitted)\n",
             "module m1 /scale/m1.so mapped (admitted)\n",
-            "edge c0 -> m0 mapping mapped entries 34 (observed) presence mapped capture armed activity used (recency unknown) semantics unknown (semantic capture withheld) coverage counted since 100\n",
+            "edge c0 -> m0 mapping mapped entries 34 (observed) presence mapped capture armed activity used (recency unknown) semantics unknown (semantic capture withheld) coverage counted exactly for the last 100ns\n",
             "  instance i2 observed api_returns=3 historical_only_returns=0 semantics unknown (no operation evidence) coverage lossy=false reasons=[]\n",
             "  instance i11 retired api_returns=5 (saturated) historical_only_returns=1 semantics unknown (no operation evidence) coverage lossy=true reasons=[instance_retired,semantic_loss]\n",
-            "edge c1 -> m1 mapping mapped entries 55 (observed) presence mapped capture armed activity used (recency unknown) semantics unknown (semantic capture withheld) coverage counted since 100\n",
+            "edge c1 -> m1 mapping mapped entries 55 (observed) presence mapped capture armed activity used (recency unknown) semantics unknown (semantic capture withheld) coverage counted exactly for the last 100ns\n",
             "  instance i7 uncertain api_returns=unknown historical_only_returns=0 semantics unknown (no calls observed) coverage lossy=true reasons=[semantic_loss]\n",
             "  instance i4095 observed api_returns=0 historical_only_returns=0 semantics unknown (no operation evidence) coverage lossy=false reasons=[]\n",
             "gap [fixture scope] semantic state refused (budget semantic_state: limit 4, requested 5)\n",
@@ -1965,18 +1991,20 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
 }
 
 /// `--quiet` keeps the summary head (header, coverage, key operations,
-/// every application edge) and drops everything from `Details:` on.
+/// every application edge) and drops the limits line, the hint and
+/// everything from `Details:` on.
 #[test]
 fn quiet_summary_keeps_the_head_and_drops_details() {
     let harness = varied_harness();
     let presentation = capture_for(&harness, &harness.render());
-    let full = render_snapshot(&presentation);
-    assert!(full.contains("Details: retained paths"), "{full}");
-    assert!(full.contains("application "), "{full}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains("Details: retained paths"), "{verbose}");
+    assert!(verbose.contains("application "), "{verbose}");
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let summary = render_snapshot_summary(&presentation);
-    let head: String = full
+    let head: String = concise
         .lines()
-        .take_while(|line| !line.starts_with("Details:"))
+        .take_while(|line| !line.starts_with("limits:"))
         .map(|line| format!("{line}\n"))
         .collect();
     assert_eq!(summary, head);
@@ -2050,8 +2078,9 @@ fn f7_snapshot_high_cardinality_allocation_baseline() {
     assert_eq!(presentation.semantic_edges.len(), 4096);
     presentation.render_index =
         PresentationRenderIndex::build(&presentation.instances, &presentation.semantic_edges);
-    let (snapshot, allocations, bytes) =
-        crate::test_alloc::count_allocs_during(|| render_snapshot(&presentation));
+    let (snapshot, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose)
+    });
     assert_eq!(
         snapshot
             .lines()
@@ -2241,4 +2270,108 @@ fn flagged_unregistered_mechanism_renders_row_without_name() {
     assert_eq!(row.id, 0xCE53_43A9);
     assert_eq!(row.name, None);
     assert_eq!((row.calls, row.errors), (1, 0));
+}
+
+/// CLI-1: the concise snapshot keeps the summary head, the limits
+/// line and the `-v` hint; the `Details:` tail is verbose-only.
+#[test]
+fn concise_snapshot_keeps_head_limits_and_hint() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(out.contains("inventory workload ("), "{out}");
+    assert!(out.contains("coverage: "), "{out}");
+    assert!(out.contains("key operations: "), "{out}");
+    assert!(out.contains("limits:"), "{out}");
+    assert!(out.contains("Full budget detail: -v or --json."), "{out}");
+    assert!(!out.contains("budgets:"), "{out}");
+    assert!(!out.contains("Details:"), "{out}");
+    assert!(!out.contains("gap ["), "{out}");
+    assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+}
+
+/// CLI-1: the concise limits line uses singular nouns for counts of
+/// one (a 1×1×1 capture reads "1 caller", never "1 callers").
+#[test]
+fn concise_limits_line_uses_singular_nouns_for_one() {
+    let mut harness = harness();
+    let spec = ScaleSpec {
+        name: "present-limits-singular",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 73_000,
+    };
+    harness.stage_scale(&spec);
+    harness.commit();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 1, 1);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let limits = out
+        .lines()
+        .find(|line| line.starts_with("limits:"))
+        .unwrap_or_else(|| panic!("no limits line: {out}"));
+    assert!(
+        limits.starts_with("limits: 1 caller, 1 provider file, 1 link (0 refused);"),
+        "{limits}"
+    );
+    assert!(limits.contains("function"), "{limits}");
+    assert!(!limits.contains("callers"), "{limits}");
+    assert!(!limits.contains("files"), "{limits}");
+    assert!(!limits.contains("links"), "{limits}");
+}
+
+/// CLI-1: the verbose snapshot keeps the full `Details:` tail and no hint.
+#[test]
+fn verbose_snapshot_keeps_details_without_hint() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(out.contains("Details:"), "{out}");
+    assert!(out.contains("budgets:"), "{out}");
+    assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+}
+
+/// CLI-1: the quiet snapshot is the summary head, identical to the
+/// `--quiet` direct entry, with no hint.
+#[test]
+fn quiet_snapshot_matches_summary_head_without_hint() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Quiet);
+    assert_eq!(out, render_snapshot_summary(&presentation));
+    assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+}
+
+/// CLI-1/STAT-1: the coverage line carries a COMPLETE verdict when
+/// nothing is lost and a PARTIAL verdict with counts otherwise.
+#[test]
+fn coverage_line_carries_a_complete_or_partial_verdict() {
+    let harness = varied_harness();
+    let mut clean = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    clean.gaps.clear();
+    clean.gaps_suppressed = 0;
+    clean.budgets.callers_refused = 0;
+    clean.budgets.modules_refused = 0;
+    clean.budgets.edges_refused = 0;
+    clean.budgets.endpoints_refused = 0;
+    let out = render_snapshot_with_verbosity(&clean, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("coverage: COMPLETE (nothing known was lost)"),
+        "{out}"
+    );
+    let varied = varied_harness();
+    let mut presentation = Presentation::capture(varied.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "fixture gap".into(),
+        reason: "fixture reason".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(out.contains("coverage: PARTIAL"), "{out}");
+    assert!(!out.contains("suppressed"), "{out}");
 }

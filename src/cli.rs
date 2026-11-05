@@ -17,6 +17,73 @@ pub enum Kind {
     Trace,
 }
 
+/// Terminal text verbosity (CLI-1 owner ruling): default output is
+/// concise, `-v`/`--verbose` shows full detail, and `--quiet` prints
+/// only the summary head. `--json` and `-o` are always complete and
+/// never consult this switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextVerbosity {
+    Quiet,
+    #[default]
+    Concise,
+    Verbose,
+}
+
+impl TextVerbosity {
+    /// Maps the two flags to a level. Both together are a usage error,
+    /// never a silent precedence.
+    pub fn resolve(verbose: bool, quiet: bool) -> Result<Self, CliError> {
+        match (verbose, quiet) {
+            (true, true) => Err(usage_err("--quiet and --verbose are mutually exclusive")),
+            (true, false) => Ok(Self::Verbose),
+            (false, true) => Ok(Self::Quiet),
+            (false, false) => Ok(Self::Concise),
+        }
+    }
+}
+
+/// The hint every concise text report ends with.
+pub const VERBOSE_HINT: &str = "run with -v for details";
+
+/// Run-scoped text verbosity, mirroring the scan-progress toggle: set
+/// once at command entry, restored on exit, so the deep run wrappers
+/// need no new display parameter. The default is [`TextVerbosity::Concise`].
+static TEXT_VERBOSITY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+/// Sets the run-scoped verbosity; returns the previous setting.
+pub fn set_text_verbosity(verbosity: TextVerbosity) -> TextVerbosity {
+    let next = match verbosity {
+        TextVerbosity::Quiet => 0,
+        TextVerbosity::Concise => 1,
+        TextVerbosity::Verbose => 2,
+    };
+    match TEXT_VERBOSITY.swap(next, std::sync::atomic::Ordering::SeqCst) {
+        0 => TextVerbosity::Quiet,
+        2 => TextVerbosity::Verbose,
+        _ => TextVerbosity::Concise,
+    }
+}
+
+/// The current run-scoped verbosity.
+pub fn text_verbosity() -> TextVerbosity {
+    match TEXT_VERBOSITY.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => TextVerbosity::Quiet,
+        2 => TextVerbosity::Verbose,
+        _ => TextVerbosity::Concise,
+    }
+}
+
+/// True only under `-v`/`--verbose`: full detail plus informational
+/// stderr notes.
+pub fn text_is_verbose() -> bool {
+    text_verbosity() == TextVerbosity::Verbose
+}
+
+/// True only under `--quiet`: summary head only, for scripts.
+pub fn text_is_quiet() -> bool {
+    text_verbosity() == TextVerbosity::Quiet
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeArg {
     Pid(u32),
@@ -68,6 +135,12 @@ pub struct CaptureArgs {
     /// records exec-time exe identity and the engine classifies novel
     /// unmatched exits into static-linkage hints. Default off.
     pub track_short_lived: bool,
+    /// `-v`/`--verbose`: full text detail plus informational stderr
+    /// notes. Default off; refused beside `--quiet`.
+    pub verbose: bool,
+    /// `--quiet`: summary head only, for scripts. Default off; refused
+    /// beside `--verbose`.
+    pub quiet: bool,
 }
 
 /// What `run` is allowed to do to its own child to keep loader discovery from
@@ -122,6 +195,12 @@ pub struct RunArgs {
     /// `--track-short-lived`: extensive mode (6.14 Option B), same as
     /// profile. Default off.
     pub track_short_lived: bool,
+    /// `-v`/`--verbose`: full text detail plus informational stderr
+    /// notes. Default off; refused beside `--quiet`.
+    pub verbose: bool,
+    /// `--quiet`: summary head only, for scripts. Default off; refused
+    /// beside `--verbose`.
+    pub quiet: bool,
     /// Everything after `--`, verbatim — bytes, not text: Linux arguments
     /// need not be UTF-8 (M-9). Never empty.
     pub command: Vec<OsString>,
@@ -156,6 +235,12 @@ pub struct InspectArgs {
     /// `--max-scan-pids`: members deep-scanned per pass; None ⇒ 256 default.
     /// Only `--system` scans more than one member, so only it reads this.
     pub max_scan_pids: Option<usize>,
+    /// `-v`/`--verbose`: full text detail plus informational stderr
+    /// notes. Default off; refused beside `--quiet`.
+    pub verbose: bool,
+    /// `--quiet`: summary head only, for scripts. Default off; refused
+    /// beside `--verbose`.
+    pub quiet: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,8 +301,11 @@ pub struct InventoryArgs {
     pub diagnostics_pid: Option<u32>,
     /// `--quiet`: print only the summary head (totals plus
     /// application/module edges) and silence scan progress. `--json`,
-    /// `-o`, and logs are unchanged.
+    /// `-o`, and logs are unchanged. Refused beside `--verbose`.
     pub quiet: bool,
+    /// `-v`/`--verbose`: full text detail plus informational stderr
+    /// notes. Default off; refused beside `--quiet`.
+    pub verbose: bool,
     /// `--capture`: which usage lane runs; `auto` by default.
     pub capture: CaptureMode,
     /// Opt-in finite display hints; never changes capture or scope.
@@ -424,18 +512,37 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
+                   [-v] [--quiet]
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
+                   [-v] [--quiet]
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
-                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json]
+                   [-v] [--quiet]
   p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+                   [-v] [--quiet]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
+                   [--attach-backend auto|multi|singles] [--dashboard]
+                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
+                   [--attach-backend auto|multi|singles] [--dashboard]
+                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
+                   [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
+                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -485,6 +592,7 @@ The selection attempt is recorded in the report's additive selected_detail ledge
 Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
+Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail (every gap and reason, per-function data, timing) plus informational stderr notes; --quiet prints only the summary head. --json and -o are always complete.
 environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
 P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
 capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
@@ -500,6 +608,7 @@ const PROFILE_HELP: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
+                   [-v] [--quiet]
 
 examples (4242 is an example PID, not a detected target):
   p11scope profile --pid 4242 --duration 30s -o profile.json
@@ -525,6 +634,7 @@ executable identity and unmatched exits classify into STATIC HINT linkage classe
 Refused beside --counter-mode: extensive mode arms Detailed captures only.
 Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
+Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions.
 ";
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
@@ -532,6 +642,7 @@ const TRACE_HELP: &str = "usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
+                   [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope trace --pid 4242 --duration 10s --max-events 1000
@@ -547,6 +658,7 @@ Executable names require verified event-image evidence; missing identity stays u
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
 Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED names the effective cap.
 -o copies the trace to a file; -o - uses stdout only.
+Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing).
 ";
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
@@ -554,7 +666,7 @@ const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
                    [--attach-backend auto|multi|singles]
-                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
+                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
 
 example (replace the example program path with your command):
   p11scope run --trace -- /absolute/path/to/program
@@ -579,12 +691,15 @@ while a leader exit that is the last lifecycle record ends the window cleanly.
 executable identity and unmatched exits classify into STATIC HINT linkage classes.
 Refused beside --counter-mode: extensive mode arms Detailed captures only.
 Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
+Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
 const INSPECT_HELP: &str = "usage:
   p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json]
+                   [-v] [--quiet]
   p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
+                   [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope inspect --pid 4242 --json
@@ -595,6 +710,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
 Choose --pid or --system. --json preserves the same discovery facts for scripts.
 Unreadable or unexamined identities remain unknown.
+Default text output is concise: the mapped providers, one coverage line, and a hint. -v, --verbose shows every gap and reason with per-table data. --quiet prints only the summary head.
 ";
 
 /// `p11scope doctor --help`: scoped syntax, examples and evidence limits.
@@ -611,9 +727,24 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
+                   [--attach-backend auto|multi|singles] [--dashboard]
+                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
+                   [--attach-backend auto|multi|singles] [--dashboard]
+                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
+                   [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
+                   [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
+                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -642,6 +773,7 @@ identity load until the first nonempty proof plan, userspace never loads identit
 validates numbering/BTF, strict load and functional probe before capture starts. System scope
 only; explicit use under --pid/--cgroup is refused.
 --quiet prints only the summary head (totals plus application/module edges) and silences scan progress; --json, -o and logs are unchanged.
+Default text output is concise: the summary head plus the limits line. -v, --verbose shows full detail (every gap and reason, per-caller/module/edge data, budgets, timing) plus informational stderr notes.
 --json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
 --diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
 --diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
@@ -994,6 +1126,8 @@ struct Common {
     unsafe_requested: bool,
     allow_confined_uretprobe: bool,
     track_short_lived: bool,
+    verbose: bool,
+    quiet: bool,
     attach_backend: BackendSelection,
     /// `--attach-backend` is scalar like the rest, but its type has no
     /// unset state, so repeats are tracked separately.
@@ -1171,6 +1305,8 @@ fn capture_option(
         "--unsafe-unvalidated-metadata" => common.unsafe_requested = true,
         "--allow-uretprobe-on-confined-target" => common.allow_confined_uretprobe = true,
         "--track-short-lived" => common.track_short_lived = true,
+        "-v" | "--verbose" => common.verbose = true,
+        "--quiet" => common.quiet = true,
         _ => return Ok(false),
     }
     Ok(true)
@@ -1239,9 +1375,13 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
     let mut max_scan_pids: Option<usize> = None;
+    let mut verbose = false;
+    let mut quiet = false;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inspect)),
+            "-v" | "--verbose" => verbose = true,
+            "--quiet" => quiet = true,
             "--pid" => {
                 if pid.is_some() {
                     return Err(usage_err("--pid given twice"));
@@ -1274,6 +1414,7 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
     if system && pid.is_some() {
         return Err(usage_err("--pid and --system are mutually exclusive"));
     }
+    TextVerbosity::resolve(verbose, quiet)?;
     let scope = match (pid, system) {
         (Some(pid), false) => InspectScope::Pid(pid),
         (None, true) => InspectScope::System,
@@ -1287,6 +1428,8 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
         hooks,
         json,
         max_scan_pids,
+        verbose,
+        quiet,
     })
 }
 
@@ -1389,6 +1532,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut diagnostics: Option<PathBuf> = None;
     let mut diagnostics_pid: Option<u32> = None;
     let mut quiet = false;
+    let mut verbose = false;
     let mut capture: Option<CaptureMode> = None;
     let mut caller_metadata: Option<CallerMetadataMode> = None;
     let mut attach_backend: Option<BackendSelection> = None;
@@ -1465,6 +1609,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
             "--quiet" => quiet = true,
+            "-v" | "--verbose" => verbose = true,
             "--dashboard" => dashboard = true,
             "--event-log" => {
                 if event_log.is_some() {
@@ -1647,6 +1792,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
              use inventory --system)"
         )));
     }
+    TextVerbosity::resolve(verbose, quiet)?;
     Ok(InventoryArgs {
         scope,
         modules,
@@ -1668,6 +1814,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         diagnostics,
         diagnostics_pid,
         quiet,
+        verbose,
         capture: capture.unwrap_or(CaptureMode::Auto),
         caller_metadata: caller_metadata.unwrap_or_default(),
         attach_backend: attach_backend.unwrap_or_default(),
@@ -1776,6 +1923,9 @@ pub fn parse_capture(
             "--max-events is a trace option; profile publishes one aggregate document",
         ));
     }
+    // The level itself resolves at command entry; parsing only refuses
+    // the contradictory pair.
+    TextVerbosity::resolve(common.verbose, common.quiet)?;
 
     let metrics = common.metrics_for(kind, "trace")?;
     let out = resolve_dash_out(kind, "profile", common.out)?;
@@ -1800,6 +1950,8 @@ pub fn parse_capture(
         allow_confined_uretprobe: common.allow_confined_uretprobe,
         attach_backend: common.attach_backend,
         track_short_lived: common.track_short_lived,
+        verbose: common.verbose,
+        quiet: common.quiet,
     })
 }
 
@@ -1866,6 +2018,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
             "--max-events is a trace option; profile publishes one aggregate document",
         ));
     }
+    TextVerbosity::resolve(common.verbose, common.quiet)?;
     let metrics = common.metrics_for(kind, "run --trace")?;
     let out = resolve_dash_out(kind, "run without --trace", common.out)?;
     Ok(RunArgs {
@@ -1890,6 +2043,8 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         attach_backend: common.attach_backend,
         kill_on_timeout,
         track_short_lived: common.track_short_lived,
+        verbose: common.verbose,
+        quiet: common.quiet,
         command,
     })
 }
@@ -2642,36 +2797,54 @@ mod tests {
         );
     }
 
+    /// One wrapped synopsis block per inventory scope: the prefixed
+    /// line plus its continuation lines, joined. The synopsis wraps
+    /// one option group per line (HELP-1); flags live anywhere in
+    /// their scope's block.
+    fn inventory_usage_blocks(text: &str) -> Vec<String> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut blocks = Vec::new();
+        for (start, line) in lines.iter().enumerate() {
+            if !(line.contains("p11scope inventory --") && line.contains("[--")) {
+                continue;
+            }
+            let mut block = line.to_string();
+            for following in lines.iter().skip(start + 1) {
+                if following.starts_with("                   [") {
+                    block.push_str(following);
+                } else {
+                    break;
+                }
+            }
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn inventory_usage_block_for<'a>(blocks: &'a [String], prefix: &str) -> &'a str {
+        let matches: Vec<&String> = blocks
+            .iter()
+            .filter(|block| block.starts_with(prefix))
+            .collect();
+        assert_eq!(matches.len(), 1, "missing or duplicate {prefix:?} block");
+        matches[0]
+    }
+
     /// The C8 harness probes `--capture` on a usage line that names
     /// `p11scope inventory` (`inventory-native-oracle.py probe-help`): every
     /// inventory scope usage line carries it, in global and scoped help alike.
     #[test]
     fn inventory_usage_lines_carry_the_capture_flag() {
         for text in [USAGE, INVENTORY_HELP] {
-            let lines: Vec<&str> = text
-                .lines()
-                .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
-                .collect();
-            assert_eq!(lines.len(), 3, "{text}");
+            let blocks = inventory_usage_blocks(text);
+            assert_eq!(blocks.len(), 3, "{text}");
             for prefix in [
                 "  p11scope inventory --pid ",
                 "  p11scope inventory --cgroup ",
                 "  p11scope inventory --system ",
             ] {
-                let scoped_lines: Vec<&&str> = lines
-                    .iter()
-                    .filter(|line| line.starts_with(prefix))
-                    .collect();
-                assert_eq!(
-                    scoped_lines.len(),
-                    1,
-                    "missing or duplicate {prefix:?} line"
-                );
-                assert!(
-                    scoped_lines[0].contains("[--capture auto|scan|native]"),
-                    "{}",
-                    scoped_lines[0]
-                );
+                let block = inventory_usage_block_for(&blocks, prefix);
+                assert!(block.contains("[--capture auto|scan|native]"), "{block}");
             }
         }
     }
@@ -2858,29 +3031,17 @@ mod tests {
             Err(CliError::Usage { message: m, .. }) if m.contains("given twice")
         ));
         for help in [USAGE, INVENTORY_HELP] {
-            let lines: Vec<&str> = help
-                .lines()
-                .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
-                .collect();
-            assert_eq!(lines.len(), 3);
+            let blocks = inventory_usage_blocks(help);
+            assert_eq!(blocks.len(), 3);
             for prefix in [
                 "  p11scope inventory --pid ",
                 "  p11scope inventory --cgroup ",
                 "  p11scope inventory --system ",
             ] {
-                let scoped_lines: Vec<&&str> = lines
-                    .iter()
-                    .filter(|line| line.starts_with(prefix))
-                    .collect();
-                assert_eq!(
-                    scoped_lines.len(),
-                    1,
-                    "missing or duplicate {prefix:?} line"
-                );
+                let block = inventory_usage_block_for(&blocks, prefix);
                 assert!(
-                    scoped_lines[0].contains("[--attach-backend auto|multi|singles]"),
-                    "{}",
-                    scoped_lines[0]
+                    block.contains("[--attach-backend auto|multi|singles]"),
+                    "{block}"
                 );
             }
         }
@@ -3255,6 +3416,120 @@ mod tests {
     }
 
     #[test]
+    fn verbosity_flags_parse_on_every_user_facing_command() {
+        // `-v` and `--verbose` spell the same flag; `--quiet` is the
+        // scripts-only summary head. All four user-facing commands plus
+        // trace (stderr notes only there) accept them; omission means off.
+        let Command::Profile(profile) = parse(args(&["profile", "--pid", "7", "-v"])).unwrap()
+        else {
+            panic!("expected profile");
+        };
+        assert!(profile.verbose);
+        assert!(!profile.quiet);
+        let Command::Trace(trace) = parse(args(&[
+            "trace",
+            "--pid",
+            "7",
+            "--duration",
+            "1s",
+            "--verbose",
+        ]))
+        .unwrap() else {
+            panic!("expected trace");
+        };
+        assert!(trace.verbose);
+        assert!(!trace.quiet);
+        let Command::Run(run) = parse(args(&["run", "--quiet", "--", "/bin/true"])).unwrap() else {
+            panic!("expected run");
+        };
+        assert!(!run.verbose);
+        assert!(run.quiet);
+        let Command::Inspect(inspect) =
+            parse(args(&["inspect", "--pid", "7", "--verbose"])).unwrap()
+        else {
+            panic!("expected inspect");
+        };
+        assert!(inspect.verbose);
+        assert!(!inspect.quiet);
+        let Command::Inspect(system) = parse(args(&["inspect", "--system", "-v"])).unwrap() else {
+            panic!("expected inspect");
+        };
+        assert!(system.verbose);
+        let Command::Inventory(inventory) = parse(args(&["inventory", "--system", "-v"])).unwrap()
+        else {
+            panic!("expected inventory");
+        };
+        assert!(inventory.verbose);
+        assert!(!inventory.quiet);
+        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
+            panic!("expected inventory");
+        };
+        assert!(!plain.verbose, "verbose defaults off");
+        assert!(!plain.quiet, "quiet defaults off");
+    }
+
+    #[test]
+    fn quiet_and_verbose_together_are_refused_on_every_command() {
+        for argv in [
+            vec!["profile", "--pid", "7", "--quiet", "--verbose"],
+            vec!["trace", "--pid", "7", "-v", "--quiet"],
+            vec!["run", "-v", "--quiet", "--", "/bin/true"],
+            vec!["inspect", "--pid", "7", "--quiet", "-v"],
+            vec!["inspect", "--system", "--verbose", "--quiet"],
+            vec!["inventory", "--pid", "7", "--quiet", "--verbose"],
+        ] {
+            let Err(CliError::Usage { message, .. }) = parse(args(&argv)) else {
+                panic!("{argv:?} should refuse the contradictory pair");
+            };
+            assert!(
+                message.contains("--quiet and --verbose are mutually exclusive"),
+                "{argv:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn verbosity_level_resolves_flags_without_precedence() {
+        assert_eq!(
+            TextVerbosity::resolve(false, false).unwrap(),
+            TextVerbosity::Concise
+        );
+        assert_eq!(
+            TextVerbosity::resolve(true, false).unwrap(),
+            TextVerbosity::Verbose
+        );
+        assert_eq!(
+            TextVerbosity::resolve(false, true).unwrap(),
+            TextVerbosity::Quiet
+        );
+        assert!(TextVerbosity::resolve(true, true).is_err());
+        assert_eq!(TextVerbosity::default(), TextVerbosity::Concise);
+        assert_eq!(text_verbosity(), TextVerbosity::Concise);
+    }
+
+    #[test]
+    fn verbosity_synopsis_and_notes_are_advertised() {
+        for topic in [
+            HelpTopic::Global,
+            HelpTopic::Profile,
+            HelpTopic::Trace,
+            HelpTopic::Run,
+            HelpTopic::Inspect,
+            HelpTopic::Inventory,
+        ] {
+            let help = topic.text();
+            assert!(help.contains("[-v]"), "{topic:?}: {help}");
+            assert!(help.contains("[--quiet]"), "{topic:?}: {help}");
+        }
+        assert!(USAGE.contains("-v, --verbose shows full detail"), "{USAGE}");
+        // HELP-1: no synopsis line wraps a terminal at 80 columns by
+        // itself; the inventory usage wraps one option group per line.
+        for line in USAGE.lines().filter(|line| line.contains("p11scope ")) {
+            assert!(line.len() < 200, "overlong synopsis line: {line}");
+        }
+    }
+
+    #[test]
     fn inventory_diagnostics_options_are_capture_only() {
         for (argv, expected) in [
             (
@@ -3288,13 +3563,10 @@ mod tests {
     #[test]
     fn inventory_diagnostics_help_names_options_and_limits_scope() {
         for text in [USAGE, INVENTORY_HELP] {
-            for line in text
-                .lines()
-                .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
-            {
+            for block in inventory_usage_blocks(text) {
                 assert!(
-                    line.contains("[--diagnostics <f.jsonl> [--diagnostics-pid <n>]]"),
-                    "{line}"
+                    block.contains("[--diagnostics <f.jsonl> [--diagnostics-pid <n>]]"),
+                    "{block}"
                 );
             }
         }
@@ -4558,12 +4830,14 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 9958 / 0xd9a94a6d21a3e430 (late-process scope): USAGE diff vs
-        // the 9934/0x99bf35fea86eb91f pin is exactly the +24 scope
-        // qualification (system and pid scopes) on the reported-not-
-        // scanned bound; no other drift.
-        assert_eq!(USAGE.len(), 9958);
-        assert_eq!(hash, 0xd9a94a6d21a3e430);
+        // 10678 / 0xb0ec5d13d144e1bf (concise-by-default verbosity
+        // plus the late-process scope sentence): USAGE diff vs the
+        // 9958/0xd9a94a6d21a3e430 pin is exactly the `[-v] [--quiet]`
+        // synopsis insertions, the wrapped inventory synopsis lines
+        // (one option group per line), and the concise/verbose/quiet
+        // notes line; the scope sentence is unchanged. No other drift.
+        assert_eq!(USAGE.len(), 10678);
+        assert_eq!(hash, 0xb0ec5d13d144e1bf);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

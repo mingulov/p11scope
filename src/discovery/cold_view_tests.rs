@@ -115,6 +115,8 @@ fn cold_group_discovery_keeps_tgid_scope_and_actual_callback_target() {
         let expected_offset = mapping.file_offset + group.callback_address - mapping.start;
         let args = CaptureArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: vec![group.program.clone()],
             exclude_modules: vec![],

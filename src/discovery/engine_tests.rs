@@ -6401,6 +6401,8 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         let cgroup = OwnedCgroup::create(tag, what);
         let args = crate::cli::CaptureArgs {
             track_short_lived: armed,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: vec![fixtures.provider.clone()],
             exclude_modules: vec![],
@@ -9663,6 +9665,8 @@ fn capture_start_members_that_ended_are_not_losses() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9718,6 +9722,8 @@ fn discover_wires_metrics_without_counter_mode_to_the_remedy_hint() {
         std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
         let args = CaptureArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: vec![],
             exclude_modules: vec![],
@@ -9782,6 +9788,8 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let mut args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9954,6 +9962,8 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
     let args_with = |max_scan_pids| CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10025,6 +10035,8 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10132,6 +10144,8 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10303,6 +10317,8 @@ fn retained_views_survive_ordinary_rotation_passes() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10439,6 +10455,8 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10671,6 +10689,8 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10870,6 +10890,8 @@ fn reconcile_waiter_outside_slice_settles_within_one_sweep() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10987,6 +11009,8 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -11125,6 +11149,8 @@ fn refresh_requests_survive_allocation_exhaustion() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -11222,6 +11248,8 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -30250,6 +30278,8 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -36879,6 +36909,8 @@ fn system_scope_spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> Syst
 fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         exclude_modules: vec![],
@@ -39504,6 +39536,8 @@ fn e06_cgroup_args(
 ) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         exclude_modules: vec![],
@@ -64000,6 +64034,8 @@ fn named_pid_race_reports_partial_instead_of_aborting() {
     let pid = u32::MAX;
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -64066,6 +64102,8 @@ fn named_pid_scan_failure_after_exit_gaps_instead_of_aborting() {
     child.wait().unwrap();
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -64124,6 +64162,8 @@ fn named_pid_with_live_view_still_discovers() {
     let view = ProcessView::open(ProcessViewId(41), pid).unwrap();
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],

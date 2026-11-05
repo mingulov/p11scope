@@ -686,7 +686,7 @@ fn render_compact_edge_window(
             width,
         ));
         lines.push(truncate_cell(
-            &crate::inventory_present::observation_label(edge),
+            &crate::inventory_present::observation_label_at(edge, presentation.ended_ns),
             width,
         ));
         shown += 1;
@@ -1599,7 +1599,7 @@ fn render_evidence_block(
     selected: bool,
 ) -> Vec<String> {
     let mut lines = vec![edge_identity_line(presentation, edge, width, selected)];
-    let mut items = vec![coverage_item(edge)];
+    let mut items = vec![coverage_item(presentation, edge)];
     match edge.semantics.operations.as_ref() {
         Some(operations) => items.extend(evidence_items(operations)),
         None => items.push(format!("semantics {}", edge.semantics.label)),
@@ -1611,10 +1611,16 @@ fn render_evidence_block(
 
 /// The edge's coverage item (`coverage <label>`), control-escaped: a
 /// loss reason may carry producer text.
-pub(crate) fn coverage_item(edge: &crate::inventory_present::EdgeView) -> String {
+pub(crate) fn coverage_item(
+    presentation: &crate::inventory_present::Presentation,
+    edge: &crate::inventory_present::EdgeView,
+) -> String {
     format!(
         "coverage {}",
-        escape_controls(&crate::inventory_present::coverage_label(&edge.coverage))
+        escape_controls(&crate::inventory_present::coverage_label_at(
+            &edge.coverage,
+            presentation.ended_ns
+        ))
     )
 }
 

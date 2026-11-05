@@ -6208,12 +6208,14 @@ fn broad_fixed_pool_module(
         }
     }
     let first_reason = first_reason.unwrap_or_else(|| "unknown".to_string());
-    eprintln!(
-        "p11scope: discovery: broad fixed-family: {}: {} table(s) added, {} \
-         already covered, {refused} refused at {refused_ordinals:?} \
-         (first reason: {first_reason})",
-        module.path, tallies.added, tallies.covered,
-    );
+    if crate::cli::text_is_verbose() {
+        eprintln!(
+            "p11scope: discovery: broad fixed-family: {}: {} table(s) added, {} \
+             already covered, {refused} refused at {refused_ordinals:?} \
+             (first reason: {first_reason})",
+            module.path, tallies.added, tallies.covered,
+        );
+    }
     if refused > 0 {
         counters.notes.push(format!(
             "broad fixed-family: {} refused {refused} pool table(s) at {refused_ordinals:?}; \

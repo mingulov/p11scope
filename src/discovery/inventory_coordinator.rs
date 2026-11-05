@@ -22609,7 +22609,7 @@ exit 0
             DashboardState, DisplayFrame, LogTail, Viewport, render_frame,
         };
         use crate::inventory_present::{
-            Presentation, coverage_label, entries_display, render_snapshot,
+            Presentation, coverage_label_at, entries_display, render_snapshot_with_verbosity,
         };
         let (mut native, _) = NativeScene::new();
         native.answer(7, 500, 41);
@@ -22655,8 +22655,9 @@ exit 0
         assert_eq!(events[0]["activity"], "recently observed");
         assert_eq!(events[0]["capture"], "armed");
         // Pager snapshot and dashboard frame: the same labels.
-        let snapshot = render_snapshot(&presentation);
-        let label = coverage_label(&edge.coverage);
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        let label = coverage_label_at(&edge.coverage, presentation.ended_ns);
         let line = snapshot
             .lines()
             .find(|line| {

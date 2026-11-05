@@ -14,7 +14,7 @@ use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::fixture_guard::DieWithParent as _;
 use crate::inventory_dashboard::{DashboardState, DetailPage, Viewport, render_frame};
 use crate::inventory_events::{EventWriter, emit_snapshot_as_events};
-use crate::inventory_present::{Presentation, render_snapshot};
+use crate::inventory_present::{Presentation, render_snapshot_with_verbosity};
 use crate::semantics_edge::SemanticCall;
 use p11scope_ebpf_common::{SESSION_NONE, capture};
 use pkcs11_types::CkRv;
@@ -2122,7 +2122,7 @@ fn dashboard_items(block: &str) -> Vec<String> {
 /// each dashboard edge's facts against its corresponding JSON edge —
 /// plus the replay's totals, budgets, and gaps across all outputs.
 fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation: &Presentation) {
-    let snapshot = render_snapshot(presentation);
+    let snapshot = render_snapshot_with_verbosity(presentation, crate::cli::TextVerbosity::Verbose);
     let frame = crate::inventory_dashboard::DisplayFrame {
         presentation: std::sync::Arc::new(presentation.clone()),
         log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
@@ -2206,7 +2206,7 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         assert!(
             snapshot_line.contains(&format!(
                 "coverage {}",
-                crate::inventory_present::coverage_label(&view.coverage)
+                crate::inventory_present::coverage_label_at(&view.coverage, presentation.ended_ns)
             )),
             "snapshot coverage for {caller}->{module}: {snapshot_line}"
         );
@@ -2309,7 +2309,10 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             assert!(
                 snapshot_line.ends_with(&format!(
                     "semantics {label} coverage {}",
-                    crate::inventory_present::coverage_label(&view.coverage)
+                    crate::inventory_present::coverage_label_at(
+                        &view.coverage,
+                        presentation.ended_ns
+                    )
                 )),
                 "snapshot bare label for {caller}->{module}: {snapshot_line}"
             );
@@ -2377,11 +2380,17 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
                 .map(|row| format!("0x{:x}", row["rv"].as_u64().unwrap()))
                 .collect::<Vec<_>>()
                 .join(",");
+            // Snapshot recency is relative (`last=X ago`); JSON keeps
+            // the raw `last_seen_ns`, and the dashboard still shows it
+            // raw (the interactive screen is outside the CLI-1 text
+            // contract).
+            let last_seen_ns = mech["last_seen_ns"].as_u64().unwrap();
+            let last =
+                crate::render::fmt_ns(Some(presentation.ended_ns.saturating_sub(last_seen_ns)));
             let segment = format!(
-                "[{id} {categories} calls={} errors={} last={} by=[{by}] rv=[{rv}]{}]",
+                "[{id} {categories} calls={} errors={} last={last} ago by=[{by}] rv=[{rv}]{}]",
                 mech["calls"],
                 mech["errors"],
-                mech["last_seen_ns"],
                 if mech["evidence"]["truncated"].as_bool().unwrap() {
                     " truncated"
                 } else {
@@ -2394,9 +2403,12 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
             );
             // The dashboard shows the first 8 mechs per edge, then an
             // explicit marker — both pinned against this edge's block.
+            // Dashboard recency stays raw (see above).
             if index < crate::inventory_dashboard::DASHBOARD_MAX_MECHS {
+                let raw_segment =
+                    segment.replace(&format!("last={last} ago"), &format!("last={last_seen_ns}"));
                 assert!(
-                    block.contains(&format!("mech {segment}")),
+                    block.contains(&format!("mech {raw_segment}")),
                     "dashboard mech {id} for {caller}->{module}: {block}"
                 );
             }
@@ -2414,9 +2426,14 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
         // machines, and the nine evidence counters — in the snapshot
         // segment and the dashboard's own block.
         let ops = &edge_json["operations"];
+        let ops_last = crate::render::fmt_ns(Some(
+            presentation
+                .ended_ns
+                .saturating_sub(ops["last_seen_ns"].as_u64().unwrap()),
+        ));
         assert!(
             snapshot_line.contains(&format!(
-                "ops [calls={} started={} completed={} cancelled={} failed={} unknown={} orphans={} dropped={} last={}]",
+                "ops [calls={} started={} completed={} cancelled={} failed={} unknown={} orphans={} dropped={} last={ops_last} ago]",
                 ops["calls"],
                 ops["started"],
                 ops["completed"],
@@ -2425,7 +2442,6 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
                 ops["unknown"],
                 ops["orphans"],
                 ops["dropped"],
-                ops["last_seen_ns"],
             )),
             "snapshot ops for {caller}->{module}: {snapshot_line}"
         );
@@ -2671,12 +2687,12 @@ fn assert_four_way_semantic_agreement(document: &serde_json::Value, presentation
     }
     if suppressed > 0 {
         assert!(
-            snapshot.contains(&format!("gaps suppressed: {suppressed}")),
+            snapshot.contains(&format!("more gaps not shown: {suppressed}")),
             "snapshot suppressed gaps"
         );
     } else {
         assert!(
-            !snapshot.contains("gaps suppressed:"),
+            !snapshot.contains("more gaps not shown:"),
             "snapshot hides a zero suppression count"
         );
     }
@@ -3808,7 +3824,7 @@ fn instance_s1_private_debug_and_projection_are_redacted() {
     let public = format!(
         "{p:?} {} {} {}",
         document,
-        render_snapshot(&p),
+        render_snapshot_with_verbosity(&p, crate::cli::TextVerbosity::Verbose),
         String::from_utf8(render_frame(
             &frame,
             Viewport {
@@ -4591,7 +4607,7 @@ fn instance_s1_projection_agrees_across_consumers() {
             assert_eq!(event["event"], *row);
         }
     }
-    let snapshot = render_snapshot(&p);
+    let snapshot = render_snapshot_with_verbosity(&p, crate::cli::TextVerbosity::Verbose);
     let frame = crate::inventory_dashboard::DisplayFrame {
         presentation: std::sync::Arc::new(p),
         log: crate::inventory_dashboard::LogTail::bounded().snapshot(),

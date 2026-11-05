@@ -1647,11 +1647,21 @@ fn run_with_terminal_budget(
                 ) else {
                     return Ok(());
                 };
-                // Under --quiet the summary head already carries the
-                // coverage totals; the per-pass stderr detail stays silent.
-                if !crate::inventory_present::snapshot_summary_only() {
-                    for line in progress_lines(coordinator, report) {
-                        inventory_diagnostic(&line);
+                // The summary head already carries the coverage
+                // totals; the per-pass stderr detail is verbose-only.
+                // Pass 0's headline stays at every verbosity: it is the
+                // capture-readiness signal scripts match (`p11scope: pass 0:`).
+                // The stage-timings line stays whenever its env opt-in set
+                // it: the benches parse it without -v. The match pins the
+                // pass number, so a hostile event reason cannot forge it.
+                let verbose = crate::cli::text_is_verbose();
+                let timings_prefix = format!("p11scope: pass {}: stage timings: ", report.pass);
+                for (index, line) in progress_lines(coordinator, report).iter().enumerate() {
+                    if verbose
+                        || (report.pass == 0 && index == 0)
+                        || line.starts_with(&timings_prefix)
+                    {
+                        inventory_diagnostic(line);
                     }
                 }
                 // The pass freed its pin batch; hand the peak back before
@@ -8583,6 +8593,22 @@ pub(crate) fn render_text<Source: ProcessSource>(
     render_snapshot(&presentation)
 }
 
+/// [`render_text`] at an explicit verbosity: the tests' race-free
+/// handle for full-detail text pins.
+#[cfg(test)]
+pub(crate) fn render_text_with_verbosity<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
+    scope_label: &str,
+    started_ns: u64,
+    ended_ns: u64,
+    passes: u64,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
+    let presentation =
+        Presentation::capture(coordinator, scope_label, started_ns, ended_ns, passes);
+    crate::inventory_present::render_snapshot_with_verbosity(&presentation, verbosity)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::fixture_guard::DieWithParent as _;
@@ -10981,14 +11007,12 @@ mod tests {
             }
             if !stopped {
                 if !isolate_progress {
+                    // Scan-stage progress is verbose-only since CLI-1; the
+                    // default path's marker is the pass-0 headline.
                     let text = String::from_utf8_lossy(&bytes);
                     assert!(
-                        text.contains("p11scope: enumerating processes..."),
-                        "default progress disabled: {text}"
-                    );
-                    assert!(
-                        text.contains("p11scope: lowering scan-only admission and rendering..."),
-                        "default lowering progress lost: {text}"
+                        text.contains("p11scope: pass 0:"),
+                        "default pass headline missing: {text}"
                     );
                 }
                 assert!(
@@ -21585,10 +21609,30 @@ mod promotion_driver_tests {
                         if json {
                             assert_eq!(stdout.bytes, bytes, "both sinks agree: {case}");
                         } else {
+                            // Concise text carries the PARTIAL coverage and
+                            // the `-v` hint; gap subjects are verbose-only
+                            // (the JSON above pins them).
                             let text = String::from_utf8(stdout.bytes).unwrap();
-                            assert!(text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT));
-                            assert_eq!(text.contains("global native retirement"), refused);
-                            assert_eq!(text.contains("joint finish abandoned for exit"), refused);
+                            assert!(
+                                text.contains("coverage: PARTIAL"),
+                                "concise zero-pass coverage: {case}: {text}"
+                            );
+                            assert!(
+                                text.contains(crate::cli::VERBOSE_HINT),
+                                "concise zero-pass hint: {case}: {text}"
+                            );
+                            assert!(
+                                !text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT),
+                                "gap subjects are verbose-only: {case}: {text}"
+                            );
+                            assert!(
+                                !text.contains("global native retirement"),
+                                "gap subjects are verbose-only: {case}"
+                            );
+                            assert!(
+                                !text.contains("joint finish abandoned for exit"),
+                                "gap subjects are verbose-only: {case}"
+                            );
                         }
                     }
                     // The command combines its primary error AFTER output;

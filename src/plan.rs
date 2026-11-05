@@ -12454,7 +12454,11 @@ mod tests {
         assert_eq!(slots_of(&shared, 41), 0, "published-only, not whole");
         assert_eq!(shared.uncorroborated_candidates, 5);
         let refusal = refusal_of(&shared, "/opt/small-closure.so").expect("gap reported");
-        assert!(is_closure_awaiting_publication(&refusal.reason), "{}", refusal.reason);
+        assert!(
+            is_closure_awaiting_publication(&refusal.reason),
+            "{}",
+            refusal.reason
+        );
     }
 
     /// Named scope defers a proxy closure array behind real providers: a
@@ -12608,7 +12612,11 @@ mod tests {
         assert_eq!(slots_of(&beside, 41), 0, "published-only, not whole");
         assert_eq!(beside.uncorroborated_candidates, 5);
         let refusal = refusal_of(&beside, "/opt/small-closure.so").expect("gap reported");
-        assert!(is_closure_awaiting_publication(&refusal.reason), "{}", refusal.reason);
+        assert!(
+            is_closure_awaiting_publication(&refusal.reason),
+            "{}",
+            refusal.reason
+        );
     }
 
     /// Part 0: a closure array is refused whole when a real provider was
@@ -13396,7 +13404,11 @@ mod tests {
         assert_eq!(slots_of(&plan, 90), 68);
         assert_eq!(plan.uncorroborated_candidates, 5);
         let refusal = refusal_of(&plan, "/opt/opaque-published.so").expect("gap reported");
-        assert!(is_closure_awaiting_publication(&refusal.reason), "{}", refusal.reason);
+        assert!(
+            is_closure_awaiting_publication(&refusal.reason),
+            "{}",
+            refusal.reason
+        );
     }
 
     #[test]

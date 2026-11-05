@@ -37843,7 +37843,11 @@ fn whole_closure_module_settles_live_publication_without_spill() {
     // One publication leaves four unresolved tables, at the classifier
     // cap: the object is no longer a closure array, so the extension
     // admits it whole beside the sidecar (6 slots).
-    assert_eq!(engine.plan.slots.len(), 6, "sidecar plus now-corroborated module");
+    assert_eq!(
+        engine.plan.slots.len(),
+        6,
+        "sidecar plus now-corroborated module"
+    );
     assert_eq!(
         engine.plan.uncorroborated_candidates, 0,
         "whole admission leaves no uncorroborated tables"

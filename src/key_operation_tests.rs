@@ -21627,6 +21627,68 @@ fn key_operation_registry_watchdog_trip_counts_staged_joint_calls() {
     assert_eq!(proved_signs, 1, "the sealed sign keeps its row");
 }
 
+/// Observer-first live shape (fedora DEMO-4 Chromium): the journal
+/// is linked but no feed ever reached Joint (no birth landed), while
+/// the browser's key calls still reached the registry. The section
+/// must publish `partial` with every such call counted under a named
+/// reason, never a silent `unavailable` with the presented signs
+/// unaccounted. A capture that observed nothing stays unavailable.
+#[test]
+fn key_operation_linked_without_birth_publishes_partial_with_counted_calls() {
+    let mut guarded = GuardedScene::new();
+    guarded.registry.note_journal_linked(true);
+    let (late_key, _) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded
+        .registry
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            late_key.clone(),
+            CallerId(99),
+            position,
+            facts,
+        ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let observations = guarded.registry.joint_observations(90);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "bootstrap_unavailable"),
+        "counted calls make the no-birth section partial"
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "started_before_attach",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "foreign_or_unproven_caller",
+                count: 1,
+            },
+        ],
+        "every observed key call counts once: {:?}",
+        observations.unattributed
+    );
+    assert!(observations.key_operations.is_empty(), "no row is guessed");
+
+    let mut quiet = GuardedScene::new();
+    quiet.registry.note_journal_linked(true);
+    let _ = quiet.register(1);
+    let observations = quiet.registry.joint_observations(91);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Unavailable, "bootstrap_unavailable"),
+        "nothing observed stays unavailable"
+    );
+    assert!(observations.unattributed.is_empty());
+}
+
 /// Late attach: an instance registered without a witnessed birth
 /// keeps its S1 counts and counts its calls as
 /// `started_before_attach`, while a Joint sibling that started

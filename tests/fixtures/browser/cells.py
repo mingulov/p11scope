@@ -478,7 +478,24 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         browser_env["HOME"] = str(home)
         cr_args = list(extra_browser_args)
         if auto_select_cert:
-            cr_args.append(f"--auto-select-certificate-for-urls={flow_url}")
+            # Chrome for Testing 156 removed the
+            # --auto-select-certificate-for-urls switch; cert
+            # auto-selection comes only from the managed policy
+            # under /etc/opt/chrome_for_testing/policies (fedora
+            # certprobe15/16). Install it for this launch and
+            # register its removal at process exit.
+            import atexit
+
+            from profiles import (
+                chrome_auto_select_patterns,
+                install_chrome_auto_select_policy,
+                remove_chrome_auto_select_policy,
+            )
+            installed = install_chrome_auto_select_policy(
+                chrome_auto_select_patterns(flow_url),
+                f"g33-{os.getpid()}",
+                workdir)
+            atexit.register(remove_chrome_auto_select_policy, installed)
         context = pw.chromium.launch_persistent_context(
             str(workdir / "crprofile"), channel="chromium",
             headless=True, ignore_https_errors=True,

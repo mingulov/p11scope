@@ -148,6 +148,8 @@ attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
 # production sink with zero bpf() syscalls; dual-outcome by running
 # kernel (denied on 5.15, eligible elsewhere), lane-classified.
 inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed
+inspect_system::tests::probe_dir_created_dir_exec_maps
+inspect_system::tests::probe_dir_falls_back_when_temp_is_noexec
 attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32
 attach::instance_tests::privileged_full_image_native_multi_query_and_scan_lp64
 attach::instance_tests::privileged_semantic_capture_multi_reload_and_rebound_successor

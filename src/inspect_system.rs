@@ -5213,6 +5213,196 @@ mod tests {
         }
     }
 
+    /// Whether a fresh file under `dir` maps `PROT_EXEC` (the probe
+    /// child's fixture shape: it maps each fixture `PROT_READ|PROT_EXEC`
+    /// `MAP_PRIVATE`). Test-only; the product carries its own check, so
+    /// this asserts the behavior, not the implementation.
+    fn exec_map_smoke(dir: &std::path::Path) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let path = dir.join(format!("probe-smoke-{}", std::process::id()));
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        else {
+            return false;
+        };
+        if file.set_len(4096).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return false;
+        }
+        // SAFETY: anonymous-length private executable mapping of a
+        // 4096-byte file we just created; unmapped and unlinked below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        let mapped = addr != libc::MAP_FAILED;
+        if mapped {
+            // SAFETY: the successful `mmap` above returned this range.
+            unsafe {
+                libc::munmap(addr, 4096);
+            }
+        }
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        mapped
+    }
+
+    /// The created probe dir exec-maps: the probe child maps its
+    /// fixtures `PROT_EXEC`, so a noexec dir is unusable. Also the
+    /// inner driver of `probe_dir_falls_back_when_temp_is_noexec`,
+    /// which re-execs this binary to run exactly this cell with
+    /// TMPDIR pointed at a noexec tmpfs. Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: created probe dir exec-maps"]
+    fn probe_dir_created_dir_exec_maps() {
+        let dir = ProbeDir::create("p11scope-identity-probe").expect("probe dir");
+        assert!(
+            exec_map_smoke(dir.path()),
+            "probe dir is not exec-capable: {}",
+            dir.path().display()
+        );
+    }
+
+    /// The probe dir under a noexec temp root (kind nodes mount /tmp
+    /// noexec): creation falls back to an exec-capable root instead of
+    /// handing back a dir the probe cannot use. Forks, mounts a noexec
+    /// tmpfs over a scratch dir in a private mount namespace, re-execs
+    /// this binary to run the exec-map cell with TMPDIR pointed at it,
+    /// and asserts the inner positive ran (exit 0 plus `1 passed`,
+    /// never a zero-match pass). Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: probe dir falls back when temp is noexec"]
+    fn probe_dir_falls_back_when_temp_is_noexec() {
+        use std::ffi::CString;
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::io::FromRawFd as _;
+        let scratch = tempfile::tempdir().expect("noexec mountpoint");
+        let mountpoint =
+            CString::new(scratch.path().as_os_str().as_bytes()).expect("mountpoint has no nul");
+        let exe = std::env::current_exe().expect("own test binary");
+        let args = [
+            CString::new(exe.as_os_str().as_bytes()).expect("exe has no nul"),
+            CString::new("--exact").unwrap(),
+            CString::new("inspect_system::tests::probe_dir_created_dir_exec_maps").unwrap(),
+            CString::new("--ignored").unwrap(),
+            CString::new("--test-threads=1").unwrap(),
+            CString::new("--nocapture").unwrap(),
+        ];
+        let argv: Vec<*const libc::c_char> = args
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        // The re-exec environment: this process's own with TMPDIR
+        // pointed at the noexec mount. Built pre-fork; the child only
+        // passes the pointers to `execve`.
+        let tmpdir = CString::new(format!("TMPDIR={}", scratch.path().to_string_lossy()))
+            .expect("TMPDIR has no nul");
+        let mut env: Vec<CString> = std::env::vars_os()
+            .filter(|(key, _)| key != "TMPDIR")
+            .map(|(key, value)| {
+                let mut pair = key.into_encoded_bytes();
+                pair.push(b'=');
+                pair.extend_from_slice(&value.into_encoded_bytes());
+                CString::new(pair).expect("env pair has no nul")
+            })
+            .collect();
+        env.push(tmpdir);
+        let envp: Vec<*const libc::c_char> = env
+            .iter()
+            .map(|var| var.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let mut pipe = [0 as libc::c_int; 2];
+        // SAFETY: out-param pipe pair; the parent closes the write end
+        // after forking and reads the read end to EOF.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe works");
+        // SAFETY: the child only calls async-signal-safe libc, then
+        // re-execs or exits with a distinct status; all CStrings were
+        // built before forking. The parent waits below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for the noexec probe runner");
+        if pid == 0 {
+            noexec_probe_child(&mountpoint, pipe[1], &argv, &envp);
+        }
+        // SAFETY: our own pipe write end; closing first lets EOF arrive
+        // when the re-exec'd child exits.
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0, "close our write end");
+        // SAFETY: our own pipe read end, owned from here to EOF.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read inner output");
+        let mut status: libc::c_int = 0;
+        // SAFETY: waiting for our own forked child.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "reap the noexec probe runner");
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "inner exec-map cell passed under noexec TMPDIR (runner status {status}): {text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed; 0 failed"),
+            "the inner positive ran (not a zero-match pass): {text}"
+        );
+    }
+
+    /// Child side of the noexec probe runner: a private mount namespace
+    /// with a noexec tmpfs over `mountpoint`, then re-exec with the
+    /// prebuilt argv/envp. Async-signal-safe only: no allocation, no
+    /// locks, `_exit` on every path. Call only in the post-fork child.
+    fn noexec_probe_child(
+        mountpoint: &std::ffi::CString,
+        write_fd: libc::c_int,
+        argv: &[*const libc::c_char],
+        envp: &[*const libc::c_char],
+    ) -> ! {
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                libc::_exit(70);
+            }
+            // Private first: without this the tmpfs mount below would
+            // propagate to the host through the shared mount tree.
+            if libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ) != 0
+            {
+                libc::_exit(70);
+            }
+            if libc::mount(
+                c"tmpfs".as_ptr(),
+                mountpoint.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOEXEC,
+                std::ptr::null(),
+            ) != 0
+            {
+                libc::_exit(70);
+            }
+            if libc::dup2(write_fd, libc::STDOUT_FILENO) < 0
+                || libc::dup2(write_fd, libc::STDERR_FILENO) < 0
+            {
+                libc::_exit(70);
+            }
+            libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+            libc::_exit(70);
+        }
+    }
+
     /// Fresh probe dirs are unique per call.
     #[test]
     fn probe_dir_names_are_unique() {

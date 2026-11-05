@@ -14363,6 +14363,41 @@ mod tests {
         );
     }
 
+    /// The owned-run startup preloads the overlay-witness BPF session
+    /// before spawning the child: the one-time session load (BPF
+    /// verifier plus functional probe, ~1s in slow guests) must not
+    /// land inside a 500ms pause-cycle engine apply, where it
+    /// fail-closes the first overlay join unavailable and turns the
+    /// pause partial. The startup needs a live child, so the order is
+    /// pinned statically (same `split_once` precedent as
+    /// `prearm_release_wiring_sits_between_release_and_revalidate`).
+    #[test]
+    fn witness_preload_sits_before_owned_spawn() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("fn run_owned_inner_with_host(")
+            .unwrap()
+            .1
+            .split_once("fn preflight_uretprobe_hazard(")
+            .unwrap()
+            .0;
+        let preloaded = body
+            .find("overlay_witness::preload_session()")
+            .expect("owned startup preloads the witness session");
+        let spawned = body
+            .find("OwnedChild::spawn(")
+            .expect("owned startup spawns the child");
+        assert!(
+            preloaded < spawned,
+            "witness preload sits before OwnedChild::spawn"
+        );
+        assert_eq!(
+            body.matches("overlay_witness::preload_session()").count(),
+            1,
+            "one preload site feeds the owned run"
+        );
+    }
+
     #[test]
     fn prearm_terminal_pause_hold_empties_windows() {
         use crate::attach::BackendSelection;

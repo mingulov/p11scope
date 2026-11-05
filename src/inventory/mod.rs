@@ -25095,49 +25095,16 @@ mod seal_readiness_tests {
         );
     }
 
-    /// The run gates the flag before any load: on a non-journal build
-    /// the refusal names the finite build reason. On a journal build
-    /// the gate passes — the twin proves it with a colliding
-    /// destination pair, which refuses later (pre-lane, no BPF)
-    /// instead of the build reason.
+    /// F-08: a missing journal build must not blank the whole
+    /// inventory at the `run` gate. The refusal belongs to
+    /// `start_semantic_lane`, which keeps broad S1 inventory with a
+    /// named key-operations gap. Proof without BPF: on every build
+    /// the run gets past any journal gate and refuses later on the
+    /// colliding destination pair (pre-lane), never with the build
+    /// reason.
     #[test]
     fn key_operations_run_gates_build_before_any_load() {
         use crate::cli::{CallerMetadataMode, IdentityBackendSelection, ScopeArg};
-        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
-            let error = super::run(
-                ScopeArg::Pid(std::process::id()),
-                &[],
-                &[],
-                &[],
-                &[],
-                &HookRegistry::builtin(),
-                true,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                None,
-                None,
-                None,
-                CaptureMode::Auto,
-                crate::attach::BackendSelection::Auto,
-                None,
-                None,
-                IdentityBackendSelection::Auto,
-                false,
-                CallerMetadataMode::None,
-                true,
-                false,
-            )
-            .expect_err("a flag-on run on a non-journal build refuses");
-            assert!(
-                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
-                "the refusal names the build reason: {error:#}"
-            );
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(
             dir.path(),

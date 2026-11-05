@@ -1213,7 +1213,9 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
         }
         assert_eq!(state.sessions().opened, 1);
         if trace_mode {
-            assert!(String::from_utf8_lossy(&context.stdout).contains(" C_OpenSession "));
+            let stdout = String::from_utf8_lossy(&context.stdout);
+            assert!(stdout.contains(" C_OpenSession "), "{stdout}");
+            assert!(stdout.contains("sess#"), "{stdout}");
         }
 
         context.plan.slots[0].descriptor_index = 0;
@@ -1260,9 +1262,14 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
             "COUNT_ONLY must not add a semantic open"
         );
         if trace_mode {
+            // No per-line marker anymore: a downgraded (COUNT_ONLY) slot
+            // renders the bare name with no session pseudonym, so the
+            // missing `sess#` proves the tracer synced the downgrade.
+            let stdout = String::from_utf8_lossy(&context.stdout);
+            assert!(stdout.contains(" C_OpenSession "), "{stdout}");
             assert!(
-                String::from_utf8_lossy(&context.stdout).contains("[semantics unverified]"),
-                "trace metadata must be synchronized with the downgrade"
+                !stdout.contains("sess#"),
+                "trace metadata must be synchronized with the downgrade: {stdout}"
             );
         }
     }

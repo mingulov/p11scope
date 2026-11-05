@@ -724,3 +724,53 @@ fn retained_input_descriptor_detects_alias_after_the_original_path_is_replaced()
     assert_eq!(std::fs::read(&args.before).unwrap(), b"replacement input");
     assert_eq!(std::fs::read(&args.after).unwrap(), FIXTURE);
 }
+
+/// Item 20: concise diff is counts plus top changed applications, without
+/// the per-record flood or raw limitation tokens.
+#[test]
+fn concise_diff_summarizes_counts_and_top_applications() {
+    let before = document();
+    let mut after = document();
+    after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
+    let report = report(&before, &after);
+    assert!(report.summary.application_groups_changed > 0);
+    let mut output = Vec::new();
+    super::render::render_concise(&report, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("application groups changed"), "{text}");
+    assert!(text.contains("run with -v for details"), "{text}");
+    assert!(!text.contains("absence_is_not_removal"), "{text}");
+    assert!(!text.contains("Limitation:"), "{text}");
+    assert!(text.lines().count() < 40, "concise must stay short: {text}");
+}
+
+/// Item 20: concise diff names the top changed applications.
+#[test]
+fn concise_diff_names_top_changed_applications() {
+    let mut before = document();
+    before["callers"][0]["image"]["exe"]["path"] = json!("/opt/one/driver");
+    let mut after = before.clone();
+    after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
+    let report = report(&before, &after);
+    let mut output = Vec::new();
+    super::render::render_concise(&report, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("/opt/one/driver"), "{text}");
+}
+
+/// Item 20: concise unchanged diff says so briefly with the caveats.
+#[test]
+fn concise_unchanged_diff_says_so_briefly() {
+    let value = document();
+    let report = report(&value, &value);
+    let mut output = Vec::new();
+    super::render::render_concise(&report, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("No differences in the compared inventory observations"),
+        "{text}"
+    );
+    assert!(text.contains("does not prove removal"), "{text}");
+    assert!(!text.contains("absence_is_not_removal"), "{text}");
+    assert!(text.lines().count() < 30, "concise must stay short: {text}");
+}

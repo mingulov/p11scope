@@ -14,6 +14,12 @@ fn optional_number(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |number| number.to_string())
 }
 
+/// Concise summary: counts plus top changed applications, without the
+/// per-record flood. Stubbed until the summary renderer lands.
+pub(super) fn render_concise(_report: &DiffReport, _out: &mut dyn Write) -> io::Result<()> {
+    Ok(())
+}
+
 /// Rendering only borrows the pooled report. References never reach the human
 /// output: labels, physical descriptions and separate observations do.
 pub(super) fn render_text(report: &DiffReport, out: &mut dyn Write) -> io::Result<()> {

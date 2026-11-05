@@ -510,6 +510,8 @@ cgroup_capture() {
   if [ "$cg_gone" != 1 ]; then result "$cell" 0 "owned cgroup not removed $CG (force cleanup attempted)" failed; return 1; fi
   if [ "$kind" = inventory ]; then
     publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
+    # stat(1) spells the type "overlayfs" (coreutils S_MAGIC_OVERLAYFS),
+    # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
     python3 - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$MODULE" "$module_fs" <<'PY' > "$cell.detail" 2>&1
 import json,sys
@@ -531,7 +533,7 @@ for mid,m in modules.items():
     dev=ident.get('device',{})
     if [dev.get('major'),dev.get('minor')]==pin['dev'] and ident.get('inode')==pin['ino'] and ident.get('sha256')==pin['sha256']:
         owned=mid; break
-assert owned is not None or modfs=='overlay', 'owned provider not inventoried'
+assert owned is not None or modfs=='overlayfs', 'owned provider not inventoried (modfs=%s)' % modfs
 if owned is None:
     assert modules=={}, 'owned provider not inventoried'
     callers={c['id']:c for c in report.get('callers',[])}
@@ -656,13 +658,18 @@ def assert_handoff_pair(module):
     # across an id change, so the late discovery reads late_discovery
     # up to the declared attach and the out-of-declared-set mapping
     # reads mapped_unattached from the same start. Nothing else passes.
+    # The undeclared end is an independent real attach stamp: the
+    # producer (PrearmState::assemble) takes it as the maximum over
+    # undeclared slots, unordered against the declared maximum, so a
+    # same-tick or later undeclared attach is a correct disclosure.
+    # Only the window's own well-formedness is asserted here.
     windows = module["unobserved_windows"]
     reasons = [w["reason"] for w in windows]
     assert reasons == ["late_discovery", "mapped_unattached"], windows
     late, unattached = windows
     assert late["end_ns"] == module["attached_at_ns"], windows
     assert unattached["start_ns"] == late["start_ns"], windows
-    assert unattached["end_ns"] < module["attached_at_ns"], windows
+    assert unattached["start_ns"] <= unattached["end_ns"], windows
 
 def load(name):
     # EVIDENCE rides on the observer's stdout (diagnostics go to stderr).

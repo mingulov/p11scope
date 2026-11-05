@@ -1112,24 +1112,10 @@ jobs:
           out="$GITHUB_WORKSPACE/cli-ia32-out"
           sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_PUBLIC_CLI_ONLY_IA32=1 scripts/qualify-public-cli.sh "$in/p11scope" "$out/cells"
           sudo -n chown -R "$(id -un):$(id -gn)" "$out"
-          python3 -I - "$out/cells/results.jsonl" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
-          cells = {row["cell"]: row for row in rows}
-          need = {"profile-pid-ia32", "run-ia32"}
-          problems = sorted("missing cell " + name for name in need - set(cells))
-          problems += sorted("extra cell " + name for name in set(cells) - need)
-          for row in rows:
-              status = "PASS" if row["pass"] else "FAIL"
-              print(status, row["cell"], row["qualification"], row["detail"][:200])
-              if not row["pass"] or row["qualification"] != "qualified":
-                  problems.append("unqualified cell " + row["cell"])
-          if problems:
-              raise SystemExit("\n".join(problems))
-          PY
+          # The shared closed-set gate (as the host leg): the ia32 cells
+          # route through judge and pass with owned-provider-counts.
+          python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
+            --require profile-pid-ia32 --require run-ia32
       - name: Upload the ia32 results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

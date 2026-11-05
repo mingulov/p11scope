@@ -8,6 +8,7 @@ extracted from scripts/qualify-public-cli.sh (not copied) so the tests track
 the real code.
 """
 
+import ast
 import json
 import subprocess
 import tempfile
@@ -93,7 +94,7 @@ def overlay_report():
     }
 
 
-def run_oracle(report, *, modfs="overlay", pin=None):
+def run_oracle(report, *, modfs="overlayfs", pin=None):
     """Run the extracted oracle against a fixture report."""
     block = extract_inventory_oracle()
     if pin is None:
@@ -342,6 +343,9 @@ class ScriptTextTests(unittest.TestCase):
                       "overlay unproven signature needs a named reason")
         self.assertIn('module_fs=$(stat -f -c %T "$MODULE"', text,
                       "the overlay branch must be gated on the module fs")
+        self.assertIn("modfs=='overlayfs'", text,
+                      "the gate must use stat(1)'s spelling: GNU stat "
+                      "prints 'overlayfs', never 'overlay'")
         pos = text.index("inventory\\ overlay\\ unproven\\ signature")
         segment = text[pos:pos + 400]
         self.assertIn("REASON_INVENTORY_OVERLAY", segment)
@@ -362,31 +366,31 @@ class InventoryOverlayTests(unittest.TestCase):
         cases.append(("ext4", ext4, "ext4", "owned provider not inventoried"))
         other = overlay_report()
         other["modules"] = [{"id": "m9", "identity": {}}]
-        cases.append(("nonempty-modules", other, "overlay",
+        cases.append(("nonempty-modules", other, "overlayfs",
                       "owned provider not inventoried"))
         dropped = overlay_report()
         dropped["gaps"] = [g for g in dropped["gaps"]
                            if g.get("caller") != "c1"
                            or g.get("reason") != UNPROVEN]
-        cases.append(("dropped-unproven", dropped, "overlay",
+        cases.append(("dropped-unproven", dropped, "overlayfs",
                       "overlay unproven caller cover"))
         leaked = overlay_report()
         leaked["callers"].append({"id": "c2", "pid": 102})
-        cases.append(("outside-leak", leaked, "overlay",
+        cases.append(("outside-leak", leaked, "overlayfs",
                       "outside workload leaked into cgroup inventory"))
         edged = overlay_report()
         edged["edges"] = [{"caller": "c0", "module": "m0"}]
-        cases.append(("edges-present", edged, "overlay",
+        cases.append(("edges-present", edged, "overlayfs",
                       "overlay unproven edges present"))
         extra = overlay_report()
         extra["gaps"].append({"caller": None, "module": None, "pid": None,
                              "reason": "something new",
                              "subject": "novel gap", "repeats": 1})
-        cases.append(("extra-gap", extra, "overlay",
+        cases.append(("extra-gap", extra, "overlayfs",
                       "overlay unproven extra gap"))
         subject = overlay_report()
         subject["gaps"][0]["subject"] = "/some/other/path.so"
-        cases.append(("wrong-subject", subject, "overlay",
+        cases.append(("wrong-subject", subject, "overlayfs",
                       "overlay unproven subject"))
         for name, report, modfs, marker in cases:
             with self.subTest(name=name):
@@ -395,6 +399,17 @@ class InventoryOverlayTests(unittest.TestCase):
                 self.assertIn(marker, out)
                 self.assertNotIn("inventory overlay unproven signature",
                                  out)
+
+    def test_bare_overlay_spelling_does_not_match(self):
+        # stat(1) never emits the bare 'overlay' spelling (coreutils
+        # S_MAGIC_OVERLAYFS prints 'overlayfs'); the gate must not
+        # accept it, so a reintroduced misspelling fails loudly here
+        # instead of misclassifying CI guests.
+        rc, out = run_oracle(overlay_report(), modfs="overlay")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("owned provider not inventoried", out)
+        self.assertNotIn("inventory overlay unproven signature",
+                         out)
 
     def test_owned_pass_path_still_passes(self):
         pin = {"dev": [8, 1], "ino": 42, "sha256": "ab" * 32}
@@ -414,6 +429,120 @@ class InventoryOverlayTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("inventory cgroup: inside=100 child=101 "
                       "outside=102 excluded module=m0 gaps=0", out)
+
+
+def extract_handoff_oracle():
+    """Extract the run-prearm python oracle block from the qualifier."""
+    lines = QUAL.read_text().splitlines(keepends=True)
+    start = next(
+        i for i, line in enumerate(lines)
+        if line.strip() == "detail=$(python3 - <<'PY' 2>&1")
+    end = next(i for i in range(start, len(lines))
+               if lines[i].rstrip("\n") == "PY")
+    return "".join(lines[start + 1:end])
+
+
+def load_handoff_pair():
+    """Compile assert_handoff_pair from the real oracle block.
+
+    AST-extracted (not copied) so the tests track the shipped oracle;
+    only the function is compiled, never the block's top-level capture
+    assertions.
+    """
+    tree = ast.parse(extract_handoff_oracle())
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "assert_handoff_pair":
+            namespace = {}
+            exec(compile(ast.Module(body=[node], type_ignores=[]),
+                         "<handoff>", "exec"), namespace)
+            return namespace["assert_handoff_pair"]
+    raise AssertionError("assert_handoff_pair missing from the run-prearm oracle")
+
+
+def handoff_module(late, unattached, attached):
+    """A pre-armed module record with the exact handoff window pair."""
+    return {"attached_at_ns": attached,
+            "unobserved_windows": [
+                {"reason": "late_discovery",
+                 "start_ns": late[0], "end_ns": late[1]},
+                {"reason": "mapped_unattached",
+                 "start_ns": unattached[0], "end_ns": unattached[1]},
+            ]}
+
+
+class HandoffPairTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.check = staticmethod(load_handoff_pair())
+
+    def test_strictly_earlier_undeclared_end_passes(self):
+        # Today's real guest shape (review evidence: unattached end
+        # strictly before the declared attach).
+        self.check(handoff_module((100, 200), (100, 150), 200))
+
+    def test_equal_undeclared_end_passes(self):
+        # Same monotonic tick: the producer takes the undeclared
+        # maximum independently of the declared maximum, so equality
+        # is a correct disclosure (the old strict < failed it).
+        self.check(handoff_module((100, 200), (100, 200), 200))
+
+    def test_later_undeclared_end_passes(self):
+        # A later undeclared attach is unordered against the declared
+        # maximum by construction; failing it would reject a correct
+        # fail-closed disclosure.
+        self.check(handoff_module((100, 200), (100, 250), 200))
+
+    def test_non_handoff_shapes_fail(self):
+        late = {"reason": "late_discovery", "start_ns": 100, "end_ns": 200}
+        unattached = {"reason": "mapped_unattached",
+                      "start_ns": 100, "end_ns": 150}
+        pre_attach = {"reason": "pre_attach", "start_ns": 100, "end_ns": 200}
+        cases = {
+            "swapped": {"attached_at_ns": 200,
+                        "unobserved_windows": [unattached, late]},
+            "single-pre-attach": {"attached_at_ns": 200,
+                                  "unobserved_windows": [pre_attach]},
+            "empty": {"attached_at_ns": 200, "unobserved_windows": []},
+            "late-end-mismatch": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    {"reason": "late_discovery",
+                     "start_ns": 100, "end_ns": 199},
+                    unattached]},
+            "split-starts": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    late,
+                    {"reason": "mapped_unattached",
+                     "start_ns": 101, "end_ns": 150}]},
+            "end-before-start": {
+                "attached_at_ns": 200,
+                "unobserved_windows": [
+                    late,
+                    {"reason": "mapped_unattached",
+                     "start_ns": 100, "end_ns": 99}]},
+        }
+        for name, module in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(AssertionError):
+                    self.check(module)
+
+    def test_handoff_pair_call_sites_are_the_two_pre68_twins(self):
+        text = QUAL.read_text()
+        self.assertEqual(text.count("assert_handoff_pair("), 3,
+                         "def plus exactly the held/passive pre-6.8 calls")
+
+    def test_six_eight_plus_branch_is_unchanged(self):
+        # The >= 6.8 path keeps its exact assertions: held [] and the
+        # passive single pre_attach with end == attached_at.
+        text = QUAL.read_text()
+        for line in (
+            'assert held["unobserved_windows"] == [], held["unobserved_windows"]',
+            'assert windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach", windows',
+            'assert windows[0]["end_ns"] == passive["attached_at_ns"], windows',
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line, text)
 
 
 if __name__ == "__main__":

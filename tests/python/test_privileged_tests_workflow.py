@@ -253,6 +253,18 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         ia32 = job_body(self.yml, "public-cli-ia32")
         self.assertRegex(ia32, r"(?<!lib)softhsm2:i386")
 
+    def test_ia32_gate_uses_the_shared_cell_checker(self):
+        # The two ia32 cells route through judge and pass with the
+        # owned-provider-counts taxonomy, so the gate must be the
+        # shared closed-set checker (as the host leg is), never a
+        # hand-rolled comparison against a single value no script
+        # in this pipeline emits.
+        ia32 = job_body(self.yml, "public-cli-ia32")
+        self.assertIn("scripts/ci/check-cell-results.py", ia32)
+        self.assertIn("--require profile-pid-ia32", ia32)
+        self.assertIn("--require run-ia32", ia32)
+        self.assertNotIn('!= "qualified"', ia32)
+
     def test_shard_step_exports_the_discover_helper(self):
         # The exit-mappings cell resolves p11scope-discover through
         # P11SCOPE_DISCOVER_BIN: the staged layout keeps it under bin/,
